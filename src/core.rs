@@ -135,13 +135,24 @@ pub struct ExecutionResult {
     pub outcome: ExecutionOutcome,
 }
 
-/// Receives observations synchronously; consumers must avoid blocking or panicking.
-pub type EventSink = Arc<dyn Fn(ExecutionEvent) + Send + Sync>;
+/// Reports that an observation could not be accepted by the event consumer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventSinkError;
+
+/// Accepts observations synchronously; consumers must avoid blocking or panicking.
+/// A backend must stop producing observations after its execution future returns.
+pub type EventSink = Arc<dyn Fn(ExecutionEvent) -> Result<(), EventSinkError> + Send + Sync>;
 
 /// Supports runtime-selected backends without exposing vendor-specific types.
+/// Implementations must not block executor threads and must cooperate with cancellation.
+/// Constructing the execution future must not start work before its first poll.
+/// A dropped future does not establish external process or session cleanup.
 pub trait ExecutionBackend: Send + Sync {
     /// Returns the provenance that will be attached to this backend's execution.
     fn metadata(&self) -> ExecutionMetadata;
+
+    /// Identifies the actual native state namespace used by this backend instance.
+    fn state_realm(&self) -> &str;
 
     fn execute<'a>(
         &'a self,

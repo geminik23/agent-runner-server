@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 
 use crate::storage::{Namespace, StorageError};
 
-use super::request::{AuthorizedStart, StartBody};
+use super::request::{AuthorizedStart, StartBody, StartSession};
 
 const CREDENTIAL_BYTES: usize = 32;
 
@@ -72,6 +72,7 @@ impl ExecutionProfile {
 /// Associates an operator-provided credential with a namespace and its grants.
 pub struct ClientRegistration {
     credential_id: String,
+    generation: Option<String>,
     secret: CredentialSecret,
     namespace: Namespace,
     scopes: HashSet<Scope>,
@@ -89,12 +90,30 @@ impl ClientRegistration {
     ) -> Self {
         Self {
             credential_id: credential_id.into(),
+            generation: None,
             secret,
             namespace,
             scopes: scopes.into_iter().collect(),
             profiles: profiles.into_iter().collect(),
         }
     }
+
+    /// Sets a stable, non-secret registration generation supplied by trusted configuration.
+    /// A replacement or reissued credential must use a new generation.
+    pub fn with_generation(mut self, generation: impl Into<String>) -> Self {
+        self.generation = Some(generation.into());
+        self
+    }
+}
+
+pub(crate) struct LaunchAuthorization<'a> {
+    pub credential_id: &'a str,
+    pub generation: &'a str,
+    pub namespace: &'a Namespace,
+    pub profile_id: &'a str,
+    pub workspace_id: &'a str,
+    pub input_len: usize,
+    pub resume: bool,
 }
 
 struct Registry {
@@ -188,6 +207,10 @@ impl ClientAccessControl {
         let mut credentials = HashMap::new();
         for registration in registrations {
             if !valid_identifier(&registration.credential_id)
+                || registration
+                    .generation
+                    .as_deref()
+                    .is_some_and(|value| !valid_identifier(value))
                 || registration.namespace.owner_id.is_empty()
                 || registration.namespace.client_id.is_empty()
                 || registration
@@ -267,6 +290,21 @@ impl ClientAccessControl {
         client: &AuthenticatedClient,
         body: &[u8],
     ) -> Result<AuthorizedStart, AccessError> {
+        self.with_start(client, body, |_, _, _, _, authorize| authorize())
+    }
+
+    pub(crate) fn with_start<T>(
+        &self,
+        client: &AuthenticatedClient,
+        body: &[u8],
+        operation: impl FnOnce(
+            &Namespace,
+            &str,
+            Option<&str>,
+            &StartBody,
+            &dyn Fn() -> Result<AuthorizedStart, AccessError>,
+        ) -> Result<T, AccessError>,
+    ) -> Result<T, AccessError> {
         let registry = self.registry.read().map_err(|_| AccessError::Unavailable)?;
         let registration = self.registration(&registry, client, &[Scope::RunStart])?;
         if body.len() > self.limits.max_request_bytes {
@@ -283,22 +321,76 @@ impl ClientAccessControl {
         {
             return Err(AccessError::InvalidRequest);
         }
+        if let StartSession::Resume { session_id } = &request.session {
+            validate_resource_id(session_id, &self.limits)?;
+            if !registration.scopes.contains(&Scope::SessionRead) {
+                return Err(AccessError::Forbidden);
+            }
+        }
+        let authorize = || {
+            let profile = registry
+                .profiles
+                .get(&request.profile_id)
+                .ok_or(AccessError::Forbidden)?;
+            if !registration.profiles.contains(&request.profile_id)
+                || !profile.workspaces.contains(&request.workspace_id)
+            {
+                return Err(AccessError::Forbidden);
+            }
+            if request.input.request.len() > profile.max_input_bytes {
+                return Err(AccessError::InvalidRequest);
+            }
+            Ok(AuthorizedStart::from_body(request.clone()))
+        };
+        operation(
+            &registration.namespace,
+            &registration.credential_id,
+            registration.generation.as_deref(),
+            &request,
+            &authorize,
+        )
+    }
+
+    pub(crate) fn with_launch<T>(
+        &self,
+        authorization: LaunchAuthorization<'_>,
+        operation: impl FnOnce() -> Result<T, AccessError>,
+    ) -> Result<T, AccessError> {
+        let registry = self.registry.read().map_err(|_| AccessError::Unavailable)?;
+        let registration = registry
+            .credentials
+            .get(authorization.credential_id)
+            .ok_or(AccessError::Unauthenticated)?;
         let profile = registry
             .profiles
-            .get(&request.profile_id)
+            .get(authorization.profile_id)
             .ok_or(AccessError::Forbidden)?;
-        if !registration.profiles.contains(&request.profile_id)
-            || !profile.workspaces.contains(&request.workspace_id)
+        if &registration.namespace != authorization.namespace
+            || registration.generation.as_deref() != Some(authorization.generation)
+            || !registration.scopes.contains(&Scope::RunStart)
+            || (authorization.resume && !registration.scopes.contains(&Scope::SessionRead))
+            || !registration.profiles.contains(authorization.profile_id)
+            || !profile.workspaces.contains(authorization.workspace_id)
+            || authorization.input_len > profile.max_input_bytes
         {
             return Err(AccessError::Forbidden);
         }
-        if request.input.request.len() > profile.max_input_bytes {
-            return Err(AccessError::InvalidRequest);
-        }
-        Ok(AuthorizedStart::from_body(request))
+        operation()
     }
 
-    pub(super) fn with_permissions<T>(
+    pub(crate) fn request_limit(&self) -> usize {
+        self.limits.max_request_bytes
+    }
+
+    pub(crate) fn identifier_limit(&self) -> usize {
+        self.limits.max_identifier_bytes
+    }
+
+    pub(crate) fn supports_service_ids(&self) -> bool {
+        self.limits.max_identifier_bytes >= 40
+    }
+
+    pub(crate) fn with_permissions<T>(
         &self,
         client: &AuthenticatedClient,
         required: &[Scope],
@@ -332,7 +424,7 @@ impl ClientAccessControl {
     }
 }
 
-pub(super) fn validate_resource_id(value: &str, limits: &AccessLimits) -> Result<(), AccessError> {
+pub(crate) fn validate_resource_id(value: &str, limits: &AccessLimits) -> Result<(), AccessError> {
     if value.is_empty() || value.len() > limits.max_identifier_bytes {
         Err(AccessError::InvalidRequest)
     } else {
@@ -353,7 +445,8 @@ mod tests {
     use std::sync::{Arc, TryLockError};
 
     use super::{
-        AccessError, AccessLimits, ClientAccessControl, ClientRegistration, CredentialSecret, Scope,
+        AccessError, AccessLimits, ClientAccessControl, ClientRegistration, CredentialSecret,
+        ExecutionProfile, LaunchAuthorization, Scope,
     };
     use crate::storage::Namespace;
 
@@ -392,6 +485,66 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn launch_rechecks_registration_generation_namespace_and_resume_scope() {
+        let namespace = Namespace {
+            owner_id: "owner".into(),
+            client_id: "client".into(),
+        };
+        let create = |generation: &str, scopes: Vec<Scope>| {
+            ClientAccessControl::new(
+                [ClientRegistration::new(
+                    "client",
+                    CredentialSecret::new([7; 32]),
+                    namespace.clone(),
+                    scopes,
+                    ["profile".into()],
+                )
+                .with_generation(generation)],
+                [ExecutionProfile::dummy(
+                    "profile",
+                    ["workspace".into()],
+                    100,
+                )],
+                AccessLimits {
+                    max_request_bytes: 256,
+                    max_skill_bytes: 128,
+                    max_identifier_bytes: 64,
+                },
+            )
+            .unwrap()
+        };
+        let current = create("generation_2", vec![Scope::RunStart]);
+        let check = |generation, resume| LaunchAuthorization {
+            credential_id: "client",
+            generation,
+            namespace: &namespace,
+            profile_id: "profile",
+            workspace_id: "workspace",
+            input_len: 5,
+            resume,
+        };
+        assert!(matches!(
+            current.with_launch(check("generation_1", false), || Ok(())),
+            Err(AccessError::Forbidden)
+        ));
+        assert!(
+            current
+                .with_launch(check("generation_2", false), || Ok(()))
+                .is_ok()
+        );
+        assert!(matches!(
+            current.with_launch(check("generation_2", true), || Ok(())),
+            Err(AccessError::Forbidden)
+        ));
+        let permitted = create("generation_2", vec![Scope::RunStart, Scope::SessionRead]);
+        assert!(
+            permitted
+                .with_launch(check("generation_2", true), || Ok(()))
+                .is_ok()
+        );
     }
 
     #[test]

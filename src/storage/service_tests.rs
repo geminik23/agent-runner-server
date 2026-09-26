@@ -1,0 +1,518 @@
+use tempfile::tempdir;
+
+use crate::{
+    core::{CleanupState, ExecutionMetadata, SessionDisposition, SessionRef},
+    storage::{
+        AdmissionOutcome, Namespace, SqliteStore, StorageError, TerminalState,
+        service::{Candidate, ServiceAdmission, StopCause},
+    },
+};
+use serde_json::json;
+
+fn admission(key: &str) -> ServiceAdmission {
+    ServiceAdmission {
+        namespace: Namespace {
+            owner_id: "owner".into(),
+            client_id: "client".into(),
+        },
+        idempotency_key: key.into(),
+        normalized_request: key.as_bytes().to_vec(),
+        manifest: b"manifest".to_vec(),
+        metadata: ExecutionMetadata {
+            runtime: "dummy".into(),
+            synthetic: true,
+            scenario: Some("success".into()),
+        },
+        credential_id: "credential".into(),
+        credential_generation: "generation_1".into(),
+        profile_id: "profile".into(),
+        profile_revision: "profile_1".into(),
+        workspace_id: "workspace".into(),
+        state_realm: "dummy".into(),
+        resume_session_id: None,
+        deadline_ms: 10_000,
+        max_outstanding: 8,
+    }
+}
+
+fn success() -> Candidate {
+    Candidate {
+        state: TerminalState::Succeeded,
+        details: json!({"output": "done"}),
+        cleanup: CleanupState::Settled,
+        disposition: SessionDisposition::Reusable,
+    }
+}
+
+#[test]
+fn claim_launch_and_cancel_are_fenced_in_the_same_store() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let first = admission("first");
+    let AdmissionOutcome::Accepted(run) = store.service_admit(&first).unwrap() else {
+        panic!()
+    };
+    assert!(matches!(
+        store.service_admit(&first).unwrap(),
+        AdmissionOutcome::Existing(_)
+    ));
+    let job = store.service_claim(1_000).unwrap().unwrap();
+    assert!(store.service_claim(1_000).unwrap().is_none());
+    let mut stale = job.clone();
+    stale.claim_token.push('x');
+    assert!(matches!(
+        store.service_launch(&stale, 1_001),
+        Err(StorageError::InvalidState)
+    ));
+    assert!(store.service_launch(&job, 1_001).unwrap());
+    assert!(matches!(
+        store.service_launch(&job, 1_002),
+        Err(StorageError::InvalidState)
+    ));
+    let native = SessionRef {
+        runtime: "dummy".into(),
+        state_realm: "dummy".into(),
+        native_id: "native".into(),
+    };
+    store
+        .service_event(&job, "run.session", b"{}", Some(&native), 8)
+        .unwrap();
+    assert_eq!(
+        store
+            .service_stop(&first.namespace, &run.run_id, StopCause::Cancelled, 1_003)
+            .unwrap(),
+        Some(StopCause::Cancelled)
+    );
+    store.service_finish(&job, &success(), 1_004, 1024).unwrap();
+    let result = store
+        .get_result(&first.namespace, &run.run_id)
+        .unwrap()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&result.payload).unwrap();
+    assert_eq!(payload["state"], "cancelled");
+    assert!(payload["details"].is_null());
+    assert_eq!(
+        store
+            .service_stop(&first.namespace, &run.run_id, StopCause::Cancelled, 1_005)
+            .unwrap(),
+        None
+    );
+    assert!(matches!(
+        store.service_finish(&job, &success(), 1_006, 1024),
+        Err(StorageError::InvalidState)
+    ));
+}
+
+#[test]
+fn launch_checks_wall_clock_after_waiting_for_the_database_write_lock() {
+    use crate::storage::service::ServiceClock;
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("deadline.sqlite");
+    let mut input = admission("deadline");
+    input.deadline_ms = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+        + 80;
+    let mut store = SqliteStore::open(&path).unwrap();
+    store.service_admit(&input).unwrap();
+    let job = store.service_claim(ServiceClock::Wall).unwrap().unwrap();
+    let lock = rusqlite::Connection::open(&path).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let signal = Arc::clone(&barrier);
+    let worker = thread::spawn(move || {
+        signal.wait();
+        store.service_launch(&job, ServiceClock::Wall).unwrap()
+    });
+    barrier.wait();
+    thread::sleep(Duration::from_millis(120));
+    lock.execute_batch("COMMIT").unwrap();
+    assert!(!worker.join().unwrap());
+    let store = SqliteStore::open(&path).unwrap();
+    let saved = store
+        .service_replay(
+            &input.namespace,
+            &input.idempotency_key,
+            &input.normalized_request,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.state, "timed_out");
+}
+
+#[test]
+fn terminal_storage_failure_rolls_back_and_does_not_launch_again() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let input = admission("failure");
+    store.service_admit(&input).unwrap();
+    let job = store.service_claim(1000).unwrap().unwrap();
+    store.service_launch(&job, 1001).unwrap();
+    let native = SessionRef {
+        runtime: "dummy".into(),
+        state_realm: "dummy".into(),
+        native_id: "native".into(),
+    };
+    store
+        .service_event(&job, "run.session", b"{}", Some(&native), 8)
+        .unwrap();
+    store.connection.execute_batch("CREATE TRIGGER reject_result BEFORE INSERT ON results BEGIN SELECT RAISE(ABORT, 'injected result failure'); END;").unwrap();
+    assert!(store.service_finish(&job, &success(), 1002, 1024).is_err());
+    assert_eq!(
+        store
+            .get_run(&input.namespace, &job.run_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "running"
+    );
+    assert!(
+        store
+            .get_result(&input.namespace, &job.run_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .get_session(&input.namespace, &job.session_id)
+            .unwrap()
+            .unwrap()
+            .reserved_run_id
+            .as_deref(),
+        Some(job.run_id.as_str())
+    );
+    assert!(store.service_claim(1003).unwrap().is_none());
+    store
+        .connection
+        .execute_batch("DROP TRIGGER reject_result")
+        .unwrap();
+    store.service_finish(&job, &success(), 1004, 1024).unwrap();
+    let events = store
+        .get_events(&input.namespace, &job.run_id, None)
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "run.finished")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn expired_deadline_wins_over_a_later_cancel() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let mut first = admission("first");
+    first.deadline_ms = 1_500;
+    let AdmissionOutcome::Accepted(run) = store.service_admit(&first).unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        store
+            .service_stop(&first.namespace, &run.run_id, StopCause::Cancelled, 1_501)
+            .unwrap(),
+        Some(StopCause::TimedOut)
+    );
+    assert_eq!(
+        store
+            .get_run(&first.namespace, &run.run_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "timed_out"
+    );
+}
+
+#[test]
+fn recovery_requeues_unlaunched_but_never_repeats_a_launch_intent() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("recovery.sqlite");
+    let first = admission("first");
+    let mut store = SqliteStore::open(&path).unwrap();
+    let AdmissionOutcome::Accepted(run) = store.service_admit(&first).unwrap() else {
+        panic!()
+    };
+    let old = store.service_claim(1_000).unwrap().unwrap();
+    drop(store);
+    let mut store = SqliteStore::open(&path).unwrap();
+    store.service_recover(1_001).unwrap();
+    assert!(matches!(
+        store.service_launch(&old, 1_002),
+        Err(StorageError::InvalidState)
+    ));
+    let current = store.service_claim(1_002).unwrap().unwrap();
+    assert_eq!(current.run_id, run.run_id);
+    assert!(store.service_launch(&current, 1_003).unwrap());
+    drop(store);
+    let mut store = SqliteStore::open(&path).unwrap();
+    store.service_recover(1_004).unwrap();
+    assert_eq!(
+        store
+            .get_run(&first.namespace, &run.run_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "interrupted"
+    );
+    assert!(store.service_claim(1_005).unwrap().is_none());
+    let session = store
+        .get_session(&first.namespace, &current.session_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.reserved_run_id.as_deref(),
+        Some(run.run_id.as_str())
+    );
+    assert_eq!(session.cleanup.as_deref(), Some("uncertain"));
+    assert!(matches!(
+        store.service_admit(&admission("other")),
+        Err(StorageError::SessionBusy)
+    ));
+}
+
+#[test]
+fn new_unidentified_session_cannot_launch_while_known_session_is_reserved() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let first = admission("first");
+    store.service_admit(&first).unwrap();
+    let original = store.service_claim(1_000).unwrap().unwrap();
+    store.service_launch(&original, 1_001).unwrap();
+    let native = SessionRef {
+        runtime: "dummy".into(),
+        state_realm: "dummy".into(),
+        native_id: "native".into(),
+    };
+    store
+        .service_event(&original, "run.session", b"{}", Some(&native), 8)
+        .unwrap();
+    store
+        .service_finish(&original, &success(), 1_002, 1024)
+        .unwrap();
+    let mut resume = admission("resume");
+    resume.resume_session_id = Some(original.session_id.clone());
+    store.service_admit(&resume).unwrap();
+    let resumed = store.service_claim(1_003).unwrap().unwrap();
+    store.service_launch(&resumed, 1_004).unwrap();
+    store.service_admit(&admission("new")).unwrap();
+    assert!(store.service_claim(1_005).unwrap().is_none());
+    store
+        .service_finish(&resumed, &success(), 1_006, 1024)
+        .unwrap();
+    assert!(store.service_claim(1_007).unwrap().is_some());
+}
+
+#[test]
+fn queued_unstarted_session_does_not_block_settlement_of_uncertain_native_state() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let first = admission("first");
+    store.service_admit(&first).unwrap();
+    store.service_admit(&admission("second")).unwrap();
+    let job = store.service_claim(1000).unwrap().unwrap();
+    store.service_launch(&job, 1001).unwrap();
+    let candidate = Candidate {
+        state: TerminalState::Failed,
+        details: json!({}),
+        cleanup: CleanupState::Uncertain,
+        disposition: SessionDisposition::Uncertain,
+    };
+    store.service_finish(&job, &candidate, 1002, 1024).unwrap();
+    let native = SessionRef {
+        runtime: "dummy".into(),
+        state_realm: "dummy".into(),
+        native_id: "observed_later".into(),
+    };
+    store
+        .bind_native_session(&first.namespace, &job.session_id, &native)
+        .unwrap();
+    assert!(
+        store
+            .settle_session(
+                &first.namespace,
+                &job.run_id,
+                CleanupState::Settled,
+                SessionDisposition::Reusable
+            )
+            .unwrap()
+    );
+    assert!(store.service_claim(1003).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn recovered_work_rejects_a_reissued_credential_generation_before_backend_start() {
+    use crate::{
+        access::{
+            AccessLimits, ClientAccessControl, ClientRegistration, CredentialSecret,
+            ExecutionProfile, Scope,
+        },
+        application::{BackendProfile, RunLimits, RunService},
+        runtimes::dummy::{DummyBackend, DummyScenario},
+    };
+    use std::{
+        sync::Arc,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("reissued.sqlite");
+    let mut input = admission("queued");
+    input.credential_generation = "old_generation".into();
+    input.deadline_ms = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+        + 5000;
+    input.manifest = serde_json::to_vec(&json!({"version": 1, "profile_revision": "profile_1", "prompt": "literal", "runtime": "dummy", "synthetic": true, "scenario": "success", "state_realm": "dummy", "resume": false})).unwrap();
+    let mut store = SqliteStore::open(&path).unwrap();
+    let AdmissionOutcome::Accepted(run) = store.service_admit(&input).unwrap() else {
+        panic!()
+    };
+    drop(store);
+    let access = Arc::new(
+        ClientAccessControl::new(
+            [ClientRegistration::new(
+                "credential",
+                CredentialSecret::new([7; 32]),
+                input.namespace.clone(),
+                [Scope::RunStart, Scope::RunRead],
+                ["profile".into()],
+            )
+            .with_generation("new_generation")],
+            [ExecutionProfile::dummy(
+                "profile",
+                ["workspace".into()],
+                1024,
+            )],
+            AccessLimits {
+                max_request_bytes: 4096,
+                max_skill_bytes: 1024,
+                max_identifier_bytes: 128,
+            },
+        )
+        .unwrap(),
+    );
+    let client = access.authenticate("credential", &[7; 32]).unwrap();
+    let backend = Arc::new(DummyBackend::new(DummyScenario::Success, 8));
+    let service = RunService::open(
+        &path,
+        access,
+        vec![BackendProfile {
+            profile_id: "profile".into(),
+            revision: "profile_1".into(),
+            state_realm: "dummy".into(),
+            backend: backend.clone(),
+        }],
+        RunLimits {
+            max_outstanding: 4,
+            max_workers: 1,
+            database_queue: 8,
+            event_buffer: 8,
+            max_events_per_run: 8,
+            max_event_bytes: 512,
+            max_result_bytes: 1024,
+            max_page_size: 8,
+            run_timeout: Duration::from_secs(5),
+            cleanup_grace: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(5),
+        },
+    )
+    .await
+    .unwrap();
+    let state = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let state = service
+                .get_run(&client, &run.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state;
+            if state == "failed" {
+                break state;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(state, "failed");
+    assert!(backend.captured_inputs().is_empty());
+    service.shutdown().await.unwrap();
+}
+
+#[test]
+fn fenced_proof_of_no_backend_poll_releases_a_committed_launch_intent() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let input = admission("first");
+    store.service_admit(&input).unwrap();
+    let job = store.service_claim(1000).unwrap().unwrap();
+    store.service_launch(&job, 1001).unwrap();
+    let mut stale = job.clone();
+    stale.claim_token.push('x');
+    assert!(matches!(
+        store.service_proven_unstarted(&stale, 1002),
+        Err(StorageError::InvalidState)
+    ));
+    store.service_proven_unstarted(&job, 1002).unwrap();
+    let session = store
+        .get_session(&input.namespace, &job.session_id)
+        .unwrap()
+        .unwrap();
+    assert!(session.reserved_run_id.is_none());
+    assert_eq!(session.disposition.as_deref(), Some("not_started"));
+    assert_eq!(
+        store
+            .get_run(&input.namespace, &job.run_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "interrupted"
+    );
+}
+
+#[test]
+fn proven_unstarted_resume_releases_only_its_own_reservation() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let first = admission("first");
+    store.service_admit(&first).unwrap();
+    let original = store.service_claim(1_000).unwrap().unwrap();
+    store.service_launch(&original, 1_001).unwrap();
+    let native = SessionRef {
+        runtime: "dummy".into(),
+        state_realm: "dummy".into(),
+        native_id: "native".into(),
+    };
+    store
+        .service_event(&original, "run.session", b"{}", Some(&native), 8)
+        .unwrap();
+    store
+        .service_finish(&original, &success(), 1_002, 1024)
+        .unwrap();
+    let mut resume = admission("resume");
+    resume.resume_session_id = Some(original.session_id.clone());
+    let AdmissionOutcome::Accepted(run) = store.service_admit(&resume).unwrap() else {
+        panic!()
+    };
+    store
+        .service_stop(&resume.namespace, &run.run_id, StopCause::Cancelled, 1_003)
+        .unwrap();
+    let session = store
+        .get_session(&resume.namespace, &original.session_id)
+        .unwrap()
+        .unwrap();
+    assert!(session.reserved_run_id.is_none());
+    assert_eq!(session.disposition.as_deref(), Some("reusable"));
+    let mut next = admission("next");
+    next.resume_session_id = Some(original.session_id);
+    assert!(matches!(
+        store.service_admit(&next).unwrap(),
+        AdmissionOutcome::Accepted(_)
+    ));
+}

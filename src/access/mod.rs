@@ -8,5 +8,7 @@ pub use authority::{
     AccessError, AccessLimits, AuthenticatedClient, ClientAccessControl, ClientRegistration,
     CredentialSecret, ExecutionProfile, Scope,
 };
-pub use request::AuthorizedStart;
+pub(crate) use authority::{LaunchAuthorization, validate_resource_id};
+pub use request::{AuthorizedStart, StartSession};
+
 pub use store::AuthorizedStore;

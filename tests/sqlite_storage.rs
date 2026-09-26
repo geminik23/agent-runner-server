@@ -325,6 +325,52 @@ fn completion_commit_failure_rolls_back_every_write() {
 }
 
 #[test]
+fn existing_version_one_database_is_upgraded_without_losing_records() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("v1.sqlite");
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(include_str!("../migrations/0001_initial.sql"))
+        .unwrap();
+    connection
+        .pragma_update(None, "application_id", 0x41525353_i64)
+        .unwrap();
+    connection.pragma_update(None, "user_version", 1).unwrap();
+    connection
+        .execute(
+            "INSERT INTO namespaces (owner_id, client_id) VALUES ('owner', 'client-a')",
+            [],
+        )
+        .unwrap();
+    connection.execute("INSERT INTO skill_versions (owner_id, client_id, skill_id, version, markdown) VALUES ('owner', 'client-a', 'report', '1', 'preserved')", []).unwrap();
+    drop(connection);
+
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(
+        store
+            .get_skill_version(&namespace("client-a"), &skill())
+            .unwrap()
+            .unwrap()
+            .markdown,
+        "preserved"
+    );
+    drop(store);
+    let connection = Connection::open(&path).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    let created: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'service_jobs')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(created);
+}
+
+#[test]
 fn migration_and_records_survive_reopening() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("storage.sqlite");
@@ -773,17 +819,17 @@ fn newer_schema_is_rejected_without_changing_it() {
     let path = temp.path().join("storage.sqlite");
     drop(SqliteStore::open(&path).unwrap());
     let connection = Connection::open(&path).unwrap();
-    connection.pragma_update(None, "user_version", 2).unwrap();
+    connection.pragma_update(None, "user_version", 3).unwrap();
     drop(connection);
     assert!(matches!(
         SqliteStore::open(&path),
-        Err(StorageError::UnsupportedSchema(2))
+        Err(StorageError::UnsupportedSchema(3))
     ));
     let connection = Connection::open(&path).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
 }
 
 #[test]

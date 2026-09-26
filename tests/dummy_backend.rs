@@ -2,9 +2,9 @@ use std::sync::{Arc, Mutex};
 
 use agent_runner_server::{
     core::{
-        BackendError, CancellationToken, CleanupState, EventSink, ExecutionBackend, ExecutionEvent,
-        ExecutionEventKind, ExecutionOutcome, ExecutionRequest, SessionDisposition, SessionRef,
-        SessionRequest, WarningObservation,
+        BackendError, CancellationToken, CleanupState, EventSink, EventSinkError, ExecutionBackend,
+        ExecutionEvent, ExecutionEventKind, ExecutionOutcome, ExecutionRequest, SessionDisposition,
+        SessionRef, SessionRequest, WarningObservation,
     },
     runtimes::dummy::{DELAYED_SCENARIO_DURATION, DummyBackend, DummyScenario},
 };
@@ -23,7 +23,10 @@ fn request() -> ExecutionRequest {
 fn event_log() -> (EventSink, EventLog) {
     let log = Arc::new(Mutex::new(Vec::new()));
     let events = Arc::clone(&log);
-    let sink: EventSink = Arc::new(move |event| events.lock().unwrap().push(event));
+    let sink: EventSink = Arc::new(move |event| {
+        events.lock().unwrap().push(event);
+        Ok(())
+    });
     (sink, log)
 }
 
@@ -151,7 +154,7 @@ async fn cancellation_from_event_observer_prevents_a_late_success() {
         if event.kind == ExecutionEventKind::Started {
             observer_cancellation.cancel();
         }
-        record(event);
+        record(event)
     });
 
     let result = backend.execute(request(), sink, cancellation).await;
@@ -184,6 +187,20 @@ async fn warning_is_preserved_in_both_event_and_successful_result() {
         ExecutionEventKind::Warning(warnings[0].clone())
     );
     assert!(events.iter().all(|event| event.metadata == result.metadata));
+}
+
+#[tokio::test]
+async fn an_unavailable_event_sink_cannot_produce_success() {
+    let backend = DummyBackend::new(DummyScenario::Success, 0);
+    let sink: EventSink = Arc::new(|_| Err(EventSinkError));
+    let result = backend
+        .execute(request(), sink, CancellationToken::new())
+        .await;
+    assert!(matches!(
+        result.outcome,
+        ExecutionOutcome::Failed(BackendError::ExecutionFailed { .. })
+    ));
+    assert_eq!(result.session_disposition, SessionDisposition::Uncertain);
 }
 
 #[tokio::test]
@@ -346,6 +363,7 @@ async fn cancellation_after_warning_preserves_the_observed_warning() {
         if matches!(event.kind, ExecutionEventKind::Warning(_)) {
             observer_cancellation.cancel();
         }
+        Ok(())
     });
     let result = backend.execute(request(), sink, cancellation).await;
     assert_eq!(result.outcome, ExecutionOutcome::Cancelled);

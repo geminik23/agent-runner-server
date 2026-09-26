@@ -220,6 +220,7 @@ pub enum StorageError {
     IdempotencyConflict,
     SkillVersionConflict,
     SessionBusy,
+    QueueFull,
     AlreadyTerminal,
     InvalidState,
     InvalidDatabase,
@@ -239,6 +240,7 @@ impl fmt::Display for StorageError {
                 formatter.write_str("skill version conflicts with existing content")
             }
             Self::SessionBusy => formatter.write_str("session is reserved"),
+            Self::QueueFull => formatter.write_str("execution queue is full"),
             Self::AlreadyTerminal => formatter.write_str("run is already terminal"),
             Self::InvalidState => {
                 formatter.write_str("operation is not valid in the current state")

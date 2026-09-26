@@ -142,7 +142,13 @@ impl DummyBackend {
                 attempt_id: request.attempt_id.clone(),
                 metadata: metadata.clone(),
                 kind,
-            });
+            })
+        };
+        let event_failure = || {
+            ExecutionOutcome::Failed(BackendError::ExecutionFailed {
+                code: "event_sink_unavailable".into(),
+                message: "An execution observation could not be accepted".into(),
+            })
         };
 
         if request.run_id.is_empty() || request.attempt_id.is_empty() {
@@ -183,8 +189,11 @@ impl DummyBackend {
             }
         };
 
-        emit(ExecutionEventKind::Started);
-        emit(ExecutionEventKind::SessionObserved(session.clone()));
+        if emit(ExecutionEventKind::Started).is_err()
+            || emit(ExecutionEventKind::SessionObserved(session.clone())).is_err()
+        {
+            return result(event_failure(), Some(session), vec![]);
+        }
         if self.scenario == DummyScenario::DelayedSuccess {
             tokio::select! {
                 biased;
@@ -196,9 +205,13 @@ impl DummyBackend {
             return result(ExecutionOutcome::Cancelled, Some(session), vec![]);
         }
 
-        emit(ExecutionEventKind::Progress {
+        if emit(ExecutionEventKind::Progress {
             message: "Scripted dummy progress".into(),
-        });
+        })
+        .is_err()
+        {
+            return result(event_failure(), Some(session), vec![]);
+        }
         if cancellation.is_cancelled() {
             return result(ExecutionOutcome::Cancelled, Some(session), vec![]);
         }
@@ -209,8 +222,10 @@ impl DummyBackend {
                 code: "dummy_warning".into(),
                 message: "Scripted dummy warning".into(),
             };
-            emit(ExecutionEventKind::Warning(warning.clone()));
-            warnings.push(warning);
+            warnings.push(warning.clone());
+            if emit(ExecutionEventKind::Warning(warning)).is_err() {
+                return result(event_failure(), Some(session), warnings);
+            }
         }
         if cancellation.is_cancelled() {
             return result(ExecutionOutcome::Cancelled, Some(session), warnings);
@@ -243,6 +258,10 @@ impl ExecutionBackend for DummyBackend {
             synthetic: true,
             scenario: Some(self.scenario.id().into()),
         }
+    }
+
+    fn state_realm(&self) -> &str {
+        "dummy"
     }
 
     fn execute<'a>(

@@ -1,17 +1,29 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct StartBody {
+pub(crate) struct StartBody {
     pub profile_id: String,
     pub workspace_id: String,
+    #[serde(default)]
+    pub session: StartSession,
     pub input: StartInput,
     pub idempotency_key: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StartSession {
+    #[default]
+    New,
+    Resume {
+        session_id: String,
+    },
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct StartInput {
+pub(crate) struct StartInput {
     pub request: String,
 }
 
@@ -21,6 +33,7 @@ pub struct AuthorizedStart {
     workspace_id: String,
     input: String,
     idempotency_key: String,
+    session: StartSession,
 }
 
 impl AuthorizedStart {
@@ -30,6 +43,7 @@ impl AuthorizedStart {
             workspace_id: body.workspace_id,
             input: body.input.request,
             idempotency_key: body.idempotency_key,
+            session: body.session,
         }
     }
 
@@ -51,6 +65,18 @@ impl AuthorizedStart {
     /// Returns the caller's idempotency key.
     pub fn idempotency_key(&self) -> &str {
         &self.idempotency_key
+    }
+
+    /// Returns the validated new-session or resume selection.
+    pub fn session(&self) -> &StartSession {
+        &self.session
+    }
+
+    pub(crate) fn resume_session_id(&self) -> Option<&str> {
+        match &self.session {
+            StartSession::New => None,
+            StartSession::Resume { session_id } => Some(session_id),
+        }
     }
 
     /// Only the synthetic runtime is available in this profile implementation.

@@ -11,9 +11,10 @@ use super::{
     },
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const APPLICATION_ID: i64 = 0x41525353;
 const INITIAL_MIGRATION: &str = include_str!("../../migrations/0001_initial.sql");
+const RUN_SERVICE_MIGRATION: &str = include_str!("../../migrations/0002_run_service.sql");
 
 /// Owns a synchronous SQLite connection; async callers must avoid blocking their runtime.
 pub struct SqliteStore {
@@ -50,7 +51,12 @@ impl SqliteStore {
                     return Err(StorageError::InvalidDatabase);
                 }
                 transaction.execute_batch(INITIAL_MIGRATION)?;
+                transaction.execute_batch(RUN_SERVICE_MIGRATION)?;
                 transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            }
+            (APPLICATION_ID, 1) => {
+                transaction.execute_batch(RUN_SERVICE_MIGRATION)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             (APPLICATION_ID, SCHEMA_VERSION) => {}
@@ -201,7 +207,7 @@ impl SqliteStore {
             Some(_) => {}
             None => {
                 let blocked: bool = transaction.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE runtime = ?1 AND state_realm = ?2 AND native_id IS NULL AND reserved_run_id IS NOT NULL AND NOT (owner_id = ?3 AND client_id = ?4 AND session_id = ?5))",
+                    "SELECT EXISTS(SELECT 1 FROM sessions s LEFT JOIN service_jobs j ON j.owner_id = s.owner_id AND j.client_id = s.client_id AND j.run_id = s.reserved_run_id LEFT JOIN attempts a ON a.owner_id = j.owner_id AND a.client_id = j.client_id AND a.run_id = j.run_id AND a.attempt_id = j.attempt_id WHERE s.runtime = ?1 AND s.state_realm = ?2 AND s.native_id IS NULL AND s.reserved_run_id IS NOT NULL AND NOT (s.owner_id = ?3 AND s.client_id = ?4 AND s.session_id = ?5) AND (j.queue_id IS NULL OR a.spawn_intent = 1))",
                     params![native.runtime, native.state_realm, namespace.owner_id, namespace.client_id, session_id],
                     |row| row.get(0),
                 )?;
