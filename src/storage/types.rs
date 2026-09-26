@@ -85,6 +85,14 @@ pub struct StoredRun {
     pub state: String,
 }
 
+/// Exposes run status without the internal request, session, or manifest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunSummary {
+    pub run_id: String,
+    pub state: String,
+    pub metadata: ExecutionMetadata,
+}
+
 /// Distinguishes a new run from an idempotent replay.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdmissionOutcome {
@@ -110,6 +118,15 @@ pub struct StoredEvent {
     pub sequence: i64,
     pub kind: String,
     pub payload: Vec<u8>,
+    pub metadata: ExecutionMetadata,
+}
+
+/// Exposes event identity and kind without the unclassified payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventSummary {
+    pub event_id: String,
+    pub sequence: i64,
+    pub kind: String,
     pub metadata: ExecutionMetadata,
 }
 

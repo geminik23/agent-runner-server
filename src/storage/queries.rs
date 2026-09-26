@@ -5,12 +5,28 @@ use crate::core::ExecutionMetadata;
 use super::{
     sqlite::{SqliteStore, nonempty, validate_namespace},
     types::{
-        HookBinding, Namespace, NewSession, SkillRef, SkillVersion, StorageError, StoredAttempt,
-        StoredDelivery, StoredEvent, StoredInboxItem, StoredResult, StoredRun, StoredSession,
+        EventSummary, HookBinding, Namespace, NewSession, RunSummary, SkillRef, SkillVersion,
+        StorageError, StoredAttempt, StoredDelivery, StoredEvent, StoredInboxItem, StoredResult,
+        StoredRun, StoredSession,
     },
 };
 
 impl SqliteStore {
+    /// Reads status and provenance without loading the internal request or manifest.
+    pub fn get_run_summary(
+        &self,
+        namespace: &Namespace,
+        run_id: &str,
+    ) -> Result<Option<RunSummary>, StorageError> {
+        validate_namespace(namespace)?;
+        nonempty(run_id, "run_id")?;
+        self.connection.query_row(
+            "SELECT run_id, state, runtime, synthetic, scenario FROM runs WHERE owner_id = ?1 AND client_id = ?2 AND run_id = ?3",
+            params![namespace.owner_id, namespace.client_id, run_id],
+            |row| Ok(RunSummary { run_id: row.get(0)?, state: row.get(1)?, metadata: metadata_from_row(row, 2)? }),
+        ).optional().map_err(Into::into)
+    }
+
     /// Reads a run by server ID within its namespace.
     pub fn get_run(
         &self,
@@ -84,6 +100,37 @@ impl SqliteStore {
                     hook_revision: row.get(1)?,
                     destination_revision: row.get(2)?,
                     projection: row.get(3)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Reads ordered event metadata without loading unclassified payloads.
+    pub fn get_event_summaries(
+        &self,
+        namespace: &Namespace,
+        run_id: &str,
+        after: Option<i64>,
+    ) -> Result<Vec<EventSummary>, StorageError> {
+        validate_namespace(namespace)?;
+        nonempty(run_id, "run_id")?;
+        let mut statement = self.connection.prepare(
+            "SELECT e.event_id, e.sequence, e.kind, r.runtime, r.synthetic, r.scenario FROM events e JOIN runs r USING (owner_id, client_id, run_id) WHERE e.owner_id = ?1 AND e.client_id = ?2 AND e.run_id = ?3 AND e.sequence > ?4 ORDER BY e.sequence",
+        )?;
+        let rows = statement.query_map(
+            params![
+                namespace.owner_id,
+                namespace.client_id,
+                run_id,
+                after.unwrap_or(-1)
+            ],
+            |row| {
+                Ok(EventSummary {
+                    event_id: row.get(0)?,
+                    sequence: row.get(1)?,
+                    kind: row.get(2)?,
+                    metadata: metadata_from_row(row, 3)?,
                 })
             },
         )?;
