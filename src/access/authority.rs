@@ -115,6 +115,7 @@ pub(crate) struct LaunchAuthorization<'a> {
     pub workspace_id: &'a str,
     pub input_len: usize,
     pub resume: bool,
+    pub requires_skill_read: bool,
 }
 
 struct Registry {
@@ -377,11 +378,23 @@ impl ClientAccessControl {
         {
             return Err(AccessError::InvalidRequest);
         }
+        if let Some(skills) = &request.skills {
+            crate::storage::skills::validate_refs(skills, self.limits.max_identifier_bytes)
+                .map_err(|_| AccessError::InvalidRequest)?;
+        }
         if let StartSession::Resume { session_id } = &request.session {
             validate_resource_id(session_id, &self.limits)?;
             if !registration.scopes.contains(&Scope::SessionRead) {
                 return Err(AccessError::Forbidden);
             }
+        }
+        if request
+            .skills
+            .as_ref()
+            .is_some_and(|skills| !skills.is_empty())
+            && !registration.scopes.contains(&Scope::SkillRead)
+        {
+            return Err(AccessError::Forbidden);
         }
         let authorize = || {
             let profile = registry
@@ -396,7 +409,10 @@ impl ClientAccessControl {
             if request.input.request.len() > profile.max_input_bytes {
                 return Err(AccessError::InvalidRequest);
             }
-            Ok(AuthorizedStart::from_body(request.clone()))
+            Ok(AuthorizedStart::from_body(
+                request.clone(),
+                registration.scopes.contains(&Scope::SkillRead),
+            ))
         };
         operation(
             &registration.namespace,
@@ -425,6 +441,8 @@ impl ClientAccessControl {
             || registration.generation.as_deref() != Some(authorization.generation)
             || !registration.scopes.contains(&Scope::RunStart)
             || (authorization.resume && !registration.scopes.contains(&Scope::SessionRead))
+            || (authorization.requires_skill_read
+                && !registration.scopes.contains(&Scope::SkillRead))
             || !registration.profiles.contains(authorization.profile_id)
             || !profile.workspaces.contains(authorization.workspace_id)
             || authorization.input_len > profile.max_input_bytes
@@ -436,6 +454,10 @@ impl ClientAccessControl {
 
     pub(crate) fn request_limit(&self) -> usize {
         self.limits.max_request_bytes
+    }
+
+    pub(crate) fn skill_limit(&self) -> usize {
+        self.limits.max_skill_bytes
     }
 
     pub(crate) fn identifier_limit(&self) -> usize {
@@ -574,6 +596,7 @@ mod tests {
         };
         let current = create("generation_2", vec![Scope::RunStart]);
         let check = |generation, resume| LaunchAuthorization {
+            requires_skill_read: false,
             credential_id: "client",
             generation,
             namespace: &namespace,

@@ -3,6 +3,7 @@
 mod queries;
 mod runs;
 pub(crate) mod service;
+pub(crate) mod skills;
 mod sqlite;
 mod types;
 

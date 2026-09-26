@@ -67,7 +67,7 @@ impl SqliteStore {
         validate_namespace(namespace)?;
         nonempty(run_id, "run_id")?;
         let mut statement = self.connection.prepare(
-            "SELECT skill_id, version FROM run_skills WHERE owner_id = ?1 AND client_id = ?2 AND run_id = ?3 ORDER BY skill_id",
+            "SELECT skill_id, version FROM run_skills WHERE owner_id = ?1 AND client_id = ?2 AND run_id = ?3 ORDER BY position, skill_id",
         )?;
         let rows = statement.query_map(
             params![namespace.owner_id, namespace.client_id, run_id],

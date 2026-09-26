@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::storage::SkillRef;
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StartBody {
@@ -9,6 +11,18 @@ pub(crate) struct StartBody {
     pub session: StartSession,
     pub input: StartInput,
     pub idempotency_key: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_skills",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub skills: Option<Vec<SkillRef>>,
+}
+
+fn deserialize_skills<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<SkillRef>>, D::Error> {
+    Vec::<SkillRef>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -34,17 +48,23 @@ pub struct AuthorizedStart {
     input: String,
     idempotency_key: String,
     session: StartSession,
+    may_use_skills: bool,
 }
 
 impl AuthorizedStart {
-    pub(super) fn from_body(body: StartBody) -> Self {
+    pub(super) fn from_body(body: StartBody, may_use_skills: bool) -> Self {
         Self {
             profile_id: body.profile_id,
             workspace_id: body.workspace_id,
             input: body.input.request,
             idempotency_key: body.idempotency_key,
             session: body.session,
+            may_use_skills,
         }
+    }
+
+    pub(crate) fn may_use_skills(&self) -> bool {
+        self.may_use_skills
     }
 
     /// Returns the server-approved profile identifier.

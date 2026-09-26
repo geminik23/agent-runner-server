@@ -11,10 +11,11 @@ use super::{
     },
 };
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const APPLICATION_ID: i64 = 0x41525353;
 const INITIAL_MIGRATION: &str = include_str!("../../migrations/0001_initial.sql");
 const RUN_SERVICE_MIGRATION: &str = include_str!("../../migrations/0002_run_service.sql");
+const SKILL_REGISTRY_MIGRATION: &str = include_str!("../../migrations/0003_skill_registry.sql");
 
 /// Owns a synchronous SQLite connection; async callers must avoid blocking their runtime.
 pub struct SqliteStore {
@@ -52,11 +53,17 @@ impl SqliteStore {
                 }
                 transaction.execute_batch(INITIAL_MIGRATION)?;
                 transaction.execute_batch(RUN_SERVICE_MIGRATION)?;
+                transaction.execute_batch(SKILL_REGISTRY_MIGRATION)?;
                 transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             (APPLICATION_ID, 1) => {
                 transaction.execute_batch(RUN_SERVICE_MIGRATION)?;
+                transaction.execute_batch(SKILL_REGISTRY_MIGRATION)?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            }
+            (APPLICATION_ID, 2) => {
+                transaction.execute_batch(SKILL_REGISTRY_MIGRATION)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             (APPLICATION_ID, SCHEMA_VERSION) => {}

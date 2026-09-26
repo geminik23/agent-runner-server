@@ -15,20 +15,30 @@ use crate::{
     storage::{ResultView, StorageError},
 };
 
-pub(crate) const TOOLS: [&str; 6] = [
+pub(crate) const TOOLS: [&str; 12] = [
     "agents_list",
     "agents_start",
     "runs_get",
     "runs_result",
     "runs_events",
     "runs_cancel",
+    "skills_register",
+    "skills_list",
+    "skills_get",
+    "skills_set_enabled",
+    "skills_defaults",
+    "skills_set_defaults",
 ];
 
-pub(crate) fn required_scope(name: &str) -> Option<Scope> {
+pub(crate) fn required_scopes(name: &str) -> Option<&'static [Scope]> {
     match name {
-        "agents_list" | "agents_start" => Some(Scope::RunStart),
-        "runs_get" | "runs_result" | "runs_events" => Some(Scope::RunRead),
-        "runs_cancel" => Some(Scope::RunCancel),
+        "agents_list" | "agents_start" => Some(&[Scope::RunStart]),
+        "runs_get" | "runs_result" | "runs_events" => Some(&[Scope::RunRead]),
+        "runs_cancel" => Some(&[Scope::RunCancel]),
+        "skills_list" | "skills_get" | "skills_defaults" => Some(&[Scope::SkillRead]),
+        "skills_register" | "skills_set_enabled" | "skills_set_defaults" => {
+            Some(&[Scope::SkillRead, Scope::SkillWrite])
+        }
         _ => None,
     }
 }
@@ -73,6 +83,14 @@ impl From<StorageError> for ApiError {
                 Self::new(StatusCode::CONFLICT, "idempotency_conflict")
             }
             StorageError::SessionBusy => Self::new(StatusCode::CONFLICT, "session_busy"),
+            StorageError::SkillVersionConflict => {
+                Self::new(StatusCode::CONFLICT, "skill_version_conflict")
+            }
+            StorageError::SkillBundleConflict => {
+                Self::new(StatusCode::CONFLICT, "skill_bundle_conflict")
+            }
+            StorageError::SkillUnavailable => Self::new(StatusCode::CONFLICT, "skill_unavailable"),
+            StorageError::SkillUseForbidden => Self::new(StatusCode::FORBIDDEN, "forbidden"),
             StorageError::QueueFull => Self::new(StatusCode::TOO_MANY_REQUESTS, "queue_full"),
             StorageError::InvalidInput("result limit" | "event limit") => {
                 Self::new(StatusCode::INTERNAL_SERVER_ERROR, "stored_data_limit")
@@ -122,6 +140,7 @@ pub(crate) async fn execute(
     client: &AuthenticatedClient,
     name: &str,
     args: Value,
+    max_response_bytes: usize,
 ) -> Result<Value, ApiError> {
     match name {
         "agents_list" => {
@@ -187,6 +206,15 @@ pub(crate) async fn execute(
             };
             Ok(json!({"run_id": a.run_id, "outcome": outcome}))
         }
+        "skills_register"
+        | "skills_list"
+        | "skills_get"
+        | "skills_set_enabled"
+        | "skills_defaults"
+        | "skills_set_defaults" => handle
+            .skill_operation(client, name, args, max_response_bytes)
+            .await
+            .map_err(Into::into),
         _ => Err(ApiError::new(StatusCode::NOT_FOUND, "unknown_operation")),
     }
 }
@@ -251,15 +279,32 @@ impl<'de> Deserialize<'de> for UniqueValue {
     }
 }
 
-pub(crate) fn schema(name: &str) -> Value {
+pub(crate) fn schema(name: &str, max_skill_page: usize) -> Value {
     match name {
         "agents_list" => json!({"type":"object", "additionalProperties":false}),
         "agents_start" => {
             json!({"type":"object","required":["profile_id","workspace_id","input","idempotency_key"],"additionalProperties":false,"properties":{
                 "profile_id":{"type":"string"},"workspace_id":{"type":"string"},"idempotency_key":{"type":"string"},
+                "skills":{"description":"When omitted, use defaults. When present, replace defaults with exactly this ordered list; an empty list selects no skills. Nonempty selection requires SkillRead.","type":"array","maxItems":32,"items":{"type":"object","required":["skill_id","version"],"additionalProperties":false,"properties":{"skill_id":{"type":"string"},"version":{"type":"string"}}}},
                 "input":{"type":"object","required":["request"],"additionalProperties":false,"properties":{"request":{"type":"string"}}},
                 "session":{"oneOf":[{"type":"object","required":["mode"],"additionalProperties":false,"properties":{"mode":{"const":"new"}}},{"type":"object","required":["mode","session_id"],"additionalProperties":false,"properties":{"mode":{"const":"resume"},"session_id":{"type":"string"}}}]}
             }})
+        }
+        "skills_register" => {
+            json!({"type":"object","required":["skill_id","version","markdown"],"additionalProperties":false,"properties":{"skill_id":{"type":"string"},"version":{"type":"string"},"markdown":{"type":"string"},"required_capabilities":{"type":"array","maxItems":32,"items":{"type":"string"}}}})
+        }
+        "skills_get" => {
+            json!({"type":"object","required":["skill_id","version"],"additionalProperties":false,"properties":{"skill_id":{"type":"string"},"version":{"type":"string"}}})
+        }
+        "skills_list" => {
+            json!({"type":"object","required":["limit"],"additionalProperties":false,"properties":{"limit":{"type":"integer","minimum":1,"maximum":max_skill_page},"after":{"type":["object","null"],"required":["skill_id","version"],"additionalProperties":false,"properties":{"skill_id":{"type":"string"},"version":{"type":"string"}}}}})
+        }
+        "skills_set_enabled" => {
+            json!({"type":"object","required":["skill_id","version","enabled"],"additionalProperties":false,"properties":{"skill_id":{"type":"string"},"version":{"type":"string"},"enabled":{"type":"boolean"}}})
+        }
+        "skills_defaults" => json!({"type":"object","additionalProperties":false}),
+        "skills_set_defaults" => {
+            json!({"type":"object","required":["skills"],"additionalProperties":false,"properties":{"skills":{"type":"array","maxItems":32,"items":{"type":"object","required":["skill_id","version"],"additionalProperties":false,"properties":{"skill_id":{"type":"string"},"version":{"type":"string"}}}}}})
         }
         "runs_events" => {
             json!({"type":"object","required":["run_id","limit"],"additionalProperties":false,"properties":{"run_id":{"type":"string"},"after":{"type":["integer","null"],"minimum":0},"limit":{"type":"integer","minimum":1}}})

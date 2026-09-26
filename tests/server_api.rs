@@ -131,6 +131,45 @@ impl Fixture {
                 ["profile".into()],
             )
             .with_generation("other_v1"),
+            ClientRegistration::new(
+                "skill_admin",
+                CredentialSecret::new([12; 32]),
+                namespace.clone(),
+                [
+                    Scope::RunStart,
+                    Scope::RunRead,
+                    Scope::RunCancel,
+                    Scope::SessionRead,
+                    Scope::SkillRead,
+                    Scope::SkillWrite,
+                ],
+                ["profile".into()],
+            )
+            .with_generation("skill_admin_v1"),
+            ClientRegistration::new(
+                "other_skill",
+                CredentialSecret::new([13; 32]),
+                Namespace {
+                    owner_id: "owner".into(),
+                    client_id: "other".into(),
+                },
+                [
+                    Scope::RunStart,
+                    Scope::RunRead,
+                    Scope::SkillRead,
+                    Scope::SkillWrite,
+                ],
+                ["profile".into()],
+            )
+            .with_generation("other_skill_v1"),
+            ClientRegistration::new(
+                "skill_write_only",
+                CredentialSecret::new([14; 32]),
+                namespace.clone(),
+                [Scope::SkillWrite],
+                [],
+            )
+            .with_generation("skill_write_only_v1"),
         ];
         let access = Arc::new(
             ClientAccessControl::new(
@@ -316,6 +355,824 @@ impl Fixture {
             .unwrap();
         connection.try_lock().unwrap();
     }
+}
+
+#[tokio::test]
+async fn skill_registry_enforces_immutable_versions_scopes_and_capabilities() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let admin = token("skill_admin", 12);
+    let markdown = "---\nname: report\n---\nUse {{literal}} and $HOME.\n";
+    let registration = json!({"skill_id":"report","version":"1.0","markdown":markdown,"required_capabilities":["literal_prompt"]});
+    let r = f
+        .post("/v1/skills", &registration, &admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(payload(r).await["created"], true);
+    let r = f
+        .post("/v1/skills", &registration, &admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(payload(r).await["created"], false);
+    let r = f.post("/v1/skills", &json!({"skill_id":"report","version":"1.0","markdown":"changed","required_capabilities":["literal_prompt"]}), &admin).send().await.unwrap();
+    assert_eq!(r.status(), 409);
+    let r = f.post("/v1/skills", &json!({"skill_id":"report","version":"1.0","markdown":markdown,"required_capabilities":[]}), &admin).send().await.unwrap();
+    assert_eq!(r.status(), 409);
+    let exported = f
+        .tool(
+            "skills_get",
+            json!({"skill_id":"report","version":"1.0"}),
+            &admin,
+        )
+        .await;
+    assert_eq!(
+        exported["result"]["structuredContent"]["markdown"],
+        markdown
+    );
+    let r = f
+        .client
+        .get(format!("{}/v1/skills?limit=5", f.url))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(payload(r).await["items"][0]["skill_id"], "report");
+    let r = f
+        .client
+        .get(format!("{}/v1/skills/report/1.0", f.url))
+        .bearer_auth(token("other_skill", 13))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    let r = f
+        .post("/v1/skills", &registration, &token("skill_write_only", 14))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    let r = f.post("/v1/skills", &json!({"skill_id":"unsupported","version":"1","markdown":"text","required_capabilities":["filesystem"]}), &admin).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let mut request = start("unavailable-capability");
+    request["skills"] = json!([{"skill_id":"unsupported","version":"1"}]);
+    let r = f.post("/v1/runs", &request, &admin).send().await.unwrap();
+    assert_eq!(r.status(), 409);
+    let mut null_skills = start("null-skill-selection");
+    null_skills["skills"] = Value::Null;
+    assert_eq!(
+        f.post("/v1/runs", &null_skills, &admin)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    assert!(f.backend.captured_inputs().is_empty());
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn skill_snapshot_is_pinned_before_ack_and_replay_ignores_changed_defaults() {
+    let f = Fixture::new(DummyScenario::DelayedSuccess).await;
+    let admin = token("skill_admin", 12);
+    for (version, markdown) in [("1", "first {{literal}}"), ("2", "second")] {
+        assert_eq!(
+            f.post(
+                "/v1/skills",
+                &json!({"skill_id":"report","version":version,"markdown":markdown}),
+                &admin
+            )
+            .send()
+            .await
+            .unwrap()
+            .status(),
+            200
+        );
+    }
+    let one = json!({"skill_id":"report","version":"1"});
+    let two = json!({"skill_id":"report","version":"2"});
+    assert_eq!(
+        f.post("/v1/skill-defaults", &json!({"skills":[one]}), &admin)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let blocker = payload(
+        f.post("/v1/runs", &start("snapshot-blocker"), &admin)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while f.backend.captured_inputs().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let request = start("snapshot-queued");
+    let receipt = payload(f.post("/v1/runs", &request, &admin).send().await.unwrap()).await;
+    let id = receipt["run_id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        f.post("/v1/skill-defaults", &json!({"skills":[two]}), &admin)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let replay = f.tool("agents_start", request.clone(), &admin).await;
+    assert_eq!(replay["result"]["structuredContent"]["run_id"], id);
+    assert_eq!(replay["result"]["structuredContent"]["replay"], true);
+    let mut changed = request.clone();
+    changed["skills"] = json!([]);
+    assert_eq!(
+        f.post("/v1/runs", &changed, &admin)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while f.backend.captured_inputs().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let captured = f.backend.captured_inputs();
+    assert!(captured[1].request.prompt.contains("first {{literal}}"));
+    assert!(!captured[1].request.prompt.contains("second"));
+    let connection = rusqlite::Connection::open(&f.path).unwrap();
+    let snapshot: Vec<u8> = connection
+        .query_row(
+            "SELECT prompt FROM attempt_prompt_snapshots WHERE run_id = ?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(snapshot, captured[1].request.prompt.as_bytes());
+    drop(connection);
+    let r = f
+        .post(&format!("/v1/runs/{id}/cancel"), &json!({}), &admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_ne!(blocker["run_id"], receipt["run_id"]);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn resume_requires_original_skill_bundle_and_explicit_selection_overrides_defaults() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let admin = token("skill_admin", 12);
+    for version in ["1", "2"] {
+        assert_eq!(
+            f.post(
+                "/v1/skills",
+                &json!({"skill_id":"report","version":version,"markdown":version}),
+                &admin
+            )
+            .send()
+            .await
+            .unwrap()
+            .status(),
+            200
+        );
+    }
+    let one = json!({"skill_id":"report","version":"1"});
+    let two = json!({"skill_id":"report","version":"2"});
+    assert_eq!(
+        f.post(
+            "/v1/skill-defaults",
+            &json!({"skills":[one.clone()]}),
+            &admin
+        )
+        .send()
+        .await
+        .unwrap()
+        .status(),
+        200
+    );
+    let receipt = payload(
+        f.post("/v1/runs", &start("session-first"), &admin)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        f.wait_terminal(receipt["run_id"].as_str().unwrap()).await["state"],
+        "succeeded"
+    );
+    assert_eq!(
+        f.post("/v1/skill-defaults", &json!({"skills":[two]}), &admin)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let mut resume = start("session-mismatch");
+    resume["session"] = json!({"mode":"resume","session_id":receipt["session_id"]});
+    assert_eq!(
+        f.post("/v1/runs", &resume, &admin)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+    resume["idempotency_key"] = json!("session-matched");
+    resume["skills"] = json!([one]);
+    let r = f.post("/v1/runs", &resume, &admin).send().await.unwrap();
+    assert_eq!(r.status(), 202);
+    let resumed = payload(r).await;
+    assert_eq!(
+        f.wait_terminal(resumed["run_id"].as_str().unwrap()).await["state"],
+        "succeeded"
+    );
+    assert_eq!(f.backend.captured_inputs().len(), 2);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn revoked_queued_skill_is_not_launched_but_existing_replay_survives() {
+    let f = Fixture::new(DummyScenario::DelayedSuccess).await;
+    let admin = token("skill_admin", 12);
+    assert_eq!(
+        f.post(
+            "/v1/skills",
+            &json!({"skill_id":"report","version":"1","markdown":"instruction"}),
+            &admin
+        )
+        .send()
+        .await
+        .unwrap()
+        .status(),
+        200
+    );
+    assert_eq!(
+        f.post(
+            "/v1/skill-defaults",
+            &json!({"skills":[{"skill_id":"report","version":"1"}]}),
+            &admin
+        )
+        .send()
+        .await
+        .unwrap()
+        .status(),
+        200
+    );
+    let mut blocker = start("revoke-blocker");
+    blocker["skills"] = json!([]);
+    assert_eq!(
+        f.post("/v1/runs", &blocker, &admin)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        202
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while f.backend.captured_inputs().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let request = start("revoke-target");
+    let receipt = payload(f.post("/v1/runs", &request, &admin).send().await.unwrap()).await;
+    assert_eq!(
+        f.post(
+            "/v1/skills/report/1/enabled",
+            &json!({"enabled":false}),
+            &admin
+        )
+        .send()
+        .await
+        .unwrap()
+        .status(),
+        200
+    );
+    let replay = payload(f.post("/v1/runs", &request, &admin).send().await.unwrap()).await;
+    assert_eq!(replay["run_id"], receipt["run_id"]);
+    assert_eq!(replay["replay"], true);
+    assert_eq!(
+        f.post("/v1/runs", &start("revoked-new"), &admin)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+    let id = receipt["run_id"].as_str().unwrap();
+    let state = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let r = f
+                .client
+                .get(format!("{}/v1/runs/{id}", f.url))
+                .bearer_auth(&admin)
+                .send()
+                .await
+                .unwrap();
+            let value = payload(r).await;
+            if value["state"] == "failed" {
+                break value;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(state["state"], "failed");
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn revocation_after_prompt_commit_fails_only_the_affected_run() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let admin = token("skill_admin", 12);
+    assert_eq!(
+        f.post(
+            "/v1/skills",
+            &json!({"skill_id":"report","version":"1","markdown":"instruction"}),
+            &admin
+        )
+        .send()
+        .await
+        .unwrap()
+        .status(),
+        200
+    );
+    let connection = rusqlite::Connection::open(&f.path).unwrap();
+    connection.execute_batch("CREATE TRIGGER revoke_after_snapshot AFTER INSERT ON attempt_prompt_snapshots BEGIN UPDATE skill_policies SET enabled = 0 WHERE skill_id = 'report' AND version = '1'; END;").unwrap();
+    drop(connection);
+    let mut request = start("revoke-after-prompt");
+    request["skills"] = json!([{"skill_id":"report","version":"1"}]);
+    let receipt = payload(f.post("/v1/runs", &request, &admin).send().await.unwrap()).await;
+    assert_eq!(
+        f.wait_terminal(receipt["run_id"].as_str().unwrap()).await["state"],
+        "failed"
+    );
+    assert!(f.backend.captured_inputs().is_empty());
+    let mut next = start("after-revocation");
+    next["skills"] = json!([]);
+    let r = f.post("/v1/runs", &next, &admin).send().await.unwrap();
+    assert_eq!(r.status(), 202);
+    let next = payload(r).await;
+    assert_eq!(
+        f.wait_terminal(next["run_id"].as_str().unwrap()).await["state"],
+        "succeeded"
+    );
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn skill_use_requires_read_scope_but_explicit_empty_is_allowed() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let admin = token("skill_admin", 12);
+    let start_only = token("start", 8);
+    assert_eq!(
+        f.post(
+            "/v1/skills",
+            &json!({"skill_id":"secret","version":"1","markdown":"private"}),
+            &admin
+        )
+        .send()
+        .await
+        .unwrap()
+        .status(),
+        200
+    );
+    for id in ["secret", "not-present"] {
+        let mut request = start("denied");
+        request["skills"] = json!([{"skill_id":id,"version":"1"}]);
+        assert_eq!(
+            f.post("/v1/runs", &request, &start_only)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+    assert_eq!(
+        f.post(
+            "/v1/skill-defaults",
+            &json!({"skills":[{"skill_id":"secret","version":"1"}]}),
+            &admin
+        )
+        .send()
+        .await
+        .unwrap()
+        .status(),
+        200
+    );
+    assert_eq!(
+        f.post("/v1/runs", &start("default-denied"), &start_only)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    let mut existing = start("known-replay-key");
+    existing["skills"] = json!([{"skill_id":"secret","version":"1"}]);
+    let original = payload(f.post("/v1/runs", &existing, &admin).send().await.unwrap()).await;
+    assert_eq!(
+        f.wait_terminal(original["run_id"].as_str().unwrap()).await["state"],
+        "succeeded"
+    );
+    for id in ["secret", "not-present"] {
+        existing["skills"] = json!([{"skill_id":id,"version":"1"}]);
+        assert_eq!(
+            f.post("/v1/runs", &existing, &start_only)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+    let mut empty = start("explicit-empty");
+    empty["skills"] = json!([]);
+    let r = f
+        .post("/v1/runs", &empty, &start_only)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 202);
+    let receipt = payload(r).await;
+    assert_eq!(
+        f.wait_terminal(receipt["run_id"].as_str().unwrap()).await["state"],
+        "succeeded"
+    );
+    assert_eq!(
+        f.backend.captured_inputs().last().unwrap().request.prompt,
+        "literal input"
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn legacy_skill_identifiers_can_be_exported_selected_and_paginated() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let admin = token("skill_admin", 12);
+    let special = json!({"skill_id":"_legacy/path&name","version":"1.0+build"});
+    let registration = json!({"skill_id":"_legacy/path&name","version":"1.0+build","markdown":"legacy instruction"});
+    assert_eq!(
+        f.post("/v1/skills", &registration, &admin)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let r = f
+        .post("/v1/skills/get", &special, &admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(payload(r).await["markdown"], "legacy instruction");
+    let page = payload(
+        f.post("/v1/skills/list", &json!({"limit":1}), &admin)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(page["next_after"], special);
+    let next = payload(
+        f.post(
+            "/v1/skills/list",
+            &json!({"limit":1,"after":page["next_after"]}),
+            &admin,
+        )
+        .send()
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(next["items"].as_array().unwrap().len(), 0);
+    let mut request = start("legacy-skill");
+    request["skills"] = json!([special]);
+    let receipt = payload(f.post("/v1/runs", &request, &admin).send().await.unwrap()).await;
+    assert_eq!(
+        f.wait_terminal(receipt["run_id"].as_str().unwrap()).await["state"],
+        "succeeded"
+    );
+    assert!(
+        f.backend.captured_inputs()[0]
+            .request
+            .prompt
+            .contains("legacy instruction")
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn encoded_skill_paths_and_cursors_select_the_intended_identifier() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let admin = token("skill_admin", 12);
+    for id in ["ops/prod", "ops%2Fprod", "a/b", "a0"] {
+        let r = f
+            .post(
+                "/v1/skills",
+                &json!({"skill_id":id,"version":"1","markdown":id}),
+                &admin,
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+    let r = f
+        .post(
+            "/v1/skills/ops%2Fprod/1/enabled",
+            &json!({"enabled":false}),
+            &admin,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(payload(r).await["skill_id"], "ops/prod");
+    for (id, expected) in [("ops/prod", false), ("ops%2Fprod", true)] {
+        let r = f
+            .post(
+                "/v1/skills/get",
+                &json!({"skill_id":id,"version":"1"}),
+                &admin,
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(payload(r).await["enabled"], expected);
+    }
+    let r = f
+        .client
+        .get(format!(
+            "{}/v1/skills?limit=1&after_skill_id=a%2Fb&after_version=1",
+            f.url
+        ))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(payload(r).await["items"][0]["skill_id"], "a0");
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn mcp_skill_registration_and_defaults_are_shared_with_rest() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let admin = token("skill_admin", 12);
+    let registration = f
+        .tool(
+            "skills_register",
+            json!({"skill_id":"mcp","version":"1","markdown":"mcp instruction"}),
+            &admin,
+        )
+        .await;
+    assert_eq!(registration["result"]["structuredContent"]["created"], true);
+    let defaults = f
+        .tool(
+            "skills_set_defaults",
+            json!({"skills":[{"skill_id":"mcp","version":"1"}]}),
+            &admin,
+        )
+        .await;
+    assert_eq!(
+        defaults["result"]["structuredContent"]["skills"][0]["skill_id"],
+        "mcp"
+    );
+    let r = f
+        .client
+        .get(format!("{}/v1/skill-defaults", f.url))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(payload(r).await["skills"][0]["skill_id"], "mcp");
+    let receipt = payload(
+        f.post("/v1/runs", &start("mcp-skill"), &admin)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        f.wait_terminal(receipt["run_id"].as_str().unwrap()).await["state"],
+        "succeeded"
+    );
+    assert!(
+        f.backend.captured_inputs()[0]
+            .request
+            .prompt
+            .contains("mcp instruction")
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn skill_operations_work_with_both_legacy_mcp_revisions() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let admin = token("skill_admin", 12);
+    for version in ["2025-11-25", "2025-06-18"] {
+        let session = f.legacy_init(version, &admin).await;
+        let body = rpc(
+            "tools/call",
+            json!({"name":"skills_register","arguments":{"skill_id":"legacy-mcp","version":version,"markdown":"legacy instruction"}}),
+            false,
+        );
+        let r = f
+            .post("/mcp", &body, &admin)
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", version)
+            .header("Mcp-Session-Id", &session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let result = payload(r).await;
+        assert!(result["result"].get("resultType").is_none());
+        assert_eq!(result["result"]["structuredContent"]["created"], true);
+        let body = rpc(
+            "tools/call",
+            json!({"name":"skills_get","arguments":{"skill_id":"legacy-mcp","version":version}}),
+            false,
+        );
+        let r = f
+            .post("/mcp", &body, &admin)
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", version)
+            .header("Mcp-Session-Id", &session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            payload(r).await["result"]["structuredContent"]["markdown"],
+            "legacy instruction"
+        );
+        let r = f
+            .client
+            .delete(format!("{}/mcp", f.url))
+            .bearer_auth(&admin)
+            .header("MCP-Protocol-Version", version)
+            .header("Mcp-Session-Id", session)
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+    }
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn mcp_skill_discovery_matches_scopes_and_the_configured_page_limit() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let admin = token("skill_admin", 12);
+    let result = payload(f.modern(&rpc("tools/list", json!({}), true), &admin).await).await;
+    let tools = result["result"]["tools"].as_array().unwrap();
+    let skill_list = tools
+        .iter()
+        .find(|tool| tool["name"] == "skills_list")
+        .unwrap();
+    assert_eq!(
+        skill_list["inputSchema"]["properties"]["limit"]["maximum"],
+        16
+    );
+    let write_only = token("skill_write_only", 14);
+    let result = payload(
+        f.modern(&rpc("tools/list", json!({}), true), &write_only)
+            .await,
+    )
+    .await;
+    assert!(result["result"]["tools"].as_array().unwrap().is_empty());
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn oversized_stored_identifiers_fail_before_listing_or_default_resolution() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let admin = token("skill_admin", 12);
+    let connection = rusqlite::Connection::open(&f.path).unwrap();
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO namespaces (owner_id, client_id) VALUES ('owner', 'client')",
+            [],
+        )
+        .unwrap();
+    let id = "x".repeat(256);
+    connection.execute("INSERT INTO skill_versions (owner_id, client_id, skill_id, version, markdown) VALUES ('owner', 'client', ?1, '1', 'small')", [&id]).unwrap();
+    connection.execute("INSERT INTO skill_defaults (owner_id, client_id, position, skill_id, version) VALUES ('owner', 'client', 0, ?1, '1')", [&id]).unwrap();
+    drop(connection);
+    let r = f
+        .post("/v1/skills/list", &json!({"limit":1}), &admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let r = f
+        .client
+        .get(format!("{}/v1/skill-defaults", f.url))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert_eq!(
+        f.post("/v1/runs", &start("oversized-default"), &admin)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    assert_eq!(
+        f.post("/v1/skill-defaults", &json!({"skills":[]}), &admin)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn oversized_legacy_skill_is_rejected_and_can_still_be_revoked() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let admin = token("skill_admin", 12);
+    let connection = rusqlite::Connection::open(&f.path).unwrap();
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO namespaces (owner_id, client_id) VALUES ('owner', 'client')",
+            [],
+        )
+        .unwrap();
+    connection.execute("INSERT INTO skill_versions (owner_id, client_id, skill_id, version, markdown) VALUES ('owner', 'client', 'large', '1', ?1)", ["x".repeat(2048)]).unwrap();
+    drop(connection);
+    let reference = json!({"skill_id":"large","version":"1"});
+    let r = f
+        .post("/v1/skills/get", &reference, &admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let mut request = start("oversized-skill");
+    request["skills"] = json!([reference]);
+    let r = f.post("/v1/runs", &request, &admin).send().await.unwrap();
+    assert_eq!(r.status(), 400);
+    assert!(f.backend.captured_inputs().is_empty());
+    assert_eq!(
+        f.post(
+            "/v1/skills/large/1/enabled",
+            &json!({"enabled":false}),
+            &admin
+        )
+        .send()
+        .await
+        .unwrap()
+        .status(),
+        200
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn snapshot_storage_failure_never_launches_backend() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let connection = rusqlite::Connection::open(&f.path).unwrap();
+    connection.execute_batch("CREATE TRIGGER fail_prompt_snapshot BEFORE INSERT ON attempt_prompt_snapshots BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+    drop(connection);
+    let r = f
+        .post(
+            "/v1/runs",
+            &start("snapshot-failure"),
+            &token("skill_admin", 12),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 202);
+    let receipt = payload(r).await;
+    assert_eq!(
+        f.wait_terminal(receipt["run_id"].as_str().unwrap()).await["state"],
+        "failed"
+    );
+    assert!(f.backend.captured_inputs().is_empty());
+    f.finish().await;
 }
 
 #[tokio::test]

@@ -32,6 +32,13 @@ fn admission(key: &str) -> ServiceAdmission {
         resume_session_id: None,
         deadline_ms: 10_000,
         max_outstanding: 8,
+        skills: None,
+        may_use_skills: true,
+        skill_bounds: crate::storage::skills::SkillBounds {
+            markdown: 1024,
+            metadata: 4096,
+            identifier: 128,
+        },
     }
 }
 
@@ -42,6 +49,116 @@ fn success() -> Candidate {
         cleanup: CleanupState::Settled,
         disposition: SessionDisposition::Reusable,
     }
+}
+
+#[test]
+fn skill_free_prompt_respects_current_size_limit() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let mut input = admission("bounded-empty-bundle");
+    input.manifest = br#"{"version":2}"#.to_vec();
+    store.service_admit(&input).unwrap();
+    let job = store.service_claim(1_000).unwrap().unwrap();
+    assert!(matches!(
+        store.service_prepare_prompt(&job, "eleven bytes", 5, input.skill_bounds, 1_001),
+        Err(StorageError::InvalidInput("prompt limit"))
+    ));
+    let count: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM attempt_prompt_snapshots", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn stored_run_skill_references_follow_their_applied_order() {
+    use crate::storage::SkillRef;
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let mut input = admission("ordered-skills");
+    let refs = vec![
+        SkillRef {
+            skill_id: "z".into(),
+            version: "1".into(),
+        },
+        SkillRef {
+            skill_id: "a".into(),
+            version: "1".into(),
+        },
+    ];
+    for reference in &refs {
+        store
+            .register_skill(
+                &input.namespace,
+                reference,
+                "instruction",
+                &[],
+                input.skill_bounds,
+            )
+            .unwrap();
+    }
+    input.skills = Some(refs.clone());
+    let AdmissionOutcome::Accepted(run) = store.service_admit(&input).unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        store.get_run_skills(&input.namespace, &run.run_id).unwrap(),
+        refs
+    );
+}
+
+#[test]
+fn recovery_reuses_the_committed_prompt_before_launch() {
+    use crate::storage::SkillRef;
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let mut input = admission("snapshot-recovery");
+    let reference = SkillRef {
+        skill_id: "report".into(),
+        version: "1".into(),
+    };
+    store
+        .register_skill(
+            &input.namespace,
+            &reference,
+            "literal instructions",
+            &[],
+            input.skill_bounds,
+        )
+        .unwrap();
+    input.skills = Some(vec![reference]);
+    input.manifest = br#"{"version":2}"#.to_vec();
+    store.service_admit(&input).unwrap();
+    let first = store.service_claim(1_000).unwrap().unwrap();
+    let snapshot = store
+        .service_prepare_prompt(&first, "literal request", 4096, input.skill_bounds, 1_001)
+        .unwrap()
+        .unwrap();
+    assert!(snapshot.0.contains("literal instructions"));
+    assert!(snapshot.1);
+    store.service_recover(1_002).unwrap();
+    let recovered = store.service_claim(1_003).unwrap().unwrap();
+    assert_ne!(first.claim_token, recovered.claim_token);
+    assert_eq!(
+        store
+            .service_prepare_prompt(
+                &recovered,
+                "literal request",
+                4096,
+                input.skill_bounds,
+                1_004
+            )
+            .unwrap()
+            .unwrap(),
+        snapshot
+    );
+    let count: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM attempt_prompt_snapshots", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1);
+    assert!(store.service_launch(&recovered, 1_005).unwrap());
 }
 
 #[test]

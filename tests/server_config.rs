@@ -59,6 +59,27 @@ fn trusted_configuration_rejects_invalid_limits_unknown_fields_and_public_bindin
     assert!(PreparedServer::load(&config).is_err());
 }
 
+#[tokio::test]
+async fn existing_small_response_configuration_remains_startable() {
+    let temp = tempdir().unwrap();
+    let config = temp.path().join("config.json");
+    secret(&temp.path().join("secret"));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut value = settings(port);
+    value["run"]["max_event_bytes"] = json!(256);
+    value["run"]["max_page_size"] = json!(1);
+    value["transport"]["max_response_bytes"] = json!(73728);
+    write_config(&config, &value);
+    let prepared = PreparedServer::load(&config).unwrap();
+    assert!(!temp.path().join("runs.sqlite").exists());
+    let server = prepared.start().await.unwrap();
+    let stop = agent_runner_server::core::CancellationToken::new();
+    stop.cancel();
+    server.run(stop).await.unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn secret_files_must_be_private_regular_files_with_exact_encoding() {

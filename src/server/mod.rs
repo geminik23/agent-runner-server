@@ -858,13 +858,16 @@ fn validate_mcp(
                 value.get("id"),
             ));
         }
-        if let Some(scope) = value
+        if let Some(scopes) = value
             .pointer("/params/name")
             .and_then(Value::as_str)
-            .and_then(wire::required_scope)
-            && let Err(e) = shared.access.check_scope(&principal.client, scope)
+            .and_then(wire::required_scopes)
         {
-            return Some(response(e.into()));
+            for scope in scopes {
+                if let Err(e) = shared.access.check_scope(&principal.client, *scope) {
+                    return Some(response(e.into()));
+                }
+            }
         }
         if value
             .pointer("/params/arguments/session/mode")
@@ -880,6 +883,37 @@ fn validate_mcp(
     None
 }
 
+fn decode_uri_component(value: &str, query: bool) -> Result<String, ApiError> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut position = 0;
+    while position < bytes.len() {
+        match bytes[position] {
+            b'%' => {
+                let high = bytes
+                    .get(position + 1)
+                    .and_then(|v| (*v as char).to_digit(16))
+                    .ok_or_else(ApiError::invalid)?;
+                let low = bytes
+                    .get(position + 2)
+                    .and_then(|v| (*v as char).to_digit(16))
+                    .ok_or_else(ApiError::invalid)?;
+                decoded.push(((high << 4) | low) as u8);
+                position += 3;
+            }
+            b'+' if query => {
+                decoded.push(b' ');
+                position += 1;
+            }
+            value => {
+                decoded.push(value);
+                position += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| ApiError::invalid())
+}
+
 async fn rest(State(shared): State<Arc<Shared>>, request: Request) -> Response {
     let Some(principal) = request.extensions().get::<RequestPrincipal>() else {
         return response(ApiError::new(StatusCode::UNAUTHORIZED, "unauthenticated"));
@@ -891,8 +925,69 @@ async fn rest(State(shared): State<Arc<Shared>>, request: Request) -> Response {
         .get::<ParsedBody>()
         .map(|b| b.0.clone())
         .unwrap_or_else(|| json!({}));
+    macro_rules! decode {
+        ($value:expr, $query:expr) => {
+            match decode_uri_component($value, $query) {
+                Ok(value) => value,
+                Err(error) => return response(error),
+            }
+        };
+    }
     let (name, args) = match (method, path.as_slice()) {
         (&Method::GET, ["", "v1", "agents"]) => ("agents_list", json!({})),
+        (&Method::POST, ["", "v1", "skills"]) => ("skills_register", body),
+        (&Method::POST, ["", "v1", "skills", "list"]) => ("skills_list", body),
+        (&Method::POST, ["", "v1", "skills", "get"]) => ("skills_get", body),
+        (&Method::POST, ["", "v1", "skills", "enabled"]) => ("skills_set_enabled", body),
+        (&Method::GET, ["", "v1", "skills"]) => {
+            let mut limit = None;
+            let mut skill_id = None;
+            let mut version = None;
+            for pair in request.uri().query().unwrap_or("").split('&') {
+                match pair.split_once('=') {
+                    Some(("limit", v)) if limit.is_none() => {
+                        limit = v.parse::<usize>().ok();
+                        if limit.is_none() {
+                            return response(ApiError::invalid());
+                        }
+                    }
+                    Some(("after_skill_id", v)) if skill_id.is_none() => {
+                        skill_id = Some(decode!(v, true))
+                    }
+                    Some(("after_version", v)) if version.is_none() => {
+                        version = Some(decode!(v, true))
+                    }
+                    _ => return response(ApiError::invalid()),
+                }
+            }
+            let Some(limit) = limit else {
+                return response(ApiError::invalid());
+            };
+            let after = match (skill_id, version) {
+                (None, None) => Value::Null,
+                (Some(id), Some(version)) => json!({"skill_id":id,"version":version}),
+                _ => return response(ApiError::invalid()),
+            };
+            ("skills_list", json!({"limit":limit,"after":after}))
+        }
+        (&Method::GET, ["", "v1", "skills", id, version]) => (
+            "skills_get",
+            json!({"skill_id":decode!(id, false),"version":decode!(version, false)}),
+        ),
+        (&Method::POST, ["", "v1", "skills", id, version, "enabled"]) => {
+            let Some(enabled) = body.get("enabled").and_then(Value::as_bool) else {
+                return response(ApiError::invalid());
+            };
+            if body.as_object().is_none_or(|object| object.len() != 1) {
+                return response(ApiError::invalid());
+            }
+            (
+                "skills_set_enabled",
+                json!({"skill_id":decode!(id, false),"version":decode!(version, false),"enabled":enabled}),
+            )
+        }
+        (&Method::GET, ["", "v1", "skill-defaults"]) => ("skills_defaults", json!({})),
+        (&Method::POST, ["", "v1", "skill-defaults"]) => ("skills_set_defaults", body),
         (&Method::POST, ["", "v1", "runs"]) => ("agents_start", body),
         (&Method::GET, ["", "v1", "runs", id]) => ("runs_get", json!({"run_id":id})),
         (&Method::GET, ["", "v1", "runs", id, "result"]) => ("runs_result", json!({"run_id":id})),
@@ -932,10 +1027,21 @@ async fn rest(State(shared): State<Arc<Shared>>, request: Request) -> Response {
         }
         _ => return response(ApiError::new(StatusCode::NOT_FOUND, "not_found")),
     };
-    if name != "runs_events" && request.uri().query().is_some() {
+    if name != "runs_events"
+        && !(name == "skills_list" && method == Method::GET)
+        && request.uri().query().is_some()
+    {
         return response(ApiError::invalid());
     }
-    match wire::execute(&shared.handle, &principal.client, name, args).await {
+    match wire::execute(
+        &shared.handle,
+        &principal.client,
+        name,
+        args,
+        shared.limits.max_response_bytes,
+    )
+    .await
+    {
         Ok(value) => {
             let status = if name == "agents_start" && value["replay"] == false {
                 StatusCode::ACCEPTED

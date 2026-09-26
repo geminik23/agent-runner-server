@@ -9,7 +9,7 @@ use super::{
     queries::{load_run_by_key, load_session},
     sqlite::SqliteStore,
     types::{
-        AdmissionOutcome, EventSummary, Namespace, StorageError, StoredResult, StoredRun,
+        AdmissionOutcome, EventSummary, Namespace, SkillRef, StorageError, StoredResult, StoredRun,
         TerminalState,
     },
 };
@@ -47,6 +47,9 @@ pub(crate) struct ServiceAdmission {
     pub resume_session_id: Option<String>,
     pub deadline_ms: i64,
     pub max_outstanding: usize,
+    pub skills: Option<Vec<SkillRef>>,
+    pub may_use_skills: bool,
+    pub skill_bounds: super::skills::SkillBounds,
 }
 
 #[derive(Clone, Debug)]
@@ -186,6 +189,13 @@ impl SqliteStore {
             tx.commit()?;
             return Ok(AdmissionOutcome::Existing(existing));
         }
+        let selected_skills = super::skills::resolve(
+            &tx,
+            ns,
+            admission.skills.as_deref(),
+            admission.may_use_skills,
+            admission.skill_bounds,
+        )?;
         let outstanding: i64 = tx.query_row(
             "SELECT COUNT(*) FROM service_jobs j JOIN runs r USING (owner_id, client_id, run_id) WHERE r.state IN ('queued', 'preparing', 'running', 'validating')",
             [],
@@ -227,6 +237,11 @@ impl SqliteStore {
             if !compatible {
                 return Err(StorageError::InvalidState);
             }
+            if super::skills::bundle(&tx, "session", ns, id, admission.skill_bounds)?
+                != selected_skills
+            {
+                return Err(StorageError::SkillBundleConflict);
+            }
             id.clone()
         } else {
             let id = new_id(&tx, "session")?;
@@ -238,12 +253,24 @@ impl SqliteStore {
                 "INSERT INTO service_sessions (owner_id, client_id, session_id, profile_id, profile_revision, workspace_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![ns.owner_id, ns.client_id, id, admission.profile_id, admission.profile_revision, admission.workspace_id],
             )?;
+            for (position, skill) in selected_skills.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO session_skills (owner_id, client_id, session_id, position, skill_id, version) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![ns.owner_id, ns.client_id, id, position as i64, skill.skill_id, skill.version],
+                )?;
+            }
             id
         };
         tx.execute(
             "INSERT INTO runs (owner_id, client_id, run_id, session_id, idempotency_key, normalized_request, manifest, runtime, synthetic, scenario, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'queued')",
             params![ns.owner_id, ns.client_id, run_id, session_id, admission.idempotency_key, admission.normalized_request, admission.manifest, admission.metadata.runtime, admission.metadata.synthetic, admission.metadata.scenario],
         )?;
+        for (position, skill) in selected_skills.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO run_skills (owner_id, client_id, run_id, skill_id, version, position) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![ns.owner_id, ns.client_id, run_id, skill.skill_id, skill.version, position as i64],
+            )?;
+        }
         tx.execute(
             "INSERT INTO attempts (owner_id, client_id, run_id, attempt_id, state) VALUES (?1, ?2, ?3, ?4, 'queued')",
             params![ns.owner_id, ns.client_id, run_id, attempt_id],
@@ -322,6 +349,51 @@ impl SqliteStore {
         Ok(Some(job))
     }
 
+    pub(crate) fn service_prepare_prompt(
+        &mut self,
+        job: &ClaimedJob,
+        input: &str,
+        max_bytes: usize,
+        bounds: super::skills::SkillBounds,
+        now: impl Into<ServiceClock>,
+    ) -> Result<Option<(String, bool)>, StorageError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (stop, deadline, spawn) = job_status(&tx, job)?;
+        if stop.is_some() || now.into().read()? >= deadline {
+            tx.commit()?;
+            return Ok(None);
+        }
+        if spawn {
+            return Err(StorageError::InvalidState);
+        }
+        let has_skills =
+            !super::skills::bundle(&tx, "run", &job.namespace, &job.run_id, bounds)?.is_empty();
+        let existing: Option<(bool, Option<Vec<u8>>)> = tx.query_row(
+            "SELECT compiler_revision = ?5 AND context = ?6, CASE WHEN length(prompt) <= ?7 THEN prompt ELSE NULL END FROM attempt_prompt_snapshots WHERE owner_id = ?1 AND client_id = ?2 AND run_id = ?3 AND attempt_id = ?4",
+            params![job.namespace.owner_id, job.namespace.client_id, job.run_id, job.attempt_id, super::skills::COMPILER_REVISION, b"{\"source\":\"none\"}".as_slice(), i64::try_from(max_bytes).unwrap_or(i64::MAX)],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        if let Some((compatible, bytes)) = existing {
+            if !compatible {
+                return Err(StorageError::InvalidState);
+            }
+            let bytes = bytes.ok_or(StorageError::InvalidInput("prompt limit"))?;
+            let prompt = String::from_utf8(bytes).map_err(|_| StorageError::InvalidState)?;
+            tx.commit()?;
+            return Ok(Some((prompt, has_skills)));
+        }
+        let prompt =
+            super::skills::compile(&tx, &job.namespace, &job.run_id, input, max_bytes, bounds)?;
+        tx.execute(
+            "INSERT INTO attempt_prompt_snapshots (owner_id, client_id, run_id, attempt_id, compiler_revision, context, prompt) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![job.namespace.owner_id, job.namespace.client_id, job.run_id, job.attempt_id, super::skills::COMPILER_REVISION, b"{\"source\":\"none\"}".as_slice(), prompt.as_bytes()],
+        )?;
+        tx.commit()?;
+        Ok(Some((prompt, has_skills)))
+    }
+
     pub(crate) fn service_launch(
         &mut self,
         job: &ClaimedJob,
@@ -349,6 +421,26 @@ impl SqliteStore {
         }
         if spawn {
             return Err(StorageError::InvalidState);
+        }
+        let unavailable: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM run_skills r LEFT JOIN skills s USING (owner_id, client_id, skill_id) LEFT JOIN skill_policies p USING (owner_id, client_id, skill_id, version) WHERE r.owner_id = ?1 AND r.client_id = ?2 AND r.run_id = ?3 AND (COALESCE(s.enabled, 1) = 0 OR COALESCE(p.enabled, 1) = 0))",
+            params![job.namespace.owner_id, job.namespace.client_id, job.run_id], |row| row.get(0),
+        )?;
+        if unavailable {
+            return Err(StorageError::SkillUnavailable);
+        }
+        let requires_snapshot = serde_json::from_slice::<Value>(&job.manifest)
+            .ok()
+            .and_then(|v| v.get("version").and_then(Value::as_u64))
+            == Some(2);
+        if requires_snapshot {
+            let prepared: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM attempt_prompt_snapshots WHERE owner_id = ?1 AND client_id = ?2 AND run_id = ?3 AND attempt_id = ?4 AND compiler_revision = ?5)",
+                params![job.namespace.owner_id, job.namespace.client_id, job.run_id, job.attempt_id, super::skills::COMPILER_REVISION], |row| row.get(0),
+            )?;
+            if !prepared {
+                return Err(StorageError::InvalidState);
+            }
         }
         if tx.execute(
             "UPDATE attempts SET state = 'running', spawn_intent = 1 WHERE owner_id = ?1 AND client_id = ?2 AND run_id = ?3 AND attempt_id = ?4 AND state = 'preparing' AND spawn_intent = 0",

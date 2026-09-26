@@ -10,7 +10,8 @@ pub struct Namespace {
 }
 
 /// Identifies an immutable skill version within a namespace.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillRef {
     pub skill_id: String,
     pub version: String,
@@ -230,6 +231,9 @@ pub enum StorageError {
     NotFound,
     IdempotencyConflict,
     SkillVersionConflict,
+    SkillUnavailable,
+    SkillUseForbidden,
+    SkillBundleConflict,
     SessionBusy,
     QueueFull,
     AlreadyTerminal,
@@ -250,6 +254,9 @@ impl fmt::Display for StorageError {
             Self::SkillVersionConflict => {
                 formatter.write_str("skill version conflicts with existing content")
             }
+            Self::SkillUnavailable => formatter.write_str("skill is unavailable"),
+            Self::SkillUseForbidden => formatter.write_str("skill use is not authorized"),
+            Self::SkillBundleConflict => formatter.write_str("skill bundle conflicts"),
             Self::SessionBusy => formatter.write_str("session is reserved"),
             Self::QueueFull => formatter.write_str("execution queue is full"),
             Self::AlreadyTerminal => formatter.write_str("run is already terminal"),

@@ -166,6 +166,43 @@ impl ExecutionBackend for GateBackend {
 }
 
 #[tokio::test]
+async fn legacy_v2_database_replays_the_original_normalized_request() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("legacy.sqlite");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(include_str!("../migrations/0001_initial.sql"))
+        .unwrap();
+    connection
+        .execute_batch(include_str!("../migrations/0002_run_service.sql"))
+        .unwrap();
+    connection
+        .pragma_update(None, "application_id", 0x41525353_i64)
+        .unwrap();
+    connection.pragma_update(None, "user_version", 2).unwrap();
+    connection.execute_batch("INSERT INTO namespaces (owner_id, client_id) VALUES ('owner', 'client'); INSERT INTO sessions (owner_id, client_id, session_id, runtime, state_realm, native_id, cleanup, disposition) VALUES ('owner', 'client', 'legacy_session', 'dummy', 'dummy', 'legacy_native', 'settled', 'reusable'); INSERT INTO service_sessions (owner_id, client_id, session_id, profile_id, profile_revision, workspace_id) VALUES ('owner', 'client', 'legacy_session', 'profile', 'profile_v1', 'workspace');").unwrap();
+    let normalized = br#"{"profile_id":"profile","workspace_id":"workspace","session":{"mode":"new"},"input":{"request":"literal"},"idempotency_key":"legacy-key"}"#;
+    let manifest = serde_json::to_vec(&json!({"version":1,"profile_revision":"profile_v1","prompt":"literal","runtime":"dummy","synthetic":true,"scenario":"success","state_realm":"dummy","resume":false})).unwrap();
+    connection.execute("INSERT INTO runs (owner_id, client_id, run_id, session_id, idempotency_key, normalized_request, manifest, runtime, synthetic, scenario, state) VALUES ('owner', 'client', 'legacy_run', 'legacy_session', 'legacy-key', ?1, ?2, 'dummy', 1, 'success', 'succeeded')", rusqlite::params![normalized.as_slice(), manifest]).unwrap();
+    connection.execute_batch("INSERT INTO attempts (owner_id, client_id, run_id, attempt_id, state, spawn_intent, cleanup, disposition) VALUES ('owner', 'client', 'legacy_run', 'legacy_attempt', 'succeeded', 1, 'settled', 'reusable'); INSERT INTO service_jobs (owner_id, client_id, run_id, attempt_id, credential_id, credential_generation, profile_id, workspace_id, state_realm, deadline_ms) VALUES ('owner', 'client', 'legacy_run', 'legacy_attempt', 'credential', 'registration_1', 'profile', 'workspace', 'dummy', 9223372036854775806);").unwrap();
+    drop(connection);
+    let access = access();
+    let client = access.authenticate("credential", &[7; 32]).unwrap();
+    let backend = Arc::new(DummyBackend::new(DummyScenario::Success, 8));
+    let service = RunService::open(&path, access, vec![profile(backend.clone())], limits())
+        .await
+        .unwrap();
+    let replay = service
+        .start(&client, &body("legacy-key", "literal"))
+        .await
+        .unwrap();
+    assert_eq!(replay.run_id, "legacy_run");
+    assert!(replay.replay);
+    assert!(backend.captured_inputs().is_empty());
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn durable_admission_replay_execution_and_scoped_result() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("runs.sqlite");

@@ -156,6 +156,10 @@ struct Manifest {
     scenario: Option<String>,
     state_realm: String,
     resume: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compiler_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    policy_revision: Option<String>,
 }
 
 impl Manifest {
@@ -410,6 +414,11 @@ impl RunHandle {
             return Err(ServiceError::Access(AccessError::InvalidRequest));
         }
         let access = Arc::clone(&self.shared.access);
+        let skill_bounds = crate::storage::skills::SkillBounds {
+            markdown: access.skill_limit(),
+            metadata: access.request_limit(),
+            identifier: access.identifier_limit(),
+        };
         let profiles = Arc::clone(&self.shared.profiles);
         let client = client.clone();
         let body = body.to_vec();
@@ -454,7 +463,7 @@ impl RunHandle {
                                 return Err(AccessError::Forbidden);
                             }
                             let manifest = Manifest {
-                                version: 1,
+                                version: 2,
                                 profile_revision: profile.revision.clone(),
                                 prompt: approved.input().to_owned(),
                                 runtime: metadata.runtime.clone(),
@@ -462,6 +471,12 @@ impl RunHandle {
                                 scenario: metadata.scenario.clone(),
                                 state_realm: profile.state_realm.clone(),
                                 resume: approved.resume_session_id().is_some(),
+                                compiler_revision: Some(
+                                    crate::storage::skills::COMPILER_REVISION.to_owned(),
+                                ),
+                                policy_revision: Some(
+                                    crate::storage::skills::POLICY_REVISION.to_owned(),
+                                ),
                             };
                             let manifest = serde_json::to_vec(&manifest)
                                 .map_err(|_| AccessError::InvalidRequest)?;
@@ -488,6 +503,9 @@ impl RunHandle {
                                         .map(str::to_owned),
                                     deadline_ms,
                                     max_outstanding: limits.max_outstanding,
+                                    skills: request.skills.clone(),
+                                    may_use_skills: approved.may_use_skills(),
+                                    skill_bounds,
                                 })
                                 .map_err(Into::into)
                         },
@@ -782,6 +800,138 @@ impl RunHandle {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillRegisterArgs {
+    skill_id: String,
+    version: String,
+    markdown: String,
+    #[serde(default)]
+    required_capabilities: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillListArgs {
+    limit: usize,
+    #[serde(default)]
+    after: Option<crate::storage::SkillRef>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillEnabledArgs {
+    skill_id: String,
+    version: String,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillDefaultsArgs {
+    skills: Vec<crate::storage::SkillRef>,
+}
+
+impl RunHandle {
+    pub(crate) fn max_skill_page_size(&self) -> usize {
+        self.shared
+            .limits
+            .max_page_size
+            .min(crate::storage::skills::MAX_SKILLS)
+    }
+
+    pub(crate) async fn skill_operation(
+        &self,
+        client: &AuthenticatedClient,
+        operation: &str,
+        args: Value,
+        max_response_bytes: usize,
+    ) -> Result<Value, ServiceError> {
+        self.ensure_available()?;
+        let _permit = Arc::clone(&self.shared.intake)
+            .try_acquire_owned()
+            .map_err(|_| ServiceError::Unavailable)?;
+        let request_bytes = serde_json::to_vec(&args)
+            .map_err(|_| AccessError::InvalidRequest)?
+            .len();
+        if request_bytes > self.shared.access.request_limit()
+            || (operation == "skills_register"
+                && request_bytes
+                    .checked_mul(16)
+                    .and_then(|v| v.checked_add(8192))
+                    .is_none_or(|v| v > max_response_bytes))
+        {
+            return Err(AccessError::InvalidRequest.into());
+        }
+        let access = Arc::clone(&self.shared.access);
+        let client = client.clone();
+        let operation = operation.to_owned();
+        let max_page_size = self.shared.limits.max_page_size;
+        self.shared.database.call(move |store| {
+            let scopes: &[Scope] = match operation.as_str() {
+                "skills_register" | "skills_set_enabled" | "skills_set_defaults" => &[Scope::SkillRead, Scope::SkillWrite],
+                "skills_list" | "skills_get" | "skills_defaults" => &[Scope::SkillRead],
+                _ => return Err(AccessError::InvalidRequest.into()),
+            };
+            access.with_permissions(&client, scopes, |ns, limits| {
+                use crate::storage::{SkillRef, SkillWrite, skills::{MAX_SKILLS, SkillBounds, validate_refs}};
+                let bounds = SkillBounds { markdown: limits.max_skill_bytes, metadata: limits.max_request_bytes, identifier: limits.max_identifier_bytes };
+                let invalid = |_| AccessError::InvalidRequest;
+                match operation.as_str() {
+                    "skills_register" => {
+                        let mut input: SkillRegisterArgs = serde_json::from_value(args).map_err(invalid)?;
+                        let reference = SkillRef { skill_id: input.skill_id, version: input.version };
+                        validate_refs(std::slice::from_ref(&reference), limits.max_identifier_bytes)?;
+                        if input.markdown.is_empty() || input.markdown.len() > limits.max_skill_bytes
+                            || input.required_capabilities.len() > MAX_SKILLS
+                            || input.required_capabilities.iter().any(|c| c.is_empty() || c.len() > limits.max_identifier_bytes || !c.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))) {
+                            return Err(AccessError::InvalidRequest);
+                        }
+                        input.required_capabilities.sort();
+                        if input.required_capabilities.windows(2).any(|v| v[0] == v[1]) { return Err(AccessError::InvalidRequest); }
+                        let result = store.register_skill(ns, &reference, &input.markdown, &input.required_capabilities, bounds)?;
+                        Ok(json!({"skill_id":reference.skill_id,"version":reference.version,"created":result == SkillWrite::Inserted}))
+                    }
+                    "skills_get" => {
+                        let reference: SkillRef = serde_json::from_value(args).map_err(invalid)?;
+                        validate_refs(std::slice::from_ref(&reference), limits.max_identifier_bytes)?;
+                        let record = store.skill(ns, &reference, bounds)?.ok_or(StorageError::NotFound)?;
+                        if record.markdown.len() > limits.max_skill_bytes { return Err(AccessError::Storage(StorageError::InvalidInput("skill limit"))); }
+                        serde_json::to_value(record).map_err(invalid)
+                    }
+                    "skills_list" => {
+                        let input: SkillListArgs = serde_json::from_value(args).map_err(invalid)?;
+                        if input.limit == 0 || input.limit > max_page_size || input.limit > MAX_SKILLS { return Err(AccessError::InvalidRequest); }
+                        if let Some(after) = &input.after { validate_refs(std::slice::from_ref(after), limits.max_identifier_bytes)?; }
+                        let items = store.list_skills(ns, input.after.as_ref(), input.limit, bounds.identifier)?;
+                        let next_after = items.last().map(|s| json!({"skill_id":s.skill_id,"version":s.version}));
+                        Ok(json!({"items":items,"next_after":next_after}))
+                    }
+                    "skills_set_enabled" => {
+                        let input: SkillEnabledArgs = serde_json::from_value(args).map_err(invalid)?;
+                        let reference = SkillRef { skill_id: input.skill_id, version: input.version };
+                        validate_refs(std::slice::from_ref(&reference), limits.max_identifier_bytes)?;
+                        store.set_skill_enabled(ns, &reference, input.enabled)?;
+                        Ok(json!({"skill_id":reference.skill_id,"version":reference.version,"enabled":input.enabled}))
+                    }
+                    "skills_defaults" => {
+                        let empty: std::collections::HashMap<String, Value> = serde_json::from_value(args).map_err(invalid)?;
+                        if !empty.is_empty() { return Err(AccessError::InvalidRequest); }
+                        Ok(json!({"skills":store.skill_defaults(ns, bounds)?}))
+                    }
+                    "skills_set_defaults" => {
+                        let input: SkillDefaultsArgs = serde_json::from_value(args).map_err(invalid)?;
+                        validate_refs(&input.skills, limits.max_identifier_bytes)?;
+                        store.set_skill_defaults(ns, &input.skills, bounds)?;
+                        Ok(json!({"skills":input.skills}))
+                    }
+                    _ => Err(AccessError::InvalidRequest),
+                }
+            }).map_err(Into::into)
+        }).await
+    }
+}
+
 impl Drop for RunService {
     fn drop(&mut self) {
         stop_service(&self.shared, false);
@@ -1030,7 +1180,12 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
     let Some(profile) = shared.profiles.get(&job.profile_id).cloned() else {
         return finish_prelaunch(shared, &job, "profile_unavailable").await;
     };
-    if manifest.version != 1
+    if !matches!(manifest.version, 1 | 2)
+        || (manifest.version == 2
+            && (manifest.compiler_revision.as_deref()
+                != Some(crate::storage::skills::COMPILER_REVISION)
+                || manifest.policy_revision.as_deref()
+                    != Some(crate::storage::skills::POLICY_REVISION)))
         || manifest.profile_revision != profile.revision
         || manifest.metadata() != job.metadata
         || profile.backend.metadata() != job.metadata
@@ -1059,6 +1214,44 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
             })
             .await?;
     }
+    let (prompt, requires_skill_read) = if manifest.version == 2 {
+        let prepare_job = job.clone();
+        let input = manifest.prompt.clone();
+        let max_bytes = shared.access.request_limit();
+        let bounds = crate::storage::skills::SkillBounds {
+            markdown: shared.access.skill_limit(),
+            metadata: max_bytes,
+            identifier: shared.access.identifier_limit(),
+        };
+        match shared
+            .database
+            .call(move |store| {
+                store
+                    .service_prepare_prompt(
+                        &prepare_job,
+                        &input,
+                        max_bytes,
+                        bounds,
+                        ServiceClock::Wall,
+                    )
+                    .map_err(Into::into)
+            })
+            .await
+        {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => (manifest.prompt.clone(), false),
+            Err(ServiceError::Storage(
+                StorageError::SkillUnavailable
+                | StorageError::InvalidInput(_)
+                | StorageError::Database(_),
+            )) => {
+                return finish_prelaunch(shared, &job, "prompt_snapshot_unavailable").await;
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        (manifest.prompt.clone(), false)
+    };
     let mut changes = shared.changes.subscribe();
     let launch_job = job.clone();
     let launch_shutdown = shared.shutdown.clone();
@@ -1087,6 +1280,7 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
                         workspace_id: &launch_job.workspace_id,
                         input_len,
                         resume: launch_job.native_id.is_some(),
+                        requires_skill_read,
                     },
                     || store.service_launch(&launch_job, now).map_err(Into::into),
                 )
@@ -1098,6 +1292,12 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
         Ok(true) => {}
         Err(ServiceError::Access(AccessError::Forbidden | AccessError::Unauthenticated)) => {
             return finish_prelaunch(shared, &job, "launch_not_authorized").await;
+        }
+        Err(
+            ServiceError::Storage(StorageError::SkillUnavailable)
+            | ServiceError::Access(AccessError::Storage(StorageError::SkillUnavailable)),
+        ) => {
+            return finish_prelaunch(shared, &job, "skill_not_authorized").await;
         }
         Err(error) => return Err(error),
     }
@@ -1125,7 +1325,7 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
         run_id: job.run_id.clone(),
         attempt_id: job.attempt_id.clone(),
         session,
-        prompt: manifest.prompt,
+        prompt,
     };
     let cancellation = CancellationToken::new();
     let key = run_key(&job.namespace, &job.run_id);

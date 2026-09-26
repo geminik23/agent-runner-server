@@ -30,14 +30,14 @@ fn principal(context: &RequestContext<RoleServer>) -> Result<RequestPrincipal, E
         .ok_or_else(|| ErrorData::internal_error("missing authenticated request context", None))
 }
 
-fn tool(name: &str) -> Option<Tool> {
+fn tool(name: &str, max_skill_page: usize) -> Option<Tool> {
     if !wire::TOOLS.contains(&name) {
         return None;
     }
     let description = match name {
         "agents_list" => "List the profiles and workspaces currently granted to this caller.",
         "agents_start" => {
-            "Durably admit a run and return its receipt, not its result. Keep the same idempotency_key and request when retrying after any lost response or timeout. Disconnecting does not cancel the run. Query status and result separately."
+            "Durably admit a run and return its receipt, not its result. Omitted skills use defaults; an explicit ordered list replaces defaults, and an empty list disables them. Nonempty skills require SkillRead. Retry lost responses with the same idempotency_key and request. Disconnecting does not cancel the run."
         }
         "runs_get" => "Read current run status. A failed run is data, not a failed lookup.",
         "runs_result" => {
@@ -46,12 +46,25 @@ fn tool(name: &str) -> Option<Tool> {
         "runs_events" => {
             "Read a bounded page of event summaries without raw payloads. Continue with next_after; an empty page does not mean a running run has finished."
         }
-        _ => "Commit an explicit stop decision. The response does not prove cleanup has completed.",
+        "runs_cancel" => {
+            "Commit an explicit stop decision. The response does not prove cleanup has completed."
+        }
+        "skills_register" => {
+            "Register an immutable skill version with its exact Markdown and required capabilities."
+        }
+        "skills_list" => "List a bounded page of this client's skill versions.",
+        "skills_get" => "Read and export one exact skill version as Markdown.",
+        "skills_set_enabled" => {
+            "Enable or revoke an exact skill version for future admission and launch."
+        }
+        "skills_defaults" => "Read this client's ordered default skill versions.",
+        "skills_set_defaults" => "Replace this client's ordered default skill versions.",
+        _ => return None,
     };
     Some(Tool::new(
         name.to_owned(),
         description,
-        Arc::new(wire::schema(name).as_object()?.clone()),
+        Arc::new(wire::schema(name, max_skill_page).as_object()?.clone()),
     ))
 }
 
@@ -69,7 +82,7 @@ impl ServerHandler for Handler {
         ])
     }
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        tool(name)
+        tool(name, self.shared.handle.max_skill_page_size())
     }
 
     async fn list_tools(
@@ -91,14 +104,16 @@ impl ServerHandler for Handler {
         let tools: Vec<_> = wire::TOOLS
             .iter()
             .filter(|name| {
-                wire::required_scope(name).is_some_and(|scope| {
-                    self.shared
-                        .access
-                        .check_scope(&principal.client, scope)
-                        .is_ok()
+                wire::required_scopes(name).is_some_and(|scopes| {
+                    scopes.iter().all(|scope| {
+                        self.shared
+                            .access
+                            .check_scope(&principal.client, *scope)
+                            .is_ok()
+                    })
                 })
             })
-            .filter_map(|name| tool(name))
+            .filter_map(|name| tool(name, self.shared.handle.max_skill_page_size()))
             .collect();
         serde_json::from_value(serde_json::json!({"resultType":"complete", "tools":tools}))
             .map_err(|_| ErrorData::internal_error("tool metadata unavailable", None))
@@ -121,6 +136,7 @@ impl ServerHandler for Handler {
             &principal.client,
             &request.name,
             args,
+            self.shared.limits.max_response_bytes,
         )
         .await
         {
