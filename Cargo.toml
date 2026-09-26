@@ -6,6 +6,9 @@ edition = "2024"
 [dependencies]
 tokio = { version = "=1.53.1", features = ["macros", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+
 
 [dev-dependencies]
 tokio = { version = "=1.53.1", features = ["macros", "rt", "test-util"] }
+tempfile = "3.27.0"
