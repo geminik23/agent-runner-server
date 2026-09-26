@@ -1,0 +1,139 @@
+use std::{
+    borrow::Cow,
+    sync::{Arc, atomic::Ordering},
+};
+
+use rmcp::{
+    ErrorData, RoleServer, ServerHandler,
+    model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, ListToolsResult,
+        PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig, Tool,
+    },
+    service::RequestContext,
+};
+
+use super::{RequestPrincipal, Shared, wire};
+
+pub(super) const VERSIONS: [&str; 3] = ["2026-07-28", "2025-11-25", "2025-06-18"];
+
+#[derive(Clone)]
+pub(super) struct Handler {
+    pub shared: Arc<Shared>,
+}
+
+fn principal(context: &RequestContext<RoleServer>) -> Result<RequestPrincipal, ErrorData> {
+    context
+        .extensions
+        .get::<axum::http::request::Parts>()
+        .and_then(|p| p.extensions.get::<RequestPrincipal>())
+        .cloned()
+        .ok_or_else(|| ErrorData::internal_error("missing authenticated request context", None))
+}
+
+fn tool(name: &str) -> Option<Tool> {
+    if !wire::TOOLS.contains(&name) {
+        return None;
+    }
+    let description = match name {
+        "agents_list" => "List the profiles and workspaces currently granted to this caller.",
+        "agents_start" => {
+            "Durably admit a run and return its receipt, not its result. Keep the same idempotency_key and request when retrying after any lost response or timeout. Disconnecting does not cancel the run. Query status and result separately."
+        }
+        "runs_get" => "Read current run status. A failed run is data, not a failed lookup.",
+        "runs_result" => {
+            "Read result availability and exact UTF-8 or base64 payload. Pending is a normal result; do not resubmit the work with a new key."
+        }
+        "runs_events" => {
+            "Read a bounded page of event summaries without raw payloads. Continue with next_after; an empty page does not mean a running run has finished."
+        }
+        _ => "Commit an explicit stop decision. The response does not prove cleanup has completed.",
+    };
+    Some(Tool::new(
+        name.to_owned(),
+        description,
+        Arc::new(wire::schema(name).as_object()?.clone()),
+    ))
+}
+
+impl ServerHandler for Handler {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("agent-runner-server", env!("CARGO_PKG_VERSION")))
+            .with_instructions("Execution is asynchronous. Preserve idempotency keys across retries. MCP sessions and connections do not own durable runs. Only explicitly advertised profiles are available.")
+    }
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(&[
+            ProtocolVersion::V_2026_07_28,
+            ProtocolVersion::V_2025_11_25,
+            ProtocolVersion::V_2025_06_18,
+        ])
+    }
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        tool(name)
+    }
+
+    async fn list_tools(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let principal = principal(&context)?;
+        if request.is_some_and(|r| r.cursor.is_some()) {
+            return Err(ErrorData::invalid_params(
+                "tool-list cursors are not supported",
+                None,
+            ));
+        }
+        if self.shared.access.identity(&principal.client).is_err() {
+            principal.http_status.store(401, Ordering::Release);
+            return Err(ErrorData::internal_error("authentication required", None));
+        }
+        let tools: Vec<_> = wire::TOOLS
+            .iter()
+            .filter(|name| {
+                wire::required_scope(name).is_some_and(|scope| {
+                    self.shared
+                        .access
+                        .check_scope(&principal.client, scope)
+                        .is_ok()
+                })
+            })
+            .filter_map(|name| tool(name))
+            .collect();
+        serde_json::from_value(serde_json::json!({"resultType":"complete", "tools":tools}))
+            .map_err(|_| ErrorData::internal_error("tool metadata unavailable", None))
+    }
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let principal = principal(&context)?;
+        if !wire::TOOLS.contains(&request.name.as_ref()) {
+            return Err(ErrorData::invalid_params("unknown tool", None));
+        }
+        let args = request
+            .arguments
+            .map(serde_json::Value::Object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        let result = match wire::execute(
+            &self.shared.handle,
+            &principal.client,
+            &request.name,
+            args,
+        )
+        .await
+        {
+            Ok(value) => CallToolResult::structured(value),
+            Err(error) => {
+                if matches!(error.status.as_u16(), 401 | 403) {
+                    principal
+                        .http_status
+                        .store(error.status.as_u16(), Ordering::Release);
+                }
+                CallToolResult::structured_error(error.value())
+            }
+        };
+        Ok(CallToolResponse::Complete(result))
+    }
+}

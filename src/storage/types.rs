@@ -191,6 +191,17 @@ pub struct StoredResult {
     pub metadata: ExecutionMetadata,
 }
 
+/// Distinguishes an unknown run from pending and committed results in one read snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResultView {
+    NotFound,
+    Pending(RunSummary),
+    Available {
+        run: RunSummary,
+        result: StoredResult,
+    },
+}
+
 /// Represents an intent and the exact binding captured at admission.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredDelivery {

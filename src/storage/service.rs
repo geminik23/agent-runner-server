@@ -15,7 +15,22 @@ use super::{
 };
 
 type StopLookup = (String, Option<String>, Option<String>, Option<i64>);
-type LimitedResultRow = (String, Option<Vec<u8>>, String, bool, Option<String>);
+type LimitedResultRow = (
+    Option<String>,
+    Option<Vec<u8>>,
+    Option<String>,
+    bool,
+    Option<String>,
+    bool,
+);
+type LimitedRunRow = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+    Option<String>,
+    bool,
+);
 
 pub(crate) struct ServiceAdmission {
     pub namespace: Namespace,
@@ -530,31 +545,114 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub(crate) fn service_result(
+    pub(crate) fn service_run_summary(
         &self,
         namespace: &Namespace,
         run_id: &str,
         max_bytes: usize,
-    ) -> Result<Option<StoredResult>, StorageError> {
+    ) -> Result<Option<super::RunSummary>, StorageError> {
         let limit =
-            i64::try_from(max_bytes).map_err(|_| StorageError::InvalidInput("result limit"))?;
-        let row: Option<LimitedResultRow> = self.connection.query_row(
-            "SELECT x.revision, CASE WHEN length(x.payload) <= ?4 THEN x.payload ELSE NULL END, r.runtime, r.synthetic, r.scenario FROM results x JOIN runs r USING (owner_id, client_id, run_id) WHERE x.owner_id = ?1 AND x.client_id = ?2 AND x.run_id = ?3",
-            params![namespace.owner_id, namespace.client_id, run_id, limit],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            i64::try_from(max_bytes).map_err(|_| StorageError::InvalidInput("event limit"))?;
+        let row: Option<LimitedRunRow> = self.connection.query_row(
+            "SELECT CASE WHEN allowed THEN run_id END, CASE WHEN allowed THEN state END, CASE WHEN allowed THEN runtime END, synthetic, CASE WHEN allowed THEN scenario END, allowed FROM (SELECT run_id,state,runtime,synthetic,scenario,(length(CAST(run_id AS BLOB))+length(CAST(state AS BLOB))+length(CAST(runtime AS BLOB))+COALESCE(length(CAST(scenario AS BLOB)),0)) <= ?4 AS allowed FROM runs WHERE owner_id=?1 AND client_id=?2 AND run_id=?3)",
+            params![namespace.owner_id,namespace.client_id,run_id,limit],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
         ).optional()?;
-        row.map(|(revision, payload, runtime, synthetic, scenario)| {
-            Ok(StoredResult {
-                revision,
-                payload: payload.ok_or(StorageError::InvalidInput("result limit"))?,
+        row.map(|(run_id, state, runtime, synthetic, scenario, allowed)| {
+            if !allowed {
+                return Err(StorageError::InvalidInput("event limit"));
+            }
+            Ok(super::RunSummary {
+                run_id: run_id.ok_or(StorageError::InvalidState)?,
+                state: state.ok_or(StorageError::InvalidState)?,
                 metadata: ExecutionMetadata {
-                    runtime,
+                    runtime: runtime.ok_or(StorageError::InvalidState)?,
                     synthetic,
                     scenario,
                 },
             })
         })
         .transpose()
+    }
+
+    pub(crate) fn service_result(
+        &self,
+        namespace: &Namespace,
+        run_id: &str,
+        max_bytes: usize,
+        max_metadata_bytes: usize,
+    ) -> Result<Option<StoredResult>, StorageError> {
+        let limit =
+            i64::try_from(max_bytes).map_err(|_| StorageError::InvalidInput("result limit"))?;
+        let metadata_limit = i64::try_from(max_metadata_bytes)
+            .map_err(|_| StorageError::InvalidInput("event limit"))?;
+        let row: Option<LimitedResultRow> = self.connection.query_row(
+            "SELECT CASE WHEN allowed THEN revision END, CASE WHEN length(payload)<=?4 THEN payload END, CASE WHEN allowed THEN runtime END, synthetic, CASE WHEN allowed THEN scenario END, allowed FROM (SELECT x.revision,x.payload,r.runtime,r.synthetic,r.scenario,(length(CAST(x.revision AS BLOB))+length(CAST(r.runtime AS BLOB))+COALESCE(length(CAST(r.scenario AS BLOB)),0)) <= ?5 AS allowed FROM results x JOIN runs r USING (owner_id,client_id,run_id) WHERE x.owner_id=?1 AND x.client_id=?2 AND x.run_id=?3)",
+            params![namespace.owner_id,namespace.client_id,run_id,limit,metadata_limit],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+        ).optional()?;
+        row.map(
+            |(revision, payload, runtime, synthetic, scenario, allowed)| {
+                if !allowed {
+                    return Err(StorageError::InvalidInput("event limit"));
+                }
+                Ok(StoredResult {
+                    revision: revision.ok_or(StorageError::InvalidState)?,
+                    payload: payload.ok_or(StorageError::InvalidInput("result limit"))?,
+                    metadata: ExecutionMetadata {
+                        runtime: runtime.ok_or(StorageError::InvalidState)?,
+                        synthetic,
+                        scenario,
+                    },
+                })
+            },
+        )
+        .transpose()
+    }
+
+    pub(crate) fn service_result_view(
+        &self,
+        namespace: &Namespace,
+        run_id: &str,
+        max_bytes: usize,
+        max_metadata_bytes: usize,
+    ) -> Result<super::ResultView, StorageError> {
+        let tx = self.connection.unchecked_transaction()?;
+        let view = match self.service_run_summary(namespace, run_id, max_metadata_bytes)? {
+            None => super::ResultView::NotFound,
+            Some(run) => {
+                match self.service_result(namespace, run_id, max_bytes, max_metadata_bytes)? {
+                    Some(result) if is_terminal(&run.state) => {
+                        super::ResultView::Available { run, result }
+                    }
+                    None if !is_terminal(&run.state) => super::ResultView::Pending(run),
+                    _ => return Err(StorageError::InvalidState),
+                }
+            }
+        };
+        tx.commit()?;
+        Ok(view)
+    }
+
+    pub(crate) fn service_event_view(
+        &self,
+        namespace: &Namespace,
+        run_id: &str,
+        after: Option<i64>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<super::EventSummary>>, StorageError> {
+        let tx = self.connection.unchecked_transaction()?;
+        let page = if self
+            .service_run_summary(namespace, run_id, max_bytes)?
+            .is_some()
+        {
+            Some(self.service_events_page(namespace, run_id, after, limit, max_bytes)?)
+        } else {
+            None
+        };
+        tx.commit()?;
+        Ok(page)
     }
 
     pub(crate) fn service_events_page(

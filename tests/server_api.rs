@@ -1,0 +1,1810 @@
+use std::{path::PathBuf, sync::Arc, time::Duration};
+
+use agent_runner_server::{
+    access::{
+        AccessLimits, ClientAccessControl, ClientRegistration, CredentialSecret, ExecutionProfile,
+        Scope,
+    },
+    application::{BackendProfile, RunLimits, RunService},
+    runtimes::dummy::{DummyBackend, DummyScenario},
+    server::{Server, ServerLimits},
+    storage::Namespace,
+};
+use reqwest::{Client, Response};
+use serde_json::{Value, json};
+use tempfile::{TempDir, tempdir};
+use tokio::{io::AsyncWriteExt, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
+
+const MODERN: &str = "2026-07-28";
+fn token(id: &str, byte: u8) -> String {
+    format!("{id}.{}", format!("{byte:02x}").repeat(32))
+}
+fn start(key: &str) -> Value {
+    json!({"profile_id":"profile","workspace_id":"workspace","input":{"request":"literal input"},"idempotency_key":key})
+}
+fn rpc(method: &str, mut params: Value, modern: bool) -> Value {
+    if modern {
+        params["_meta"] = json!({"io.modelcontextprotocol/protocolVersion":MODERN,"io.modelcontextprotocol/clientCapabilities":{}});
+    }
+    json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})
+}
+async fn payload(r: Response) -> Value {
+    let text = r.text().await.unwrap();
+    if text.starts_with('{') {
+        serde_json::from_str(&text).unwrap()
+    } else {
+        serde_json::from_str(
+            text.lines()
+                .filter_map(|l| l.strip_prefix("data: "))
+                .find(|l| l.starts_with('{'))
+                .expect(&text),
+        )
+        .unwrap()
+    }
+}
+struct Fixture {
+    _dir: TempDir,
+    path: PathBuf,
+    url: String,
+    client: Client,
+    stop: CancellationToken,
+    task: JoinHandle<Result<(), agent_runner_server::server::ServerError>>,
+    backend: Arc<DummyBackend>,
+    access: Arc<ClientAccessControl>,
+    run_limits: RunLimits,
+    transport_limits: ServerLimits,
+}
+impl Fixture {
+    async fn new(scenario: DummyScenario) -> Self {
+        Self::with_timeout(scenario, Duration::from_secs(3)).await
+    }
+    async fn with_timeout(scenario: DummyScenario, request_timeout: Duration) -> Self {
+        Self::with_transport(scenario, request_timeout, |_| {}).await
+    }
+    async fn with_transport(
+        scenario: DummyScenario,
+        request_timeout: Duration,
+        configure: impl FnOnce(&mut ServerLimits),
+    ) -> Self {
+        Self::with_limits(scenario, request_timeout, |_| {}, configure).await
+    }
+    async fn with_limits(
+        scenario: DummyScenario,
+        request_timeout: Duration,
+        configure_runs: impl FnOnce(&mut RunLimits),
+        configure: impl FnOnce(&mut ServerLimits),
+    ) -> Self {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("runs.sqlite");
+        let namespace = Namespace {
+            owner_id: "owner".into(),
+            client_id: "client".into(),
+        };
+        let all = [
+            Scope::RunStart,
+            Scope::RunRead,
+            Scope::RunCancel,
+            Scope::SessionRead,
+        ];
+        let entries = [
+            ClientRegistration::new(
+                "full",
+                CredentialSecret::new([7; 32]),
+                namespace.clone(),
+                all,
+                ["profile".into()],
+            )
+            .with_generation("full_v1"),
+            ClientRegistration::new(
+                "start",
+                CredentialSecret::new([8; 32]),
+                namespace.clone(),
+                [Scope::RunStart],
+                ["profile".into()],
+            )
+            .with_generation("start_v1"),
+            ClientRegistration::new(
+                "read",
+                CredentialSecret::new([9; 32]),
+                namespace.clone(),
+                [Scope::RunRead],
+                [],
+            )
+            .with_generation("read_v1"),
+            ClientRegistration::new(
+                "control",
+                CredentialSecret::new([11; 32]),
+                namespace.clone(),
+                all,
+                ["profile".into()],
+            )
+            .with_generation("control_v1"),
+            ClientRegistration::new(
+                "other",
+                CredentialSecret::new([10; 32]),
+                Namespace {
+                    owner_id: "owner".into(),
+                    client_id: "other".into(),
+                },
+                all,
+                ["profile".into()],
+            )
+            .with_generation("other_v1"),
+        ];
+        let access = Arc::new(
+            ClientAccessControl::new(
+                entries,
+                [
+                    ExecutionProfile::dummy("profile", ["workspace".into()], 4096),
+                    ExecutionProfile::dummy("hidden", ["private".into()], 4096),
+                ],
+                AccessLimits {
+                    max_request_bytes: 8192,
+                    max_skill_bytes: 1024,
+                    max_identifier_bytes: 128,
+                },
+            )
+            .unwrap(),
+        );
+        let backend = Arc::new(DummyBackend::new(scenario, 64));
+        let profiles = vec![
+            BackendProfile {
+                profile_id: "profile".into(),
+                revision: "profile_v1".into(),
+                state_realm: "dummy".into(),
+                backend: backend.clone(),
+            },
+            BackendProfile {
+                profile_id: "hidden".into(),
+                revision: "hidden_v1".into(),
+                state_realm: "dummy".into(),
+                backend: backend.clone(),
+            },
+        ];
+        let mut runs = RunLimits {
+            max_outstanding: 8,
+            max_workers: 1,
+            database_queue: 16,
+            event_buffer: 16,
+            max_events_per_run: 32,
+            max_event_bytes: 2048,
+            max_result_bytes: 4096,
+            max_page_size: 16,
+            run_timeout: Duration::from_secs(10),
+            cleanup_grace: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(5),
+        };
+        configure_runs(&mut runs);
+        let service = RunService::open(&path, access.clone(), profiles, runs.clone())
+            .await
+            .unwrap();
+        let mut limits = ServerLimits {
+            max_request_bytes: 16384,
+            max_response_bytes: 1048576,
+            max_header_bytes: 8192,
+            max_inflight: 16,
+            max_connections: 16,
+            connection_idle_timeout: Duration::from_secs(6),
+            connection_max_lifetime: Duration::from_secs(30),
+            requests_per_second: 10000,
+            burst: 1000,
+            request_timeout,
+            shutdown_grace: Duration::from_secs(3),
+            max_mcp_sessions: 4,
+            mcp_session_idle: Duration::from_secs(60),
+        };
+        configure(&mut limits);
+        let server = Server::bind("127.0.0.1:0".parse().unwrap(), service, limits.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(server.run(stop.clone()));
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        Self {
+            _dir: dir,
+            path,
+            url,
+            client,
+            stop,
+            task,
+            backend,
+            access,
+            run_limits: runs,
+            transport_limits: limits,
+        }
+    }
+    fn post(&self, path: &str, body: &Value, credential: &str) -> reqwest::RequestBuilder {
+        self.client
+            .post(format!("{}{path}", self.url))
+            .bearer_auth(credential)
+            .json(body)
+    }
+    async fn modern(&self, body: &Value, credential: &str) -> Response {
+        let mut request = self
+            .post("/mcp", body, credential)
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", MODERN)
+            .header("Mcp-Method", body["method"].as_str().unwrap());
+        if let Some(name) = body.pointer("/params/name").and_then(Value::as_str) {
+            request = request.header("Mcp-Name", name);
+        }
+        request.send().await.unwrap()
+    }
+    async fn tool(&self, name: &str, args: Value, credential: &str) -> Value {
+        let r = self
+            .modern(
+                &rpc("tools/call", json!({"name":name,"arguments":args}), true),
+                credential,
+            )
+            .await;
+        assert_eq!(r.status(), 200);
+        payload(r).await
+    }
+    async fn legacy_init(&self, version: &str, credential: &str) -> String {
+        let body = rpc(
+            "initialize",
+            json!({"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"independent-http-fixture","version":"1"}}),
+            false,
+        );
+        let r = self
+            .post("/mcp", &body, credential)
+            .header("Accept", "application/json, text/event-stream")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let session = r.headers()["Mcp-Session-Id"].to_str().unwrap().to_owned();
+        assert_eq!(payload(r).await["result"]["protocolVersion"], version);
+        let r = self
+            .post(
+                "/mcp",
+                &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+                credential,
+            )
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", version)
+            .header("Mcp-Session-Id", &session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 202);
+        session
+    }
+    async fn wait_terminal(&self, id: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let r = self
+                    .client
+                    .get(format!("{}/v1/runs/{id}", self.url))
+                    .bearer_auth(token("full", 7))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), 200);
+                let value = payload(r).await;
+                if matches!(
+                    value["state"].as_str(),
+                    Some("succeeded" | "failed" | "cancelled" | "timed_out" | "interrupted")
+                ) {
+                    break value;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+    async fn finish(self) {
+        self.stop.cancel();
+        tokio::time::timeout(Duration::from_secs(5), self.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // A request handle retained by an SDK session must not retain the DB owner.
+        let connection = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .unwrap();
+        connection.try_lock().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn modern_discovery_tools_and_cross_transport_replay_execute_once() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let full = token("full", 7);
+    let r = f
+        .modern(&rpc("server/discover", json!({}), true), &full)
+        .await;
+    assert_eq!(r.status(), 200);
+    assert!(!r.headers().contains_key("Mcp-Session-Id"));
+    let d = payload(r).await;
+    assert_eq!(d["result"]["resultType"], "complete");
+    assert_eq!(
+        d["result"]["supportedVersions"],
+        json!([MODERN, "2025-11-25", "2025-06-18"])
+    );
+    assert_eq!(d["result"]["capabilities"], json!({"tools":{}}));
+    let list = f.modern(&rpc("tools/list", json!({}), true), &full).await;
+    assert_eq!(
+        payload(list).await["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        6
+    );
+    let profiles = f.tool("agents_list", json!({}), &full).await;
+    assert_eq!(
+        profiles["result"]["structuredContent"]["profiles"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        profiles["result"]["structuredContent"]["profiles"][0]["profile_id"],
+        "profile"
+    );
+    let r = f
+        .post("/v1/runs", &start("rest-first"), &full)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 202);
+    assert!(r.headers().contains_key("Location"));
+    let receipt = payload(r).await;
+    let id = receipt["run_id"].as_str().unwrap();
+    assert!(receipt.get("state").is_none());
+    let replay = f.tool("agents_start", start("rest-first"), &full).await;
+    assert_eq!(replay["result"]["structuredContent"]["run_id"], id);
+    assert_eq!(replay["result"]["structuredContent"]["replay"], true);
+    assert_eq!(f.wait_terminal(id).await["state"], "succeeded");
+    let r = f.tool("agents_start", start("mcp-first"), &full).await;
+    let id2 = r["result"]["structuredContent"]["run_id"].as_str().unwrap();
+    let r = f
+        .post("/v1/runs", &start("mcp-first"), &full)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(payload(r).await["run_id"], id2);
+    f.wait_terminal(id2).await;
+    assert_eq!(f.backend.captured_inputs().len(), 2);
+    let r = f
+        .client
+        .get(format!("{}/v1/runs/{id}/result", f.url))
+        .bearer_auth(&full)
+        .send()
+        .await
+        .unwrap();
+    let result = payload(r).await;
+    assert_eq!(result["availability"], "available");
+    assert_eq!(result["encoding"], "utf8");
+    assert_eq!(result["metadata"]["synthetic"], true);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn sdk_client_discovers_calls_and_replays_across_real_http() {
+    use rmcp::{
+        ClientLifecycleMode, ClientServiceExt,
+        model::{CallToolRequestParams, ClientConfig, ProtocolVersion},
+        transport::{
+            StreamableHttpClientTransport,
+            streamable_http_client::StreamableHttpClientTransportConfig,
+        },
+    };
+    let f = Fixture::new(DummyScenario::Success).await;
+    let transport = StreamableHttpClientTransport::with_client(
+        f.client.clone(),
+        StreamableHttpClientTransportConfig::with_uri(format!("{}/mcp", f.url))
+            .auth_header(token("full", 7)),
+    );
+    let client = ClientConfig::default()
+        .serve_with_lifecycle(
+            transport,
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(client.list_tools(None).await.unwrap().tools.len(), 6);
+    let args = start("sdk-client").as_object().unwrap().clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("agents_start").with_arguments(args))
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(false));
+    let receipt = result.structured_content.unwrap();
+    let id = receipt["run_id"].as_str().unwrap();
+    f.wait_terminal(id).await;
+    let r = f
+        .post("/v1/runs", &start("sdk-client"), &token("full", 7))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(payload(r).await["run_id"], id);
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    client.cancel().await.unwrap();
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn both_legacy_revisions_use_current_credentials_and_owned_sessions() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let full = token("full", 7);
+    for version in ["2025-11-25", "2025-06-18"] {
+        let session = f.legacy_init(version, &full).await;
+        let body = rpc(
+            "tools/call",
+            json!({"name":"agents_start","arguments":start(version)}),
+            false,
+        );
+        let r = f
+            .post("/mcp", &body, &full)
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", version)
+            .header("Mcp-Session-Id", &session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let receipt = payload(r).await;
+        assert!(!receipt["result"].get("resultType").is_some());
+        let id = receipt["result"]["structuredContent"]["run_id"]
+            .as_str()
+            .expect("current request principal must reach the handler");
+        f.wait_terminal(id).await;
+        for method in [reqwest::Method::POST, reqwest::Method::DELETE] {
+            let mut r = f
+                .client
+                .request(method.clone(), format!("{}/mcp", f.url))
+                .bearer_auth(token("other", 10))
+                .header("MCP-Protocol-Version", version)
+                .header("Mcp-Session-Id", &session)
+                .header("Accept", "application/json, text/event-stream");
+            if method == reqwest::Method::POST {
+                r = r.json(&body);
+            }
+            assert_eq!(r.send().await.unwrap().status(), 404);
+        }
+        let r = f
+            .client
+            .post(format!("{}/mcp", f.url))
+            .header("MCP-Protocol-Version", version)
+            .header("Mcp-Session-Id", &session)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+        let r = f
+            .client
+            .delete(format!("{}/mcp", f.url))
+            .bearer_auth(&full)
+            .header("MCP-Protocol-Version", version)
+            .header("Mcp-Session-Id", session)
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+        let r = f
+            .client
+            .get(format!("{}/v1/runs/{id}", f.url))
+            .bearer_auth(&full)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+    assert_eq!(f.backend.captured_inputs().len(), 2);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn scopes_namespace_revocation_and_client_info_do_not_establish_identity() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let full = token("full", 7);
+    let start_only = token("start", 8);
+    let r = f
+        .post("/v1/runs", &start("scopes"), &start_only)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 202);
+    let receipt = payload(r).await;
+    let id = receipt["run_id"].as_str().unwrap();
+    f.wait_terminal(id).await;
+    let replay = f.tool("agents_start", start("scopes"), &start_only).await;
+    assert!(replay["result"]["structuredContent"].get("state").is_none());
+    let mut resume = start("no-session-scope");
+    resume["session"] = json!({"mode":"resume","session_id":receipt["session_id"]});
+    assert_eq!(
+        f.post("/v1/runs", &resume, &start_only)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        f.modern(
+            &rpc(
+                "tools/call",
+                json!({"name":"agents_start","arguments":resume}),
+                true
+            ),
+            &start_only
+        )
+        .await
+        .status(),
+        403
+    );
+    let r = f
+        .client
+        .get(format!("{}/v1/runs/{id}", f.url))
+        .bearer_auth(&start_only)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    let b = rpc(
+        "tools/call",
+        json!({"name":"runs_get","arguments":{"run_id":id}}),
+        true,
+    );
+    assert_eq!(f.modern(&b, &start_only).await.status(), 403);
+    let mut spoof = b.clone();
+    spoof["params"]["_meta"]["io.modelcontextprotocol/clientInfo"] =
+        json!({"name":"full","version":"1"});
+    let r = f.modern(&spoof, &token("other", 10)).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(payload(r).await["result"]["isError"], true);
+    let r = f
+        .client
+        .get(format!("{}/v1/runs/{id}", f.url))
+        .bearer_auth(token("other", 10))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    let read = token("read", 9);
+    let r = f.modern(&rpc("tools/list", json!({}), true), &read).await;
+    assert_eq!(
+        payload(r).await["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        f.modern(
+            &rpc(
+                "tools/call",
+                json!({"name":"agents_start","arguments":start("denied")}),
+                true
+            ),
+            &read
+        )
+        .await
+        .status(),
+        403
+    );
+    f.access.revoke("full").unwrap();
+    assert_eq!(
+        f.modern(&rpc("server/discover", json!({}), true), &full)
+            .await
+            .status(),
+        401
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn protocol_validation_and_strict_business_parsing_have_no_execution_side_effects() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let full = token("full", 7);
+    let mut b = rpc("tools/list", json!({}), true);
+    b["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2025-11-25");
+    let r = f.modern(&b, &full).await;
+    assert_eq!(r.status(), 400);
+    assert_eq!(payload(r).await["error"]["code"], -32020);
+    let mut b = rpc("tools/list", json!({}), true);
+    b["params"]["_meta"]
+        .as_object_mut()
+        .unwrap()
+        .remove("io.modelcontextprotocol/clientCapabilities");
+    let r = f.modern(&b, &full).await;
+    assert_eq!(r.status(), 400);
+    assert_eq!(payload(r).await["error"]["code"], -32602);
+    let b = rpc(
+        "tools/list",
+        json!({"_meta":{"io.modelcontextprotocol/protocolVersion":"1900-01-01","io.modelcontextprotocol/clientCapabilities":{}}}),
+        false,
+    );
+    let r = f
+        .post("/mcp", &b, &full)
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "1900-01-01")
+        .header("Mcp-Method", "tools/list")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let p = payload(r).await;
+    assert_eq!(p["error"]["code"], -32022);
+    assert_eq!(
+        p["error"]["data"]["supported"],
+        json!([MODERN, "2025-11-25", "2025-06-18"])
+    );
+    let mut unknown = start("unknown");
+    unknown["client_id"] = json!("other");
+    assert_eq!(
+        f.post("/v1/runs", &unknown, &full)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    assert_eq!(
+        f.tool("agents_start", unknown, &full).await["result"]["isError"],
+        true
+    );
+    let mut oversized_input = start("unicode-input");
+    oversized_input["input"]["request"] = json!("한".repeat(1366));
+    assert_eq!(
+        f.post("/v1/runs", &oversized_input, &full)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    assert_eq!(
+        f.tool("agents_start", oversized_input, &full).await["result"]["isError"],
+        true
+    );
+    let mismatch = rpc(
+        "tools/call",
+        json!({"name":"agents_start","arguments":start("header-mismatch")}),
+        true,
+    );
+    let r = f
+        .post("/mcp", &mismatch, &full)
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", MODERN)
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", "runs_cancel")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert_eq!(payload(r).await["error"]["code"], -32020);
+    let encoded = rpc(
+        "tools/call",
+        json!({"name":"runs_get","arguments":{"run_id":"not-found"}}),
+        true,
+    );
+    let r = f
+        .post("/mcp", &encoded, &full)
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", MODERN)
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", "=?base64?cnVuc19nZXQ=?=")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(payload(r).await["result"]["isError"], true);
+    let unknown_method = rpc("unknown/method", json!({}), true);
+    let r = f.modern(&unknown_method, &full).await;
+    assert_eq!(r.status(), 404);
+    assert_eq!(payload(r).await["error"]["code"], -32601);
+    let malformed = f
+        .client
+        .post(format!("{}/mcp", f.url))
+        .bearer_auth(&full)
+        .header("Content-Type", "application/json")
+        .body("{")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), 400);
+    assert_eq!(payload(malformed).await["error"]["code"], -32700);
+    let duplicate = r#"{"profile_id":"profile","workspace_id":"workspace","input":{"request":"one","request":"two"},"idempotency_key":"duplicate"}"#;
+    let r = f
+        .client
+        .post(format!("{}/v1/runs", f.url))
+        .bearer_auth(&full)
+        .header("Content-Type", "application/json")
+        .body(duplicate)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let duplicate_rpc = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"agents_start","arguments":{duplicate},"_meta":{{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{{}}}}}}}}"#
+    );
+    let r = f
+        .client
+        .post(format!("{}/mcp", f.url))
+        .bearer_auth(&full)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", MODERN)
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", "agents_start")
+        .body(duplicate_rpc)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert_eq!(
+        f.post("/mcp", &json!([rpc("tools/list", json!({}), true)]), &full)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    assert_eq!(
+        f.post("/v1/runs", &json!({"padding":"x".repeat(20000)}), &full)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        413
+    );
+    assert!(f.backend.captured_inputs().is_empty());
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn pending_pagination_explicit_cancel_and_failed_run_are_normal_read_results() {
+    let f = Fixture::new(DummyScenario::DelayedSuccess).await;
+    let full = token("full", 7);
+    let r = f
+        .post("/v1/runs", &start("pending"), &full)
+        .send()
+        .await
+        .unwrap();
+    let receipt = payload(r).await;
+    let id = receipt["run_id"].as_str().unwrap();
+    let r = f.tool("runs_result", json!({"run_id":id}), &full).await;
+    assert_eq!(r["result"]["structuredContent"]["availability"], "pending");
+    assert_eq!(r["result"]["isError"], false);
+    let r = f
+        .client
+        .get(format!("{}/v1/runs/{id}/events?limit=1", f.url))
+        .bearer_auth(&full)
+        .send()
+        .await
+        .unwrap();
+    let page = payload(r).await;
+    assert_eq!(page["events"].as_array().unwrap().len(), 1);
+    assert!(page["events"][0].get("payload").is_none());
+    let cursor = page["next_after"].as_i64().unwrap();
+    let p = f
+        .tool(
+            "runs_events",
+            json!({"run_id":id,"after":cursor,"limit":1}),
+            &full,
+        )
+        .await;
+    if let Some(e) = p["result"]["structuredContent"]["events"][0].get("sequence") {
+        assert!(e.as_i64().unwrap() > cursor);
+    }
+    let r = f
+        .post(&format!("/v1/runs/{id}/cancel"), &json!({}), &full)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(payload(r).await["outcome"], "cancel_requested");
+    assert_eq!(f.wait_terminal(id).await["state"], "cancelled");
+    let r = f.tool("runs_result", json!({"run_id":id}), &full).await;
+    assert_eq!(r["result"]["isError"], false);
+    assert_eq!(r["result"]["structuredContent"]["state"], "cancelled");
+    for suffix in ["", "/result", "/events?limit=1"] {
+        assert_eq!(
+            f.client
+                .get(format!("{}/v1/runs/unknown{suffix}", f.url))
+                .bearer_auth(&full)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+    }
+    assert_eq!(
+        f.client
+            .get(format!("{}/v1/runs/{id}/events?limit=0", f.url))
+            .bearer_auth(&full)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    f.finish().await;
+    let f = Fixture::new(DummyScenario::Failure).await;
+    let r = f.tool("agents_start", start("failure"), &full).await;
+    let id = r["result"]["structuredContent"]["run_id"].as_str().unwrap();
+    assert_eq!(f.wait_terminal(id).await["state"], "failed");
+    assert_eq!(
+        f.tool("runs_result", json!({"run_id":id}), &full).await["result"]["isError"],
+        false
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn opaque_legacy_result_bytes_are_not_assumed_to_be_json() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let full = token("full", 7);
+    let r = f
+        .post("/v1/runs", &start("opaque"), &full)
+        .send()
+        .await
+        .unwrap();
+    let receipt = payload(r).await;
+    let id = receipt["run_id"].as_str().unwrap();
+    f.wait_terminal(id).await;
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    db.execute(
+        "UPDATE results SET payload=?1 WHERE run_id=?2",
+        rusqlite::params![vec![255u8, 0, 128], id],
+    )
+    .unwrap();
+    let p = f.tool("runs_result", json!({"run_id":id}), &full).await;
+    assert_eq!(p["result"]["structuredContent"]["encoding"], "base64");
+    assert_eq!(p["result"]["structuredContent"]["data"], "/wCA");
+    db.execute(
+        "UPDATE results SET payload=?1 WHERE run_id=?2",
+        rusqlite::params![vec![0u8; 4097], id],
+    )
+    .unwrap();
+    let r = f
+        .client
+        .get(format!("{}/v1/runs/{id}/result", f.url))
+        .bearer_auth(&full)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 500);
+    assert_eq!(payload(r).await["error"]["code"], "stored_data_limit");
+    db.execute(
+        "UPDATE results SET payload=?1 WHERE run_id=?2",
+        rusqlite::params![vec![1u8], id],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE runs SET scenario=?1 WHERE run_id=?2",
+        rusqlite::params!["x".repeat(2049), id],
+    )
+    .unwrap();
+    for suffix in ["", "/result", "/events?limit=1"] {
+        let response = f
+            .client
+            .get(format!("{}/v1/runs/{id}{suffix}", f.url))
+            .bearer_auth(&full)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 500);
+        assert_eq!(
+            payload(response).await["error"]["code"],
+            "stored_data_limit"
+        );
+    }
+    drop(db);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn lost_ack_and_disconnected_client_do_not_cancel_or_repeat_admitted_work() {
+    let f = Fixture::new(DummyScenario::DelayedSuccess).await;
+    let full = token("full", 7);
+    let address = f.url.strip_prefix("http://").unwrap();
+    let mut connection = tokio::net::TcpStream::connect(address).await.unwrap();
+    let body = start("lost-ack").to_string();
+    connection.write_all(format!("POST /v1/runs HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {full}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while f.backend.captured_inputs().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(connection);
+    let r = f.tool("agents_start", start("lost-ack"), &full).await;
+    assert_eq!(r["result"]["structuredContent"]["replay"], true);
+    let id = r["result"]["structuredContent"]["run_id"].as_str().unwrap();
+    assert_eq!(
+        f.tool("runs_get", json!({"run_id":id}), &full).await["result"]["structuredContent"]["state"],
+        "running"
+    );
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    f.tool("runs_cancel", json!({"run_id":id}), &full).await;
+    f.wait_terminal(id).await;
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn handler_timeout_during_sqlite_wait_keeps_the_original_admission() {
+    let f = Fixture::with_timeout(DummyScenario::Success, Duration::from_millis(80)).await;
+    let full = token("full", 7);
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let r = f
+        .post("/v1/runs", &start("timeout"), &full)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 504);
+    assert_eq!(payload(r).await["error"]["code"], "request_timeout");
+    db.execute_batch("COMMIT").unwrap();
+    drop(db);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let r = f
+        .post("/v1/runs", &start("timeout"), &full)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let receipt = payload(r).await;
+    assert_eq!(receipt["replay"], true);
+    f.wait_terminal(receipt["run_id"].as_str().unwrap()).await;
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn host_origin_and_bearer_are_checked_before_any_dispatch() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let full = token("full", 7);
+    assert_eq!(
+        f.client
+            .get(format!("{}/v1/agents", f.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        f.client
+            .get(format!("{}/v1/agents", f.url))
+            .bearer_auth("invalid")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        f.post("/v1/runs", &start("origin"), &full)
+            .header("Origin", "https://untrusted.example")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        f.post("/v1/runs", &start("host"), &full)
+            .header("Host", "evil.example")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    {
+        use tokio::io::AsyncReadExt;
+        let address = f.url.strip_prefix("http://").unwrap();
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let body = start("absolute-authority").to_string();
+        stream.write_all(format!("POST http://evil.example/v1/runs HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {full}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    }
+    assert!(f.backend.captured_inputs().is_empty());
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn only_the_exact_mcp_path_is_routed_and_unsupported_params_never_start_work() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let full = token("full", 7);
+    let session = f.legacy_init("2025-11-25", &full).await;
+    let body = rpc(
+        "tools/call",
+        json!({"name":"agents_start","arguments":start("bypass")}),
+        false,
+    );
+    for path in ["/mcp/", "/mcp/child"] {
+        let r = f
+            .post(path, &body, &full)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Mcp-Session-Id", &session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404);
+    }
+    let mut body = rpc(
+        "tools/call",
+        json!({"name":"agents_start","arguments":start("extra")}),
+        true,
+    );
+    body["params"]["client_id"] = json!("other");
+    let r = f.modern(&body, &full).await;
+    assert_eq!(r.status(), 400);
+    assert_eq!(payload(r).await["error"]["code"], -32602);
+    let mut body = rpc("tools/list", json!({}), true);
+    body["id"] = json!("x".repeat(12000));
+    let r = f
+        .post("/mcp", &body, &full)
+        .header("Accept", "application/json, text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert!(r.bytes().await.unwrap().len() < 8192);
+    assert!(f.backend.captured_inputs().is_empty());
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn duplicate_legacy_request_ids_are_rejected_before_either_response_is_reassigned() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let full = token("full", 7);
+    let session = f.legacy_init("2025-11-25", &full).await;
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let first = rpc(
+        "tools/call",
+        json!({"name":"agents_start","arguments":start("first-id")}),
+        false,
+    );
+    let client = f.client.clone();
+    let url = format!("{}/mcp", f.url);
+    let auth = full.clone();
+    let sid = session.clone();
+    let running = tokio::spawn(async move {
+        client
+            .post(url)
+            .bearer_auth(auth)
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2025-11-25")
+            .header("Mcp-Session-Id", sid)
+            .json(&first)
+            .send()
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let second = rpc(
+        "tools/call",
+        json!({"name":"agents_start","arguments":start("second-id")}),
+        false,
+    );
+    let r = f
+        .post("/mcp", &second, &full)
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .header("Mcp-Session-Id", &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert_eq!(payload(r).await["error"]["code"], -32600);
+    db.execute_batch("COMMIT").unwrap();
+    drop(db);
+    let r = running.await.unwrap();
+    assert_eq!(r.status(), 200);
+    let id = payload(r).await["result"]["structuredContent"]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.wait_terminal(&id).await;
+    let r = f
+        .post("/mcp", &second, &full)
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .header("Mcp-Session-Id", &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let id = payload(r).await["result"]["structuredContent"]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.wait_terminal(&id).await;
+    assert_eq!(f.backend.captured_inputs().len(), 2);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn legacy_timeout_retires_transport_session_but_preserves_a_committed_run() {
+    let f = Fixture::with_timeout(DummyScenario::Success, Duration::from_millis(100)).await;
+    let full = token("full", 7);
+    let session = f.legacy_init("2025-11-25", &full).await;
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let body = rpc(
+        "tools/call",
+        json!({"name":"agents_start","arguments":start("legacy-timeout")}),
+        false,
+    );
+    let r = f
+        .post("/mcp", &body, &full)
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .header("Mcp-Session-Id", &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 504);
+    db.execute_batch("COMMIT").unwrap();
+    drop(db);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let r = f
+        .post("/mcp", &body, &full)
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .header("Mcp-Session-Id", &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    let replay = f
+        .post("/v1/runs", &start("legacy-timeout"), &full)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), 200);
+    let receipt = payload(replay).await;
+    assert_eq!(receipt["replay"], true);
+    f.wait_terminal(receipt["run_id"].as_str().unwrap()).await;
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn global_request_and_rate_limits_bound_unauthenticated_and_concurrent_requests() {
+    let f = Fixture::with_transport(DummyScenario::Success, Duration::from_secs(3), |limits| {
+        limits.max_inflight = 1
+    })
+    .await;
+    let full = token("full", 7);
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let c = f.client.clone();
+    let url = format!("{}/v1/runs", f.url);
+    let auth = full.clone();
+    let first = tokio::spawn(async move {
+        c.post(url)
+            .bearer_auth(auth)
+            .json(&start("capacity"))
+            .send()
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let rejected = f
+        .client
+        .get(format!("{}/v1/agents", f.url))
+        .bearer_auth(&full)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 429);
+    db.execute_batch("COMMIT").unwrap();
+    drop(db);
+    let r = first.await.unwrap();
+    assert_eq!(r.status(), 202);
+    let receipt = payload(r).await;
+    f.wait_terminal(receipt["run_id"].as_str().unwrap()).await;
+    f.finish().await;
+    let f = Fixture::with_transport(DummyScenario::Success, Duration::from_secs(3), |limits| {
+        limits.requests_per_second = 1;
+        limits.burst = 1;
+    })
+    .await;
+    assert_eq!(
+        f.client
+            .get(format!("{}/v1/agents", f.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        f.client
+            .get(format!("{}/v1/agents", f.url))
+            .bearer_auth(full)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        429
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn legacy_session_capacity_is_bounded_and_released_on_delete() {
+    let f = Fixture::with_transport(DummyScenario::Success, Duration::from_secs(3), |limits| {
+        limits.max_mcp_sessions = 1
+    })
+    .await;
+    let full = token("full", 7);
+    let session = f.legacy_init("2025-11-25", &full).await;
+    let body = rpc(
+        "initialize",
+        json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}),
+        false,
+    );
+    let r = f
+        .post("/mcp", &body, &full)
+        .header("Accept", "application/json, text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 429);
+    let r = f
+        .client
+        .delete(format!("{}/mcp", f.url))
+        .bearer_auth(&full)
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .header("Mcp-Session-Id", session)
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    f.legacy_init("2025-06-18", &full).await;
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn idle_partial_headers_cannot_hold_unbounded_connection_capacity() {
+    let f = Fixture::with_transport(
+        DummyScenario::Success,
+        Duration::from_millis(100),
+        |limits| {
+            limits.max_connections = 1;
+            limits.connection_idle_timeout = Duration::from_millis(500);
+        },
+    )
+    .await;
+    let address = f.url.strip_prefix("http://").unwrap();
+    let mut slow = tokio::net::TcpStream::connect(address).await.unwrap();
+    slow.write_all(format!("GET /v1/agents HTTP/1.1\r\nHost: {address}\r\n").as_bytes())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let request = f
+        .client
+        .get(format!("{}/v1/agents", f.url))
+        .bearer_auth(token("full", 7))
+        .send();
+    tokio::pin!(request);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), &mut request)
+            .await
+            .is_err()
+    );
+    let response = tokio::time::timeout(Duration::from_secs(2), request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    drop(slow);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn cross_transport_replay_precedes_queue_saturation_and_rejects_conflicts() {
+    let f = Fixture::with_limits(
+        DummyScenario::DelayedSuccess,
+        Duration::from_secs(3),
+        |runs| runs.max_outstanding = 1,
+        |_| {},
+    )
+    .await;
+    let full = token("full", 7);
+    let accepted = f
+        .post("/v1/runs", &start("queue-full"), &full)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 202);
+    let receipt = payload(accepted).await;
+    let id = receipt["run_id"].as_str().unwrap();
+    assert_eq!(
+        f.post("/v1/runs", &start("other-key"), &full)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        429
+    );
+    let replay = f.tool("agents_start", start("queue-full"), &full).await;
+    assert_eq!(replay["result"]["structuredContent"]["run_id"], id);
+    assert_eq!(replay["result"]["structuredContent"]["replay"], true);
+    let mut conflict = start("queue-full");
+    conflict["input"]["request"] = json!("different");
+    assert_eq!(
+        f.post("/v1/runs", &conflict, &full)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+    let result = f.tool("agents_start", conflict, &full).await;
+    assert_eq!(result["result"]["isError"], true);
+    assert_eq!(
+        result["result"]["structuredContent"]["error"]["code"],
+        "idempotency_conflict"
+    );
+    f.tool("runs_cancel", json!({"run_id":id}), &full).await;
+    f.wait_terminal(id).await;
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn legacy_rpc_cancellation_does_not_cancel_a_durably_admitted_run() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let full = token("full", 7);
+    let session = f.legacy_init("2025-11-25", &full).await;
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let body = rpc(
+        "tools/call",
+        json!({"name":"agents_start","arguments":start("rpc-cancel")}),
+        false,
+    );
+    let client = f.client.clone();
+    let url = format!("{}/mcp", f.url);
+    let auth = full.clone();
+    let sid = session.clone();
+    let request = tokio::spawn(async move {
+        client
+            .post(url)
+            .bearer_auth(auth)
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2025-11-25")
+            .header("Mcp-Session-Id", sid)
+            .json(&body)
+            .send()
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let notice = json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1,"reason":"fixture"}});
+    let r = f
+        .post("/mcp", &notice, &full)
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .header("Mcp-Session-Id", &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 202);
+    let _ = tokio::time::timeout(Duration::from_secs(2), request).await;
+    let other = rpc(
+        "tools/call",
+        json!({"name":"agents_start","arguments":start("after-cancel-same-id")}),
+        false,
+    );
+    let blocked = f
+        .post("/mcp", &other, &full)
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .header("Mcp-Session-Id", &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), 404);
+    db.execute_batch("COMMIT").unwrap();
+    let blocked_count: i64 = db
+        .query_row(
+            "SELECT count(*) FROM runs WHERE idempotency_key='after-cancel-same-id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(blocked_count, 0);
+    drop(db);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let r = f
+        .post("/v1/runs", &start("rpc-cancel"), &full)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let replay = payload(r).await;
+    assert_eq!(replay["replay"], true);
+    assert_eq!(
+        f.wait_terminal(replay["run_id"].as_str().unwrap()).await["state"],
+        "succeeded"
+    );
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn replay_after_profile_revision_change_keeps_the_original_run_across_transports() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let full = token("full", 7);
+    let first = f.tool("agents_start", start("profile-change"), &full).await;
+    let run_id = first["result"]["structuredContent"]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.wait_terminal(&run_id).await;
+    let Fixture {
+        _dir,
+        path,
+        client,
+        stop,
+        task,
+        backend,
+        access,
+        run_limits,
+        transport_limits,
+        ..
+    } = f;
+    stop.cancel();
+    task.await.unwrap().unwrap();
+    let profiles = vec![
+        BackendProfile {
+            profile_id: "profile".into(),
+            revision: "profile_v2".into(),
+            state_realm: "dummy".into(),
+            backend: backend.clone(),
+        },
+        BackendProfile {
+            profile_id: "hidden".into(),
+            revision: "hidden_v1".into(),
+            state_realm: "dummy".into(),
+            backend: backend.clone(),
+        },
+    ];
+    let service = RunService::open(&path, access, profiles, run_limits)
+        .await
+        .unwrap();
+    let server = Server::bind("127.0.0.1:0".parse().unwrap(), service, transport_limits)
+        .await
+        .unwrap();
+    let url = format!("http://{}", server.local_addr().unwrap());
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(server.run(stop.clone()));
+    let r = client
+        .post(format!("{url}/v1/runs"))
+        .bearer_auth(&full)
+        .json(&start("profile-change"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let replay = payload(r).await;
+    assert_eq!(replay["run_id"], run_id);
+    assert_eq!(replay["replay"], true);
+    assert_eq!(backend.captured_inputs().len(), 1);
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(_dir);
+}
+
+#[tokio::test]
+async fn revocation_before_dispatch_blocks_queued_backend_execution() {
+    let f = Fixture::new(DummyScenario::DelayedSuccess).await;
+    let full = token("full", 7);
+    let control = token("control", 11);
+    let first = f
+        .post("/v1/runs", &start("running-before-revocation"), &full)
+        .send()
+        .await
+        .unwrap();
+    let first_id = payload(first).await["run_id"].as_str().unwrap().to_owned();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while f.backend.captured_inputs().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let second = f
+        .tool("agents_start", start("queued-before-revocation"), &full)
+        .await;
+    let second_id = second["result"]["structuredContent"]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.access.revoke("full").unwrap();
+    assert_eq!(
+        f.client
+            .get(format!("{}/v1/runs/{first_id}", f.url))
+            .bearer_auth(&control)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()["state"],
+        "running"
+    );
+    let state = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let response = f
+                .client
+                .get(format!("{}/v1/runs/{second_id}", f.url))
+                .bearer_auth(&control)
+                .send()
+                .await
+                .unwrap();
+            let value = payload(response).await;
+            if value["state"] == "failed" {
+                break value;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(state["state"], "failed");
+    let first = f
+        .client
+        .get(format!("{}/v1/runs/{first_id}", f.url))
+        .bearer_auth(&control)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(payload(first).await["state"], "succeeded");
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn modern_disconnect_does_not_cancel_an_admitted_run() {
+    let f = Fixture::new(DummyScenario::DelayedSuccess).await;
+    let full = token("full", 7);
+    let address = f.url.strip_prefix("http://").unwrap();
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let body = rpc(
+        "tools/call",
+        json!({"name":"agents_start","arguments":start("modern-disconnect")}),
+        true,
+    )
+    .to_string();
+    stream.write_all(format!("POST /mcp HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {full}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nMCP-Protocol-Version: {MODERN}\r\nMcp-Method: tools/call\r\nMcp-Name: agents_start\r\nContent-Length: {}\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while f.backend.captured_inputs().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(stream);
+    let r = f
+        .post("/v1/runs", &start("modern-disconnect"), &full)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let receipt = payload(r).await;
+    assert_eq!(receipt["replay"], true);
+    let id = receipt["run_id"].as_str().unwrap();
+    let status = f
+        .client
+        .get(format!("{}/v1/runs/{id}", f.url))
+        .bearer_auth(&full)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(payload(status).await["state"], "running");
+    f.tool("runs_cancel", json!({"run_id":id}), &full).await;
+    f.wait_terminal(id).await;
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn oversized_catalog_response_is_rejected_without_truncating_json() {
+    let dir = tempdir().unwrap();
+    let namespace = Namespace {
+        owner_id: "owner".into(),
+        client_id: "client".into(),
+    };
+    let registration = ClientRegistration::new(
+        "full",
+        CredentialSecret::new([7; 32]),
+        namespace,
+        [Scope::RunStart],
+        ["profile".into()],
+    )
+    .with_generation("generation");
+    let workspaces = (0..2000)
+        .map(|i| format!("workspace_{i:05}_{}", "x".repeat(40)))
+        .collect::<Vec<_>>();
+    let access = Arc::new(
+        ClientAccessControl::new(
+            [registration],
+            [ExecutionProfile::dummy("profile", workspaces, 1024)],
+            AccessLimits {
+                max_request_bytes: 4096,
+                max_skill_bytes: 1024,
+                max_identifier_bytes: 128,
+            },
+        )
+        .unwrap(),
+    );
+    let backend = Arc::new(DummyBackend::new(DummyScenario::Success, 0));
+    let run = RunLimits {
+        max_outstanding: 2,
+        max_workers: 1,
+        database_queue: 4,
+        event_buffer: 4,
+        max_events_per_run: 4,
+        max_event_bytes: 256,
+        max_result_bytes: 128,
+        max_page_size: 1,
+        run_timeout: Duration::from_secs(10),
+        cleanup_grace: Duration::from_secs(1),
+        poll_interval: Duration::from_millis(10),
+    };
+    let service = RunService::open(
+        dir.path().join("runs.sqlite"),
+        access,
+        vec![BackendProfile {
+            profile_id: "profile".into(),
+            revision: "revision".into(),
+            state_realm: "dummy".into(),
+            backend,
+        }],
+        run,
+    )
+    .await
+    .unwrap();
+    let limits = ServerLimits {
+        max_request_bytes: 8192,
+        max_response_bytes: 16384,
+        max_header_bytes: 8192,
+        max_inflight: 4,
+        max_connections: 4,
+        connection_idle_timeout: Duration::from_secs(4),
+        connection_max_lifetime: Duration::from_secs(30),
+        requests_per_second: 100,
+        burst: 100,
+        request_timeout: Duration::from_secs(2),
+        shutdown_grace: Duration::from_secs(2),
+        max_mcp_sessions: 2,
+        mcp_session_idle: Duration::from_secs(10),
+    };
+    let server = Server::bind("127.0.0.1:0".parse().unwrap(), service, limits)
+        .await
+        .unwrap();
+    let url = format!("http://{}/v1/agents", server.local_addr().unwrap());
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(server.run(stop.clone()));
+    let r = Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(url)
+        .bearer_auth(token("full", 7))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 500);
+    let response = payload(r).await;
+    assert_eq!(response["error"]["code"], "response_limit");
+    stop.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn dropping_server_future_releases_the_listener() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    assert_eq!(
+        f.client
+            .get(format!("{}/v1/agents", f.url))
+            .bearer_auth(token("full", 7))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let address = f
+        .url
+        .strip_prefix("http://")
+        .unwrap()
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    f.task.abort();
+    assert!(f.task.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match tokio::net::TcpListener::bind(address).await {
+                Ok(listener) => {
+                    drop(listener);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .expect("listener remained active after server cancellation");
+}
+
+#[tokio::test]
+async fn continuously_dripping_headers_cannot_hold_a_connection_forever() {
+    let f = Fixture::with_transport(
+        DummyScenario::Success,
+        Duration::from_millis(100),
+        |limits| {
+            limits.max_connections = 1;
+            limits.connection_idle_timeout = Duration::from_millis(300);
+            limits.connection_max_lifetime = Duration::from_millis(800);
+        },
+    )
+    .await;
+    let address = f.url.strip_prefix("http://").unwrap();
+    let mut slow = tokio::net::TcpStream::connect(address).await.unwrap();
+    slow.write_all(format!("GET /v1/agents HTTP/1.1\r\nHost: {address}\r\nX-Drip: ").as_bytes())
+        .await
+        .unwrap();
+    let dripper = tokio::spawn(async move {
+        loop {
+            if slow.write_all(b"x").await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let request = f
+        .client
+        .get(format!("{}/v1/agents", f.url))
+        .bearer_auth(token("full", 7))
+        .send();
+    tokio::pin!(request);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), &mut request)
+            .await
+            .is_err()
+    );
+    let result = tokio::time::timeout(Duration::from_secs(2), request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.status(), 200);
+    dripper.abort();
+    let _ = dripper.await;
+    f.finish().await;
+}

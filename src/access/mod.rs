@@ -5,8 +5,8 @@ mod request;
 mod store;
 
 pub use authority::{
-    AccessError, AccessLimits, AuthenticatedClient, ClientAccessControl, ClientRegistration,
-    CredentialSecret, ExecutionProfile, Scope,
+    AccessError, AccessLimits, AuthenticatedClient, ClientAccessControl, ClientIdentity,
+    ClientRegistration, CredentialSecret, ExecutionProfile, ProfileGrant, Scope,
 };
 pub(crate) use authority::{LaunchAuthorization, validate_resource_id};
 pub use request::{AuthorizedStart, StartSession};

@@ -25,8 +25,8 @@ use tokio::{
 
 use crate::{
     access::{
-        AccessError, AuthenticatedClient, AuthorizedStore, ClientAccessControl,
-        LaunchAuthorization, Scope, validate_resource_id,
+        AccessError, AuthenticatedClient, ClientAccessControl, LaunchAuthorization, Scope,
+        validate_resource_id,
     },
     core::{
         BackendError, CancellationToken, CleanupState, EventSink, EventSinkError, ExecutionBackend,
@@ -223,6 +223,12 @@ pub struct RunService {
     database_thread: Option<thread::JoinHandle<()>>,
 }
 
+/// A request handle whose lifetime does not own workers or the database guard.
+#[derive(Clone)]
+pub struct RunHandle {
+    shared: Arc<Shared>,
+}
+
 impl RunService {
     /// Opens a file-backed database, recovers prior work, and starts bounded workers.
     pub async fn open(
@@ -324,6 +330,72 @@ impl RunService {
         })
     }
 
+    pub(crate) fn minimum_response_bytes(&self) -> Option<usize> {
+        self.shared
+            .limits
+            .max_event_bytes
+            .checked_mul(self.shared.limits.max_page_size)
+            .map(|n| n.max(self.shared.limits.max_result_bytes))
+            .and_then(|n| n.checked_mul(16))
+            .and_then(|n| n.checked_add(8192))
+    }
+
+    pub(crate) fn access_control(&self) -> Arc<ClientAccessControl> {
+        Arc::clone(&self.shared.access)
+    }
+
+    /// Creates a request handle without transferring shutdown ownership.
+    pub fn handle(&self) -> RunHandle {
+        RunHandle {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    /// Stops new admissions and signals workers before transport drain.
+    pub fn begin_shutdown(&self) {
+        stop_service(&self.shared, false);
+    }
+
+    pub async fn start(
+        &self,
+        client: &AuthenticatedClient,
+        body: &[u8],
+    ) -> Result<RunReceipt, ServiceError> {
+        self.handle().start(client, body).await
+    }
+    pub async fn get_run(
+        &self,
+        client: &AuthenticatedClient,
+        run_id: &str,
+    ) -> Result<Option<RunSummary>, ServiceError> {
+        self.handle().get_run(client, run_id).await
+    }
+    pub async fn get_result(
+        &self,
+        client: &AuthenticatedClient,
+        run_id: &str,
+    ) -> Result<Option<StoredResult>, ServiceError> {
+        self.handle().get_result(client, run_id).await
+    }
+    pub async fn get_events(
+        &self,
+        client: &AuthenticatedClient,
+        run_id: &str,
+        after: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<EventSummary>, ServiceError> {
+        self.handle().get_events(client, run_id, after, limit).await
+    }
+    pub async fn cancel(
+        &self,
+        client: &AuthenticatedClient,
+        run_id: &str,
+    ) -> Result<CancelOutcome, ServiceError> {
+        self.handle().cancel(client, run_id).await
+    }
+}
+
+impl RunHandle {
     /// Authenticates the context again and commits a new request or returns its original run.
     pub async fn start(
         &self,
@@ -373,6 +445,9 @@ impl RunService {
                                 .ok_or(AccessError::Forbidden)?;
                             let metadata = profile.backend.metadata();
                             if metadata.runtime != approved.runtime()
+                                || metadata.runtime.len().saturating_add(
+                                    metadata.scenario.as_deref().map_or(0, str::len),
+                                ) > limits.max_event_bytes.saturating_sub(128)
                                 || (metadata.synthetic
                                     && metadata.scenario.as_deref().is_none_or(str::is_empty))
                             {
@@ -450,11 +525,17 @@ impl RunService {
         let access = Arc::clone(&self.shared.access);
         let client = client.clone();
         let run_id = run_id.to_owned();
+        let max_bytes = self.shared.limits.max_event_bytes;
         self.shared
             .database
             .call(move |store| {
-                AuthorizedStore::new(&access, &client, store)
-                    .get_run(&run_id)
+                access
+                    .with_permissions(&client, &[Scope::RunRead], |namespace, limits| {
+                        validate_resource_id(&run_id, limits)?;
+                        store
+                            .service_run_summary(namespace, &run_id, max_bytes)
+                            .map_err(Into::into)
+                    })
                     .map_err(Into::into)
             })
             .await
@@ -471,6 +552,7 @@ impl RunService {
         let client = client.clone();
         let run_id = run_id.to_owned();
         let max_bytes = self.shared.limits.max_result_bytes;
+        let max_metadata_bytes = self.shared.limits.max_event_bytes;
         self.shared
             .database
             .call(move |store| {
@@ -478,7 +560,7 @@ impl RunService {
                     .with_permissions(&client, &[Scope::RunRead], |namespace, limits| {
                         validate_resource_id(&run_id, limits)?;
                         store
-                            .service_result(namespace, &run_id, max_bytes)
+                            .service_result(namespace, &run_id, max_bytes, max_metadata_bytes)
                             .map_err(Into::into)
                     })
                     .map_err(Into::into)
@@ -572,13 +654,17 @@ impl RunService {
             None => CancelOutcome::AlreadyTerminal,
         })
     }
+}
 
+impl RunService {
     /// Stops admission, requests active workers to stop, and releases the database guard.
     pub async fn shutdown(mut self) -> Result<(), ServiceError> {
         stop_service(&self.shared, false);
         drop(self.shared.launch_gate.lock().await);
-        for worker in self.workers.drain(..) {
-            worker.await.map_err(|_| ServiceError::Unavailable)?;
+        while let Some(worker) = self.workers.last_mut() {
+            let result = worker.await;
+            self.workers.pop();
+            result.map_err(|_| ServiceError::Unavailable)?;
         }
         self.shared.database.stop().await?;
         if let Some(handle) = self.database_thread.take() {
@@ -592,6 +678,87 @@ impl RunService {
         } else {
             Ok(())
         }
+    }
+}
+
+impl RunHandle {
+    /// Lists only current grants backed by an available execution profile.
+    pub fn allowed_profiles(
+        &self,
+        client: &AuthenticatedClient,
+    ) -> Result<Vec<(crate::access::ProfileGrant, ExecutionMetadata)>, ServiceError> {
+        self.ensure_available()?;
+        self.shared
+            .access
+            .allowed_profiles(client)?
+            .into_iter()
+            .map(|grant| {
+                let profile = self
+                    .shared
+                    .profiles
+                    .get(&grant.profile_id)
+                    .ok_or(ServiceError::InvalidConfiguration)?;
+                Ok((grant, profile.backend.metadata()))
+            })
+            .collect()
+    }
+
+    /// Reads result availability without a race between independent status and result calls.
+    pub async fn get_result_view(
+        &self,
+        client: &AuthenticatedClient,
+        run_id: &str,
+    ) -> Result<crate::storage::ResultView, ServiceError> {
+        let _intake = self.reserve_resource_call(run_id)?;
+        let access = Arc::clone(&self.shared.access);
+        let client = client.clone();
+        let run_id = run_id.to_owned();
+        let max_bytes = self.shared.limits.max_result_bytes;
+        let max_metadata_bytes = self.shared.limits.max_event_bytes;
+        self.shared
+            .database
+            .call(move |store| {
+                access
+                    .with_permissions(&client, &[Scope::RunRead], |namespace, limits| {
+                        validate_resource_id(&run_id, limits)?;
+                        store
+                            .service_result_view(namespace, &run_id, max_bytes, max_metadata_bytes)
+                            .map_err(Into::into)
+                    })
+                    .map_err(Into::into)
+            })
+            .await
+    }
+
+    /// Distinguishes an unknown run from an empty event page in the same snapshot.
+    pub async fn get_event_page(
+        &self,
+        client: &AuthenticatedClient,
+        run_id: &str,
+        after: Option<i64>,
+        limit: usize,
+    ) -> Result<Option<Vec<EventSummary>>, ServiceError> {
+        let _intake = self.reserve_resource_call(run_id)?;
+        if limit == 0 || limit > self.shared.limits.max_page_size || after.is_some_and(|v| v < 0) {
+            return Err(AccessError::InvalidRequest.into());
+        }
+        let access = Arc::clone(&self.shared.access);
+        let client = client.clone();
+        let run_id = run_id.to_owned();
+        let max_bytes = self.shared.limits.max_event_bytes;
+        self.shared
+            .database
+            .call(move |store| {
+                access
+                    .with_permissions(&client, &[Scope::RunRead], |namespace, limits| {
+                        validate_resource_id(&run_id, limits)?;
+                        store
+                            .service_event_view(namespace, &run_id, after, limit, max_bytes)
+                            .map_err(Into::into)
+                    })
+                    .map_err(Into::into)
+            })
+            .await
     }
 
     fn reserve_resource_call(
@@ -618,6 +785,26 @@ impl RunService {
 impl Drop for RunService {
     fn drop(&mut self) {
         stop_service(&self.shared, false);
+        if let Some(database_thread) = self.database_thread.take() {
+            let workers = std::mem::take(&mut self.workers);
+            let database = self.shared.database.clone();
+            thread::spawn(move || {
+                if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                {
+                    runtime.block_on(async move {
+                        for worker in workers {
+                            let _ = worker.await;
+                        }
+                        let _ = database.stop().await;
+                    });
+                } else {
+                    let _ = database.sender.blocking_send(DbMessage::Stop);
+                }
+                let _ = database_thread.join();
+            });
+        }
     }
 }
 

@@ -293,3 +293,119 @@ async fn profile_realm_mismatch_is_rejected_before_start() {
         Err(ServiceError::InvalidConfiguration)
     ));
 }
+
+#[tokio::test]
+async fn cancelled_shutdown_eventually_releases_database_even_when_a_handle_is_retained() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("runs.sqlite");
+    let access = access();
+    let client = access.authenticate("client", &[1; 32]).unwrap();
+    let backend = Arc::new(DummyBackend::new(DummyScenario::Success, 4));
+    let service = RunService::open(
+        &path,
+        access.clone(),
+        vec![profile(backend.clone(), "revision_1")],
+        limits(),
+    )
+    .await
+    .unwrap();
+    let retained = service.handle();
+    let blocking = rusqlite::Connection::open(&path).unwrap();
+    blocking.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let pending = {
+        let handle = retained.clone();
+        let client = client.clone();
+        tokio::spawn(async move { handle.start(&client, &body("shutdown-timeout", None)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), service.shutdown())
+            .await
+            .is_err()
+    );
+    blocking.execute_batch("COMMIT").unwrap();
+    drop(blocking);
+    let _ = pending.await.unwrap();
+    let reopened = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match RunService::open(
+                &path,
+                access.clone(),
+                vec![profile(backend.clone(), "revision_1")],
+                limits(),
+            )
+            .await
+            {
+                Ok(service) => break service,
+                Err(ServiceError::AlreadyRunning) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await
+                }
+                Err(error) => panic!("unexpected reopen error: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("database owner was not released");
+    let replay = reopened
+        .start(&client, &body("shutdown-timeout", None))
+        .await
+        .unwrap();
+    assert!(replay.replay);
+    assert_eq!(
+        terminal(&reopened, &client, &replay.run_id).await,
+        "interrupted"
+    );
+    reopened.shutdown().await.unwrap();
+    drop(retained);
+}
+
+#[test]
+fn worker_join_failure_does_not_leave_the_database_owner_locked() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("runs.sqlite");
+    let access = access();
+    let backend = Arc::new(DummyBackend::new(DummyScenario::Success, 0));
+    let runtime_a = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let service = runtime_a
+        .block_on(RunService::open(
+            &path,
+            access.clone(),
+            vec![profile(backend.clone(), "revision_1")],
+            limits(),
+        ))
+        .unwrap();
+    let retained = service.handle();
+    drop(runtime_a);
+    let runtime_b = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    assert!(runtime_b.block_on(service.shutdown()).is_err());
+    let reopened = runtime_b.block_on(async {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match RunService::open(
+                    &path,
+                    access.clone(),
+                    vec![profile(backend.clone(), "revision_1")],
+                    limits(),
+                )
+                .await
+                {
+                    Ok(service) => break service,
+                    Err(ServiceError::AlreadyRunning) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await
+                    }
+                    Err(error) => panic!("unexpected reopen error: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("database owner remained locked after worker join failure")
+    });
+    runtime_b.block_on(reopened.shutdown()).unwrap();
+    drop(retained);
+}

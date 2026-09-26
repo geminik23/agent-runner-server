@@ -25,7 +25,8 @@ impl CredentialSecret {
 }
 
 /// Lists client operations that can be granted independently.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Scope {
     RunStart,
     RunRead,
@@ -133,6 +134,22 @@ pub struct ClientAccessControl {
 pub struct AuthenticatedClient {
     authority: Arc<()>,
     credential_id: String,
+}
+
+/// Binds a transport session to a current registration, never to its secret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientIdentity {
+    pub credential_id: String,
+    pub generation: String,
+    pub namespace: Namespace,
+}
+
+/// Describes only the profiles and workspaces granted to the current caller.
+#[derive(Clone, Debug)]
+pub struct ProfileGrant {
+    pub profile_id: String,
+    pub workspaces: Vec<String>,
+    pub max_input_bytes: usize,
 }
 
 /// Reports access failures without including credentials or request content.
@@ -264,6 +281,45 @@ impl ClientAccessControl {
             authority: Arc::clone(&self.authority),
             credential_id: credential_id.to_owned(),
         })
+    }
+
+    /// Returns a non-secret binding after checking the current registration.
+    pub fn identity(&self, client: &AuthenticatedClient) -> Result<ClientIdentity, AccessError> {
+        let registry = self.registry.read().map_err(|_| AccessError::Unavailable)?;
+        let registration = self.registration(&registry, client, &[])?;
+        Ok(ClientIdentity {
+            credential_id: registration.credential_id.clone(),
+            generation: registration
+                .generation
+                .clone()
+                .ok_or(AccessError::InvalidConfiguration)?,
+            namespace: registration.namespace.clone(),
+        })
+    }
+
+    /// Lists current start grants without exposing other profiles or credentials.
+    pub fn allowed_profiles(
+        &self,
+        client: &AuthenticatedClient,
+    ) -> Result<Vec<ProfileGrant>, AccessError> {
+        let registry = self.registry.read().map_err(|_| AccessError::Unavailable)?;
+        let registration = self.registration(&registry, client, &[Scope::RunStart])?;
+        let mut result = Vec::new();
+        for id in &registration.profiles {
+            let profile = registry
+                .profiles
+                .get(id)
+                .ok_or(AccessError::InvalidConfiguration)?;
+            let mut workspaces: Vec<_> = profile.workspaces.iter().cloned().collect();
+            workspaces.sort();
+            result.push(ProfileGrant {
+                profile_id: id.clone(),
+                workspaces,
+                max_input_bytes: profile.max_input_bytes,
+            });
+        }
+        result.sort_by(|a, b| a.profile_id.cmp(&b.profile_id));
+        Ok(result)
     }
 
     /// Removes a credential and invalidates future checks using existing contexts.
