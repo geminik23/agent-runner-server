@@ -34,6 +34,10 @@ fn admission(key: &str) -> ServiceAdmission {
         max_outstanding: 8,
         skills: None,
         may_use_skills: true,
+        hooks: None,
+        may_use_hooks: false,
+        destination_grants: Default::default(),
+        delivery: None,
         skill_bounds: crate::storage::skills::SkillBounds {
             markdown: 1024,
             metadata: 4096,
@@ -230,6 +234,7 @@ fn launch_checks_wall_clock_after_waiting_for_the_database_write_lock() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("deadline.sqlite");
     let mut input = admission("deadline");
+    let mut store = SqliteStore::open(&path).unwrap();
     input.deadline_ms = i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -237,8 +242,7 @@ fn launch_checks_wall_clock_after_waiting_for_the_database_write_lock() {
             .as_millis(),
     )
     .unwrap()
-        + 80;
-    let mut store = SqliteStore::open(&path).unwrap();
+        + 300;
     store.service_admit(&input).unwrap();
     let job = store.service_claim(ServiceClock::Wall).unwrap().unwrap();
     let lock = rusqlite::Connection::open(&path).unwrap();
@@ -250,7 +254,7 @@ fn launch_checks_wall_clock_after_waiting_for_the_database_write_lock() {
         store.service_launch(&job, ServiceClock::Wall).unwrap()
     });
     barrier.wait();
-    thread::sleep(Duration::from_millis(120));
+    thread::sleep(Duration::from_millis(400));
     lock.execute_batch("COMMIT").unwrap();
     assert!(!worker.join().unwrap());
     let store = SqliteStore::open(&path).unwrap();
@@ -632,4 +636,362 @@ fn proven_unstarted_resume_releases_only_its_own_reservation() {
         store.service_admit(&next).unwrap(),
         AdmissionOutcome::Accepted(_)
     ));
+}
+
+fn bind_completion(
+    store: &SqliteStore,
+    run_id: &str,
+    binding: &str,
+    connector: &str,
+    events: &str,
+) {
+    use rusqlite::params;
+    let ns = ["owner", "client"];
+    store.connection.execute(
+        "INSERT INTO completion_hook_versions (owner_id, client_id, hook_id, version, destination_id, destination_revision, destination_snapshot, events, projection) VALUES (?1, ?2, ?3, '1', ?3, '1', X'7B7D', ?4, 'metadata')",
+        params![ns[0], ns[1], binding, events],
+    ).unwrap();
+    store.connection.execute(
+        "INSERT INTO hook_bindings (owner_id, client_id, run_id, binding_id, hook_revision, destination_revision, projection) VALUES (?1, ?2, ?3, ?4, '1', '1', X'6D65746164617461')",
+        params![ns[0], ns[1], run_id, binding],
+    ).unwrap();
+    store.connection.execute(
+        "INSERT INTO completion_bindings (owner_id, client_id, run_id, binding_id, hook_id, hook_version, destination_id, destination_revision, destination_snapshot, connector, events, projection, max_payload_bytes, max_attempts, delivery_ttl_ms, retention_ms) VALUES (?1, ?2, ?3, ?4, ?4, '1', ?4, '1', X'7B7D', ?5, ?6, 'metadata', 4096, 2, 10000, 10000)",
+        params![ns[0], ns[1], run_id, binding, connector, events],
+    ).unwrap();
+}
+
+#[test]
+fn completion_outbox_and_inbox_follow_the_final_cancelled_state() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let input = admission("completion-cancel");
+    let AdmissionOutcome::Accepted(run) = store.service_admit(&input).unwrap() else {
+        panic!()
+    };
+    bind_completion(
+        &store,
+        &run.run_id,
+        "a-webhook",
+        "webhook_test",
+        r#"["cancelled"]"#,
+    );
+    bind_completion(
+        &store,
+        &run.run_id,
+        "b-success",
+        "webhook_test",
+        r#"["succeeded"]"#,
+    );
+    bind_completion(&store, &run.run_id, "z-inbox", "inbox", r#"["cancelled"]"#);
+    let job = store.service_claim(1_000).unwrap().unwrap();
+    store.service_launch(&job, 1_001).unwrap();
+    store
+        .service_stop(&input.namespace, &run.run_id, StopCause::Cancelled, 1_002)
+        .unwrap();
+    store.service_finish(&job, &success(), 1_003, 1024).unwrap();
+    let deliveries = store.get_deliveries(&input.namespace, &run.run_id).unwrap();
+    assert_eq!(deliveries.len(), 1);
+    let value: serde_json::Value = serde_json::from_slice(&deliveries[0].payload).unwrap();
+    assert_eq!(value["state"], "cancelled");
+    assert_eq!(value["synthetic"], true);
+    assert_eq!(value["result_revision"], "1");
+    assert!(value.get("details").is_none());
+    let inbox = store
+        .get_inbox_items(&input.namespace, &run.run_id)
+        .unwrap();
+    assert_eq!(inbox.len(), 1);
+    let value: serde_json::Value = serde_json::from_slice(&inbox[0].payload).unwrap();
+    assert_eq!(value["state"], "cancelled");
+    let released: i64 = store.connection.query_row(
+        "SELECT charged FROM completion_bindings WHERE run_id = ?1 AND binding_id = 'b-success'",
+        [&run.run_id], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(released, 0);
+}
+
+#[test]
+fn completion_inbox_failure_rolls_back_result_outbox_and_session() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let input = admission("completion-rollback");
+    let AdmissionOutcome::Accepted(run) = store.service_admit(&input).unwrap() else {
+        panic!()
+    };
+    bind_completion(
+        &store,
+        &run.run_id,
+        "a-webhook",
+        "webhook_test",
+        r#"["succeeded"]"#,
+    );
+    bind_completion(&store, &run.run_id, "z-inbox", "inbox", r#"["succeeded"]"#);
+    let job = store.service_claim(1_000).unwrap().unwrap();
+    store.service_launch(&job, 1_001).unwrap();
+    store.connection.execute_batch("CREATE TRIGGER reject_completion_inbox BEFORE INSERT ON completion_inbox BEGIN SELECT RAISE(ABORT, 'injected inbox failure'); END;").unwrap();
+    assert!(store.service_finish(&job, &success(), 1_002, 1024).is_err());
+    assert_eq!(
+        store
+            .get_run(&input.namespace, &run.run_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "running"
+    );
+    assert!(
+        store
+            .get_result(&input.namespace, &run.run_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get_deliveries(&input.namespace, &run.run_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .get_inbox_items(&input.namespace, &run.run_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .get_session(&input.namespace, &job.session_id)
+            .unwrap()
+            .unwrap()
+            .reserved_run_id
+            .as_deref(),
+        Some(run.run_id.as_str())
+    );
+    store
+        .connection
+        .execute_batch("DROP TRIGGER reject_completion_inbox")
+        .unwrap();
+    store.service_finish(&job, &success(), 1_003, 1024).unwrap();
+    assert_eq!(
+        store
+            .get_deliveries(&input.namespace, &run.run_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .get_inbox_items(&input.namespace, &run.run_id)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn completion_intents_cover_queued_cancel_timeout_and_prelaunch_failure() {
+    for state in ["cancelled", "timed_out", "failed"] {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut input = admission(state);
+        if state == "timed_out" {
+            input.deadline_ms = 1005;
+        }
+        let AdmissionOutcome::Accepted(run) = store.service_admit(&input).unwrap() else {
+            panic!()
+        };
+        bind_completion(
+            &store,
+            &run.run_id,
+            "hook",
+            "webhook_test",
+            &format!("[\"{state}\"]"),
+        );
+        match state {
+            "cancelled" => {
+                store
+                    .service_stop(&input.namespace, &run.run_id, StopCause::Cancelled, 1001)
+                    .unwrap();
+            }
+            "timed_out" => {
+                store.service_deadline_maintenance(1006).unwrap();
+            }
+            "failed" => {
+                let job = store.service_claim(1000).unwrap().unwrap();
+                let candidate = Candidate {
+                    state: TerminalState::Failed,
+                    details: json!({"error":"prelaunch"}),
+                    cleanup: CleanupState::Settled,
+                    disposition: SessionDisposition::NotApplicable,
+                };
+                store.service_finish(&job, &candidate, 1001, 1024).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let deliveries = store.get_deliveries(&input.namespace, &run.run_id).unwrap();
+        assert_eq!(deliveries.len(), 1, "{state}");
+        let payload: serde_json::Value = serde_json::from_slice(&deliveries[0].payload).unwrap();
+        assert_eq!(payload["state"], state);
+    }
+}
+
+#[test]
+fn recovery_creates_interrupted_delivery_and_never_relaunches() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("completion-recovery.sqlite");
+    let mut store = SqliteStore::open(&path).unwrap();
+    let input = admission("completion-recovery");
+    let AdmissionOutcome::Accepted(run) = store.service_admit(&input).unwrap() else {
+        panic!()
+    };
+    bind_completion(
+        &store,
+        &run.run_id,
+        "hook",
+        "webhook_test",
+        r#"["interrupted"]"#,
+    );
+    let job = store.service_claim(1000).unwrap().unwrap();
+    store.service_launch(&job, 1001).unwrap();
+    drop(store);
+    let mut store = SqliteStore::open(&path).unwrap();
+    store.service_recover(1002).unwrap();
+    let deliveries = store.get_deliveries(&input.namespace, &run.run_id).unwrap();
+    assert_eq!(deliveries.len(), 1);
+    let payload: serde_json::Value = serde_json::from_slice(&deliveries[0].payload).unwrap();
+    assert_eq!(payload["state"], "interrupted");
+    assert_eq!(payload["cleanup"], "uncertain");
+    assert!(store.service_claim(1003).unwrap().is_none());
+}
+
+#[test]
+fn inbox_ack_and_expiry_preserve_namespace_and_release_quota() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let input = admission("inbox-expiry");
+    let AdmissionOutcome::Accepted(run) = store.service_admit(&input).unwrap() else {
+        panic!()
+    };
+    bind_completion(&store, &run.run_id, "hook", "inbox", r#"["cancelled"]"#);
+    store
+        .service_stop(&input.namespace, &run.run_id, StopCause::Cancelled, 1001)
+        .unwrap();
+    assert!(
+        store
+            .completion_inbox_page(&input.namespace, 0, 1, 1002, 4096)
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .connection
+        .execute("UPDATE completion_inbox SET status='available'", [])
+        .unwrap();
+    let items = store
+        .completion_inbox_page(&input.namespace, 0, 1, 1002, 4096)
+        .unwrap();
+    let id = items[0]["inbox_id"].as_str().unwrap();
+    let other = Namespace {
+        owner_id: "owner".into(),
+        client_id: "other".into(),
+    };
+    assert!(
+        store
+            .completion_inbox_page(&other, 0, 1, 1002, 4096)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        store.acknowledge_completion_inbox(&other, id, 1002),
+        Err(StorageError::NotFound)
+    ));
+    store
+        .acknowledge_completion_inbox(&input.namespace, id, 1002)
+        .unwrap();
+    store
+        .acknowledge_completion_inbox(&input.namespace, id, 1003)
+        .unwrap();
+    store.completion_maintenance(11002).unwrap();
+    assert!(
+        store
+            .completion_inbox_page(&input.namespace, 0, 1, 11002, 4096)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        store.acknowledge_completion_inbox(&input.namespace, id, 11002),
+        Err(StorageError::NotFound)
+    ));
+    let charged: bool = store
+        .connection
+        .query_row(
+            "SELECT charged FROM completion_bindings WHERE run_id=?1",
+            [&run.run_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!charged);
+}
+
+#[test]
+fn protected_library_inbox_does_not_expose_pending_or_skipped_items() {
+    use crate::access::{
+        AccessLimits, AuthorizedStore, ClientAccessControl, ClientRegistration, CredentialSecret,
+        Scope,
+    };
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let input = admission("protected-inbox");
+    let AdmissionOutcome::Accepted(run) = store.service_admit(&input).unwrap() else {
+        panic!()
+    };
+    bind_completion(&store, &run.run_id, "hook", "inbox", r#"["cancelled"]"#);
+    store
+        .service_stop(&input.namespace, &run.run_id, StopCause::Cancelled, 1001)
+        .unwrap();
+    store
+        .connection
+        .execute("UPDATE completion_inbox SET expires_ms=9000000000000", [])
+        .unwrap();
+    let access = ClientAccessControl::new(
+        [ClientRegistration::new(
+            "reader",
+            CredentialSecret::new([7; 32]),
+            input.namespace.clone(),
+            [Scope::InboxRead],
+            [],
+        )],
+        [],
+        AccessLimits {
+            max_request_bytes: 1024,
+            max_skill_bytes: 1024,
+            max_identifier_bytes: 128,
+        },
+    )
+    .unwrap();
+    let client = access.authenticate("reader", &[7; 32]).unwrap();
+    for status in ["pending", "skipped", "available"] {
+        store
+            .connection
+            .execute("UPDATE completion_inbox SET status=?1", [status])
+            .unwrap();
+        let authorized = AuthorizedStore::new(&access, &client, &mut store);
+        let items = authorized.get_inbox_items(&run.run_id).unwrap();
+        assert_eq!(items.len(), usize::from(status == "available"));
+    }
+}
+
+#[test]
+fn completion_filter_uses_result_limit_failure_not_backend_success() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let input = admission("result-too-large");
+    let AdmissionOutcome::Accepted(run) = store.service_admit(&input).unwrap() else {
+        panic!()
+    };
+    bind_completion(&store, &run.run_id, "hook", "webhook_test", r#"["failed"]"#);
+    let job = store.service_claim(1000).unwrap().unwrap();
+    store.service_launch(&job, 1001).unwrap();
+    let large = Candidate {
+        state: TerminalState::Succeeded,
+        details: json!({"output":"x".repeat(1024)}),
+        cleanup: CleanupState::Settled,
+        disposition: SessionDisposition::Uncertain,
+    };
+    store.service_finish(&job, &large, 1002, 128).unwrap();
+    let deliveries = store.get_deliveries(&input.namespace, &run.run_id).unwrap();
+    assert_eq!(deliveries.len(), 1);
+    let payload: serde_json::Value = serde_json::from_slice(&deliveries[0].payload).unwrap();
+    assert_eq!(payload["state"], "failed");
 }

@@ -38,6 +38,7 @@ pub enum Scope {
     HookWrite,
     InboxRead,
     InboxAck,
+    DeliveryReconcile,
 }
 
 /// Sets request bounds supplied by the trusted application configuration.
@@ -78,6 +79,8 @@ pub struct ClientRegistration {
     namespace: Namespace,
     scopes: HashSet<Scope>,
     profiles: HashSet<String>,
+    destinations: HashSet<String>,
+    reconciliation_destinations: HashSet<String>,
 }
 
 impl ClientRegistration {
@@ -96,7 +99,24 @@ impl ClientRegistration {
             namespace,
             scopes: scopes.into_iter().collect(),
             profiles: profiles.into_iter().collect(),
+            destinations: HashSet::new(),
+            reconciliation_destinations: HashSet::new(),
         }
+    }
+
+    /// Grants access to server-owned destination identifiers.
+    pub fn with_destinations(mut self, destinations: impl IntoIterator<Item = String>) -> Self {
+        self.destinations = destinations.into_iter().collect();
+        self
+    }
+
+    /// Grants reconciliation without enabling a destination for new deliveries.
+    pub fn with_reconciliation_destinations(
+        mut self,
+        destinations: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.reconciliation_destinations = destinations.into_iter().collect();
+        self
     }
 
     /// Sets a stable, non-secret registration generation supplied by trusted configuration.
@@ -235,6 +255,14 @@ impl ClientAccessControl {
                     .profiles
                     .iter()
                     .any(|id| !profile_map.contains_key(id))
+                || registration
+                    .destinations
+                    .iter()
+                    .any(|id| id.is_empty() || id.len() > limits.max_identifier_bytes)
+                || registration
+                    .reconciliation_destinations
+                    .iter()
+                    .any(|id| id.is_empty() || id.len() > limits.max_identifier_bytes)
             {
                 return Err(AccessError::InvalidConfiguration);
             }
@@ -382,6 +410,16 @@ impl ClientAccessControl {
             crate::storage::skills::validate_refs(skills, self.limits.max_identifier_bytes)
                 .map_err(|_| AccessError::InvalidRequest)?;
         }
+        if let Some(hooks) = &request.hooks {
+            crate::storage::hooks::validate_refs(hooks, self.limits.max_identifier_bytes)
+                .map_err(|_| AccessError::InvalidRequest)?;
+            if !hooks.is_empty()
+                && (!registration.scopes.contains(&Scope::HookRead)
+                    || !registration.scopes.contains(&Scope::RunRead))
+            {
+                return Err(AccessError::Forbidden);
+            }
+        }
         if let StartSession::Resume { session_id } = &request.session {
             validate_resource_id(session_id, &self.limits)?;
             if !registration.scopes.contains(&Scope::SessionRead) {
@@ -412,6 +450,9 @@ impl ClientAccessControl {
             Ok(AuthorizedStart::from_body(
                 request.clone(),
                 registration.scopes.contains(&Scope::SkillRead),
+                registration.scopes.contains(&Scope::HookRead)
+                    && registration.scopes.contains(&Scope::RunRead),
+                registration.destinations.clone(),
             ))
         };
         operation(
@@ -466,6 +507,55 @@ impl ClientAccessControl {
 
     pub(crate) fn supports_service_ids(&self) -> bool {
         self.limits.max_identifier_bytes >= 40
+    }
+
+    pub(crate) fn with_delivery_authorization<T>(
+        &self,
+        credential_id: &str,
+        generation: &str,
+        namespace: &Namespace,
+        destination_id: &str,
+        operation: impl FnOnce() -> Result<T, AccessError>,
+    ) -> Result<T, AccessError> {
+        let registry = self.registry.read().map_err(|_| AccessError::Unavailable)?;
+        let registration = registry
+            .credentials
+            .get(credential_id)
+            .ok_or(AccessError::Unauthenticated)?;
+        if &registration.namespace != namespace
+            || registration.generation.as_deref() != Some(generation)
+            || !registration.scopes.contains(&Scope::HookRead)
+            || !registration.scopes.contains(&Scope::RunRead)
+            || !registration.destinations.contains(destination_id)
+        {
+            return Err(AccessError::Forbidden);
+        }
+        operation()
+    }
+
+    pub(crate) fn with_hook_permissions<T>(
+        &self,
+        client: &AuthenticatedClient,
+        required: &[Scope],
+        operation: impl FnOnce(
+            &Namespace,
+            &AccessLimits,
+            &HashSet<String>,
+            &HashSet<String>,
+            &str,
+            Option<&str>,
+        ) -> Result<T, AccessError>,
+    ) -> Result<T, AccessError> {
+        let registry = self.registry.read().map_err(|_| AccessError::Unavailable)?;
+        let registration = self.registration(&registry, client, required)?;
+        operation(
+            &registration.namespace,
+            &self.limits,
+            &registration.destinations,
+            &registration.reconciliation_destinations,
+            &registration.credential_id,
+            registration.generation.as_deref(),
+        )
     }
 
     pub(crate) fn with_permissions<T>(

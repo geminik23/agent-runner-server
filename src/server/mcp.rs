@@ -59,6 +59,21 @@ fn tool(name: &str, max_skill_page: usize) -> Option<Tool> {
         }
         "skills_defaults" => "Read this client's ordered default skill versions.",
         "skills_set_defaults" => "Replace this client's ordered default skill versions.",
+        "destinations_list" => "List the caller's granted completion destination identifiers.",
+        "hooks_register" => "Register a versioned completion hook for a granted destination.",
+        "hooks_list" => "List a bounded page of completion hook versions.",
+        "hooks_get" => "Read one completion hook version.",
+        "hooks_set_enabled" => "Enable or revoke a hook version.",
+        "hooks_defaults" => "Read the ordered completion hook defaults.",
+        "hooks_set_defaults" => "Replace the ordered completion hook defaults.",
+        "inbox_list" => "Read a bounded page of completion notifications.",
+        "inbox_ack" => {
+            "Acknowledge receipt of an inbox notification without marking it processed by an agent."
+        }
+        "runs_deliveries" => "Read bounded delivery status without exposing the payload.",
+        "delivery_reconcile" => {
+            "Record an authorized operator's confirmed outcome for an uncertain delivery"
+        }
         _ => return None,
     };
     Some(Tool::new(

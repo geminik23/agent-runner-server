@@ -17,6 +17,14 @@ pub struct SkillRef {
     pub version: String,
 }
 
+/// Identifies an immutable completion hook version within a namespace.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookRef {
+    pub hook_id: String,
+    pub version: String,
+}
+
 /// Contains the original text of an immutable skill version.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillVersion {
@@ -234,6 +242,10 @@ pub enum StorageError {
     SkillUnavailable,
     SkillUseForbidden,
     SkillBundleConflict,
+    HookVersionConflict,
+    HookUnavailable,
+    HookUseForbidden,
+    DeliveryQuota,
     SessionBusy,
     QueueFull,
     AlreadyTerminal,
@@ -257,6 +269,12 @@ impl fmt::Display for StorageError {
             Self::SkillUnavailable => formatter.write_str("skill is unavailable"),
             Self::SkillUseForbidden => formatter.write_str("skill use is not authorized"),
             Self::SkillBundleConflict => formatter.write_str("skill bundle conflicts"),
+            Self::HookVersionConflict => {
+                formatter.write_str("hook version conflicts with existing content")
+            }
+            Self::HookUnavailable => formatter.write_str("hook is unavailable"),
+            Self::HookUseForbidden => formatter.write_str("hook use is not authorized"),
+            Self::DeliveryQuota => formatter.write_str("delivery capacity is full"),
             Self::SessionBusy => formatter.write_str("session is reserved"),
             Self::QueueFull => formatter.write_str("execution queue is full"),
             Self::AlreadyTerminal => formatter.write_str("run is already terminal"),

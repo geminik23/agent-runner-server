@@ -183,7 +183,11 @@ impl<'a> AuthorizedStore<'a> {
             .with_permissions(self.client, &[Scope::InboxRead], |namespace, limits| {
                 validate_resource_id(run_id, limits)?;
                 self.storage
-                    .get_inbox_items(namespace, run_id)
+                    .get_visible_inbox_items(
+                        namespace,
+                        run_id,
+                        crate::storage::service::wall_clock_ms()?,
+                    )
                     .map_err(Into::into)
             })
     }

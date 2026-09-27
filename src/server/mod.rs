@@ -935,6 +935,17 @@ async fn rest(State(shared): State<Arc<Shared>>, request: Request) -> Response {
     }
     let (name, args) = match (method, path.as_slice()) {
         (&Method::GET, ["", "v1", "agents"]) => ("agents_list", json!({})),
+        (&Method::GET, ["", "v1", "destinations"]) => ("destinations_list", json!({})),
+        (&Method::POST, ["", "v1", "hooks"]) => ("hooks_register", body),
+        (&Method::POST, ["", "v1", "hooks", "list"]) => ("hooks_list", body),
+        (&Method::POST, ["", "v1", "hooks", "get"]) => ("hooks_get", body),
+        (&Method::POST, ["", "v1", "hooks", "enabled"]) => ("hooks_set_enabled", body),
+        (&Method::GET, ["", "v1", "hook-defaults"]) => ("hooks_defaults", json!({})),
+        (&Method::POST, ["", "v1", "hook-defaults"]) => ("hooks_set_defaults", body),
+        (&Method::POST, ["", "v1", "inbox", "list"]) => ("inbox_list", body),
+        (&Method::POST, ["", "v1", "inbox", "ack"]) => ("inbox_ack", body),
+        (&Method::POST, ["", "v1", "deliveries", "list"]) => ("runs_deliveries", body),
+        (&Method::POST, ["", "v1", "deliveries", "reconcile"]) => ("delivery_reconcile", body),
         (&Method::POST, ["", "v1", "skills"]) => ("skills_register", body),
         (&Method::POST, ["", "v1", "skills", "list"]) => ("skills_list", body),
         (&Method::POST, ["", "v1", "skills", "get"]) => ("skills_get", body),

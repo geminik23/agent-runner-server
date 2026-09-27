@@ -243,6 +243,29 @@ impl SqliteStore {
         )?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    pub(crate) fn get_visible_inbox_items(
+        &self,
+        namespace: &Namespace,
+        run_id: &str,
+        now: i64,
+    ) -> Result<Vec<StoredInboxItem>, StorageError> {
+        validate_namespace(namespace)?;
+        nonempty(run_id, "run_id")?;
+        let mut statement = self.connection.prepare("SELECT i.inbox_id,i.event_id,i.payload,r.runtime,r.synthetic,r.scenario FROM inbox_items i JOIN runs r USING(owner_id,client_id,run_id) LEFT JOIN completion_inbox c USING(owner_id,client_id,inbox_id) WHERE i.owner_id=?1 AND i.client_id=?2 AND i.run_id=?3 AND (c.sequence IS NULL OR (c.status='available' AND c.payload_purged=0 AND c.expires_ms>?4)) ORDER BY i.inbox_id")?;
+        let rows = statement.query_map(
+            params![namespace.owner_id, namespace.client_id, run_id, now],
+            |row| {
+                Ok(StoredInboxItem {
+                    inbox_id: row.get(0)?,
+                    event_id: row.get(1)?,
+                    payload: row.get(2)?,
+                    metadata: metadata_from_row(row, 3)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
 }
 
 pub(super) fn load_run(

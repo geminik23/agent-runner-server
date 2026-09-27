@@ -34,6 +34,8 @@ struct Configuration {
     transport: TransportSettings,
     clients: Vec<ClientSettings>,
     profiles: Vec<ProfileSettings>,
+    #[serde(default)]
+    delivery: Option<crate::delivery::DeliveryConfig>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -84,6 +86,10 @@ struct ClientSettings {
     client_id: String,
     scopes: Vec<Scope>,
     profiles: Vec<String>,
+    #[serde(default)]
+    destinations: Vec<String>,
+    #[serde(default)]
+    reconciliation_destinations: Vec<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -111,6 +117,7 @@ pub struct PreparedServer {
     profiles: Vec<BackendProfile>,
     runs: RunLimits,
     transport: ServerLimits,
+    delivery: Option<crate::delivery::DeliveryConfig>,
 }
 impl PreparedServer {
     /// Loads paths relative to the configuration file, never relative to a client request.
@@ -135,6 +142,23 @@ impl PreparedServer {
             || config.clients.is_empty()
             || config.profiles.is_empty()
         {
+            return Err(ServerError::InvalidConfiguration);
+        }
+        if config.delivery.as_ref().is_some_and(|delivery| {
+            !delivery.validate(
+                config.access.max_identifier_bytes,
+                config.run.max_event_bytes,
+            )
+        }) || config.clients.iter().any(|client| {
+            client.destinations.iter().any(|id| {
+                config.delivery.as_ref().is_none_or(|delivery| {
+                    !delivery
+                        .destinations
+                        .iter()
+                        .any(|destination| destination.id == *id)
+                })
+            })
+        }) {
             return Err(ServerError::InvalidConfiguration);
         }
         let r = config.run;
@@ -171,6 +195,14 @@ impl PreparedServer {
             .max_event_bytes
             .checked_mul(r.max_page_size)
             .map(|n| n.max(r.max_result_bytes))
+            .map(|n| {
+                n.max(
+                    config
+                        .delivery
+                        .as_ref()
+                        .map_or(0, |delivery| delivery.max_payload_bytes),
+                )
+            })
             .and_then(|n| n.checked_mul(16))
             .and_then(|n| n.checked_add(8192))
             .ok_or(ServerError::InvalidConfiguration)?;
@@ -215,7 +247,9 @@ impl PreparedServer {
                     c.scopes,
                     c.profiles,
                 )
-                .with_generation(c.generation))
+                .with_generation(c.generation)
+                .with_destinations(c.destinations)
+                .with_reconciliation_destinations(c.reconciliation_destinations))
             })
             .collect::<Result<Vec<_>, ServerError>>()?;
         let a = config.access;
@@ -238,12 +272,19 @@ impl PreparedServer {
             profiles,
             runs,
             transport,
+            delivery: config.delivery,
         })
     }
     pub async fn start(self) -> Result<Server, ServerError> {
-        let service = RunService::open(self.database, self.access, self.profiles, self.runs)
-            .await
-            .map_err(ServerError::Service)?;
+        let service = RunService::open_with_delivery(
+            self.database,
+            self.access,
+            self.profiles,
+            self.runs,
+            self.delivery,
+        )
+        .await
+        .map_err(ServerError::Service)?;
         Server::bind(self.listen, service, self.transport).await
     }
 }

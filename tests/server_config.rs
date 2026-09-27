@@ -59,6 +59,55 @@ fn trusted_configuration_rejects_invalid_limits_unknown_fields_and_public_bindin
     assert!(PreparedServer::load(&config).is_err());
 }
 
+#[test]
+fn delivery_configuration_accepts_only_explicit_loopback_test_destinations() {
+    let temp = tempdir().unwrap();
+    let config = temp.path().join("config.json");
+    secret(&temp.path().join("secret"));
+    let mut value = settings(48001);
+    value["clients"][0]["destinations"] = json!(["test", "inbox"]);
+    value["delivery"] = json!({"max_pending":8,"max_payload_bytes":32768,"max_workers":1,"max_attempts":2,"delivery_ttl_ms":10000,"retention_ms":1000,"lease_ms":1000,"timeout_ms":500,"retry_ms":20,"poll_ms":5,"destinations":[
+        {"id":"test","revision":"v1","kind":"webhook_test","endpoint":"http://127.0.0.1:8888/hook"},
+        {"id":"inbox","revision":"v1","kind":"inbox"}
+    ]});
+    write_config(&config, &value);
+    assert!(PreparedServer::load(&config).is_ok());
+    for endpoint in [
+        "http://example.com:8888/hook",
+        "http://localhost:8888/hook",
+        "https://127.0.0.1:8888/hook",
+        "http://user@127.0.0.1:8888/hook",
+        "http://127.0.0.1:8888/hook?target=evil",
+    ] {
+        let mut invalid = value.clone();
+        invalid["delivery"]["destinations"][0]["endpoint"] = json!(endpoint);
+        write_config(&config, &invalid);
+        assert!(PreparedServer::load(&config).is_err(), "{endpoint}");
+        assert!(!temp.path().join("runs.sqlite").exists());
+    }
+    let mut invalid = value.clone();
+    invalid["transport"]["max_response_bytes"] = json!(12288);
+    write_config(&config, &invalid);
+    assert!(PreparedServer::load(&config).is_err());
+    let mut invalid = value.clone();
+    invalid["clients"][0]["destinations"] = json!(["missing"]);
+    write_config(&config, &invalid);
+    assert!(PreparedServer::load(&config).is_err());
+    let mut without_delivery = settings(48001);
+    without_delivery["clients"][0]["reconciliation_destinations"] = json!(["removed-destination"]);
+    write_config(&config, &without_delivery);
+    assert!(PreparedServer::load(&config).is_ok());
+    let mut invalid = value.clone();
+    invalid["delivery"]["delivery_ttl_ms"] = json!(i64::MAX);
+    write_config(&config, &invalid);
+    assert!(PreparedServer::load(&config).is_err());
+    let mut invalid = value;
+    invalid["delivery"]["max_payload_bytes"] = json!(1024);
+    write_config(&config, &invalid);
+    assert!(PreparedServer::load(&config).is_err());
+    assert!(!temp.path().join("runs.sqlite").exists());
+}
+
 #[tokio::test]
 async fn existing_small_response_configuration_remains_startable() {
     let temp = tempdir().unwrap();

@@ -210,6 +210,8 @@ struct Shared {
     access: Arc<ClientAccessControl>,
     profiles: Arc<HashMap<String, BackendProfile>>,
     limits: RunLimits,
+    delivery: Option<crate::delivery::DeliveryConfig>,
+    delivery_client: Option<reqwest::Client>,
     wake: Notify,
     changes: watch::Sender<u64>,
     intake: Arc<Semaphore>,
@@ -241,7 +243,34 @@ impl RunService {
         profiles: Vec<BackendProfile>,
         limits: RunLimits,
     ) -> Result<Self, ServiceError> {
+        Self::open_with_delivery(path, access, profiles, limits, None).await
+    }
+
+    /// Opens the service with explicitly configured completion delivery limits and destinations.
+    pub async fn open_with_delivery(
+        path: impl AsRef<Path>,
+        access: Arc<ClientAccessControl>,
+        profiles: Vec<BackendProfile>,
+        limits: RunLimits,
+        delivery: Option<crate::delivery::DeliveryConfig>,
+    ) -> Result<Self, ServiceError> {
         limits.validate()?;
+        if delivery.as_ref().is_some_and(|config| {
+            !config.validate(access.identifier_limit(), limits.max_event_bytes)
+        }) {
+            return Err(ServiceError::InvalidConfiguration);
+        }
+        let delivery_client = delivery
+            .as_ref()
+            .map(|config| {
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(Duration::from_millis(config.timeout_ms))
+                    .build()
+                    .map_err(|_| ServiceError::InvalidConfiguration)
+            })
+            .transpose()?;
         if !access.supports_service_ids() {
             return Err(ServiceError::InvalidConfiguration);
         }
@@ -314,6 +343,8 @@ impl RunService {
             access,
             profiles: Arc::new(profile_map),
             limits,
+            delivery,
+            delivery_client,
             wake: Notify::new(),
             changes,
             intake,
@@ -327,6 +358,11 @@ impl RunService {
             .map(|_| supervise(Arc::clone(&shared), false))
             .collect();
         workers.push(supervise(Arc::clone(&shared), true));
+        if let Some(config) = &shared.delivery {
+            for _ in 0..config.max_workers {
+                workers.push(tokio::spawn(delivery_worker(Arc::clone(&shared))));
+            }
+        }
         Ok(Self {
             shared,
             workers,
@@ -340,6 +376,14 @@ impl RunService {
             .max_event_bytes
             .checked_mul(self.shared.limits.max_page_size)
             .map(|n| n.max(self.shared.limits.max_result_bytes))
+            .map(|n| {
+                n.max(
+                    self.shared
+                        .delivery
+                        .as_ref()
+                        .map_or(0, |delivery| delivery.max_payload_bytes),
+                )
+            })
             .and_then(|n| n.checked_mul(16))
             .and_then(|n| n.checked_add(8192))
     }
@@ -423,6 +467,7 @@ impl RunHandle {
         let client = client.clone();
         let body = body.to_vec();
         let limits = self.shared.limits.clone();
+        let delivery = self.shared.delivery.clone();
         let available = Arc::clone(&self.shared.available);
         let notify_shared = Arc::clone(&self.shared);
         let outcome = self
@@ -506,6 +551,10 @@ impl RunHandle {
                                     skills: request.skills.clone(),
                                     may_use_skills: approved.may_use_skills(),
                                     skill_bounds,
+                                    hooks: request.hooks.clone(),
+                                    may_use_hooks: approved.may_use_hooks(),
+                                    destination_grants: approved.destinations().clone(),
+                                    delivery,
                                 })
                                 .map_err(Into::into)
                         },
@@ -932,6 +981,192 @@ impl RunHandle {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HookRegisterArgs {
+    hook_id: String,
+    version: String,
+    destination_id: String,
+    events: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HookEnabledArgs {
+    hook_id: String,
+    version: String,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HookDefaultsArgs {
+    hooks: Vec<crate::storage::HookRef>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HookListArgs {
+    limit: usize,
+    #[serde(default)]
+    after: Option<crate::storage::HookRef>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InboxPageArgs {
+    limit: usize,
+    #[serde(default)]
+    after: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InboxAckArgs {
+    inbox_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeliveryReconcileArgs {
+    delivery_id: String,
+    outcome: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeliveryPageArgs {
+    run_id: String,
+    limit: usize,
+    #[serde(default)]
+    after: Option<String>,
+}
+
+impl RunHandle {
+    pub(crate) async fn completion_operation(
+        &self,
+        client: &AuthenticatedClient,
+        operation: &str,
+        args: Value,
+        max_response_bytes: usize,
+    ) -> Result<Value, ServiceError> {
+        self.ensure_available()?;
+        let _permit = Arc::clone(&self.shared.intake)
+            .try_acquire_owned()
+            .map_err(|_| ServiceError::Unavailable)?;
+        if serde_json::to_vec(&args)
+            .map_err(|_| AccessError::InvalidRequest)?
+            .len()
+            > self.shared.access.request_limit()
+        {
+            return Err(AccessError::InvalidRequest.into());
+        }
+        let access = Arc::clone(&self.shared.access);
+        let client = client.clone();
+        let operation = operation.to_owned();
+        let config = self.shared.delivery.clone();
+        let max_page = self.max_skill_page_size();
+        self.shared.database.call(move |store| {
+            let scopes: &[Scope] = match operation.as_str() {
+                "hooks_register" | "hooks_set_enabled" | "hooks_set_defaults" => &[Scope::HookRead, Scope::HookWrite],
+                "hooks_list" | "hooks_get" | "hooks_defaults" | "destinations_list" => &[Scope::HookRead],
+                "inbox_list" => &[Scope::InboxRead],
+                "inbox_ack" => &[Scope::InboxAck],
+                "runs_deliveries" => &[Scope::RunRead, Scope::HookRead],
+                "delivery_reconcile" => &[Scope::RunRead, Scope::HookRead, Scope::DeliveryReconcile],
+                _ => return Err(AccessError::InvalidRequest.into()),
+            };
+            access.with_hook_permissions(&client, scopes, |ns, limits, grants, reconciliation_grants, actor, generation| {
+                use crate::storage::{HookRef, hooks::{MAX_HOOKS, validate_events, validate_refs}};
+                let invalid = |_| AccessError::InvalidRequest;
+                match operation.as_str() {
+                    "hooks_register" => {
+                        let mut input: HookRegisterArgs = serde_json::from_value(args).map_err(invalid)?;
+                        let reference = HookRef { hook_id: input.hook_id, version: input.version };
+                        validate_refs(std::slice::from_ref(&reference), limits.max_identifier_bytes)?;
+                        validate_events(&mut input.events)?;
+                        if !grants.contains(&input.destination_id) { return Err(AccessError::Forbidden); }
+                        let destination = config.as_ref().and_then(|c| c.destination(&input.destination_id)).ok_or(StorageError::HookUnavailable)?;
+                        let created = store.register_hook(ns, &reference, destination, &input.events, limits.max_identifier_bytes)?;
+                        Ok(json!({"hook_id":reference.hook_id,"version":reference.version,"created":created}))
+                    }
+                    "hooks_get" => {
+                        let reference: HookRef = serde_json::from_value(args).map_err(invalid)?;
+                        validate_refs(std::slice::from_ref(&reference), limits.max_identifier_bytes)?;
+                        serde_json::to_value(store.hook(ns,&reference,limits.max_identifier_bytes)?.ok_or(StorageError::NotFound)?).map_err(invalid)
+                    }
+                    "hooks_list" => {
+                        let input: HookListArgs = serde_json::from_value(args).map_err(invalid)?;
+                        if input.limit == 0 || input.limit > max_page || input.limit > MAX_HOOKS { return Err(AccessError::InvalidRequest); }
+                        if let Some(after) = &input.after { validate_refs(std::slice::from_ref(after),limits.max_identifier_bytes)?; }
+                        let items = store.list_hooks(ns,input.after.as_ref(),input.limit,limits.max_identifier_bytes)?;
+                        let next_after = items.last().map(|h|json!({"hook_id":h.hook_id,"version":h.version}));
+                        Ok(json!({"items":items,"next_after":next_after}))
+                    }
+                    "hooks_set_enabled" => {
+                        let input: HookEnabledArgs = serde_json::from_value(args).map_err(invalid)?;
+                        let reference = HookRef {hook_id:input.hook_id,version:input.version};
+                        validate_refs(std::slice::from_ref(&reference),limits.max_identifier_bytes)?;
+                        store.set_hook_enabled(ns,&reference,input.enabled)?;
+                        Ok(json!({"hook_id":reference.hook_id,"version":reference.version,"enabled":input.enabled}))
+                    }
+                    "hooks_defaults" => {
+                        let empty: std::collections::HashMap<String,Value> = serde_json::from_value(args).map_err(invalid)?;
+                        if !empty.is_empty() { return Err(AccessError::InvalidRequest); }
+                        Ok(json!({"hooks":store.hook_defaults(ns,limits.max_identifier_bytes)?}))
+                    }
+                    "hooks_set_defaults" => {
+                        let input: HookDefaultsArgs = serde_json::from_value(args).map_err(invalid)?;
+                        validate_refs(&input.hooks,limits.max_identifier_bytes)?;
+                        store.set_hook_defaults(ns,&input.hooks,limits.max_identifier_bytes)?;
+                        Ok(json!({"hooks":input.hooks}))
+                    }
+                    "destinations_list" => {
+                        let empty: std::collections::HashMap<String,Value> = serde_json::from_value(args).map_err(invalid)?;
+                        if !empty.is_empty() { return Err(AccessError::InvalidRequest); }
+                        let items: Vec<_> = config.as_ref().into_iter().flat_map(|c|&c.destinations).filter(|d|d.enabled && grants.contains(&d.id)).map(|d|json!({"id":d.id,"revision":d.revision,"kind":d.kind})).collect();
+                        Ok(json!({"items":items}))
+                    }
+                    "inbox_list" => {
+                        let input: InboxPageArgs = serde_json::from_value(args).map_err(invalid)?;
+                        if input.limit == 0 || input.limit > max_page || input.after.is_some_and(|n|n<0) { return Err(AccessError::InvalidRequest); }
+                        let now = now_ms().map_err(|_|AccessError::Unavailable)?;
+                        let items = store.completion_inbox_page(ns,input.after.unwrap_or(0),input.limit,now,max_response_bytes.saturating_sub(8192)/16)?;
+                        let next_after = items.last().and_then(|v|v["sequence"].as_i64()).or(input.after);
+                        let legacy_unmanaged = store.legacy_inbox_count(ns)?;
+                        Ok(json!({"items":items,"next_after":next_after,"legacy_unmanaged":legacy_unmanaged}))
+                    }
+                    "inbox_ack" => {
+                        let input: InboxAckArgs = serde_json::from_value(args).map_err(invalid)?;
+                        validate_resource_id(&input.inbox_id, limits)?;
+                        let now = now_ms().map_err(|_|AccessError::Unavailable)?;
+                        store.acknowledge_completion_inbox(ns,&input.inbox_id,now)?;
+                        Ok(json!({"acknowledged":true}))
+                    }
+                    "delivery_reconcile" => {
+                        let input: DeliveryReconcileArgs = serde_json::from_value(args).map_err(invalid)?;
+                        validate_resource_id(&input.delivery_id, limits)?;
+                        let reconciliation = crate::storage::inbox::DeliveryReconciliation { id:&input.delivery_id, actor, generation:generation.ok_or(AccessError::InvalidConfiguration)?, outcome:&input.outcome, grants:reconciliation_grants };
+                        store.reconcile_delivery(ns,&reconciliation,ServiceClock::Wall)?;
+                        Ok(json!({"reconciled":true}))
+                    }
+                    "runs_deliveries" => {
+                        let input: DeliveryPageArgs = serde_json::from_value(args).map_err(invalid)?;
+                        validate_resource_id(&input.run_id, limits)?;
+                        if let Some(after) = &input.after { validate_resource_id(after, limits)?; }
+                        if input.limit == 0 || input.limit > max_page { return Err(AccessError::InvalidRequest); }
+                        let items = store.completion_deliveries(ns,&input.run_id,input.after.as_deref(),input.limit)?.ok_or(StorageError::NotFound)?;
+                        let next_after = items.last().and_then(|v|v["delivery_id"].as_str()).map(str::to_owned).or(input.after);
+                        let legacy_unmanaged = store.legacy_delivery_count(ns,&input.run_id)?;
+                        Ok(json!({"items":items,"next_after":next_after,"legacy_unmanaged":legacy_unmanaged}))
+                    }
+                    _ => Err(AccessError::InvalidRequest),
+                }
+            }).map_err(Into::into)
+        }).await
+    }
+}
+
 impl Drop for RunService {
     fn drop(&mut self) {
         stop_service(&self.shared, false);
@@ -1067,6 +1302,20 @@ fn supervise(shared: Arc<Shared>, maintenance: bool) -> JoinHandle<()> {
 async fn maintain_deadlines(shared: Arc<Shared>) {
     let mut changes = shared.changes.subscribe();
     while !shared.shutdown.is_cancelled() {
+        if shared.delivery.is_none() {
+            let maintenance = shared
+                .database
+                .call(move |store| {
+                    store.completion_disable(ServiceClock::Wall)?;
+                    store
+                        .completion_maintenance(ServiceClock::Wall)
+                        .map_err(Into::into)
+                })
+                .await;
+            if maintenance.is_err() {
+                tracing::warn!("completion retention maintenance is unavailable");
+            }
+        }
         let next = match shared
             .database
             .call(move |store| {
@@ -1091,13 +1340,197 @@ async fn maintain_deadlines(shared: Arc<Shared>) {
         };
         let wait = next
             .map(|deadline| Duration::from_millis(deadline.saturating_sub(now).max(0) as u64))
-            .unwrap_or(shared.limits.poll_interval);
+            .unwrap_or(shared.limits.poll_interval)
+            .min(shared.limits.poll_interval);
         tokio::select! {
             _ = shared.shutdown.cancelled() => return,
             _ = changes.changed() => {},
             _ = tokio::time::sleep(wait) => {},
         }
     }
+}
+
+async fn delivery_worker(shared: Arc<Shared>) {
+    while !shared.shutdown.is_cancelled() && shared.available.load(Ordering::Acquire) {
+        let inner = Arc::clone(&shared);
+        if matches!(
+            tokio::spawn(async move { run_delivery_worker(&inner).await }).await,
+            Ok(Ok(()))
+        ) {
+            break;
+        }
+        tracing::warn!(
+            "completion delivery worker will retry after a storage or configuration error"
+        );
+        let delay = shared
+            .delivery
+            .as_ref()
+            .map_or(shared.limits.poll_interval, |config| {
+                Duration::from_millis(config.poll_ms)
+            });
+        tokio::select! {
+            _ = shared.shutdown.cancelled() => break,
+            _ = tokio::time::sleep(delay) => {},
+        }
+    }
+}
+
+async fn run_delivery_worker(shared: &Arc<Shared>) -> Result<(), ServiceError> {
+    use crate::storage::dispatch::Observation;
+    let config = shared
+        .delivery
+        .as_ref()
+        .ok_or(ServiceError::InvalidConfiguration)?
+        .clone();
+    let client = shared
+        .delivery_client
+        .as_ref()
+        .ok_or(ServiceError::InvalidConfiguration)?
+        .clone();
+    let lease = i64::try_from(config.lease_ms).map_err(|_| ServiceError::InvalidConfiguration)?;
+    let retry = i64::try_from(config.retry_ms).map_err(|_| ServiceError::InvalidConfiguration)?;
+    while !shared.shutdown.is_cancelled() {
+        let access = Arc::clone(&shared.access);
+        let inbox_config = config.clone();
+        let processed_inbox = shared
+            .database
+            .call(move |store| {
+                store.completion_maintenance(ServiceClock::Wall)?;
+                let Some(item) = store.pending_inbox()? else {
+                    return Ok(false);
+                };
+                if inbox_config.destination(&item.destination.id) != Some(&item.destination) {
+                    store.settle_pending_inbox(
+                        &item,
+                        Some("destination_unavailable"),
+                        ServiceClock::Wall,
+                    )?;
+                    return Ok(true);
+                }
+                match access.with_delivery_authorization(
+                    &item.credential_id,
+                    &item.generation,
+                    &item.namespace,
+                    &item.destination.id,
+                    || {
+                        store
+                            .settle_pending_inbox(&item, None, ServiceClock::Wall)
+                            .map_err(Into::into)
+                    },
+                ) {
+                    Ok(()) => Ok(true),
+                    Err(AccessError::Forbidden | AccessError::Unauthenticated) => {
+                        store.settle_pending_inbox(
+                            &item,
+                            Some("authorization_revoked"),
+                            ServiceClock::Wall,
+                        )?;
+                        Ok(true)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            })
+            .await?;
+        if processed_inbox {
+            continue;
+        }
+        let job = shared
+            .database
+            .call(move |store| {
+                store.completion_maintenance(ServiceClock::Wall)?;
+                store
+                    .completion_claim(ServiceClock::Wall, lease)
+                    .map_err(Into::into)
+            })
+            .await?;
+        let Some(job) = job else {
+            tokio::select! {
+                _ = shared.shutdown.cancelled() => break,
+                _ = shared.wake.notified() => {},
+                _ = tokio::time::sleep(Duration::from_millis(config.poll_ms)) => {},
+            }
+            continue;
+        };
+        let valid_destination = config.destination(&job.destination.id) == Some(&job.destination)
+            && job.synthetic
+            && job.destination.endpoint.is_some();
+        let access = Arc::clone(&shared.access);
+        let check = job.clone();
+        let ready = shared
+            .database
+            .call(move |store| {
+                if !valid_destination {
+                    store.completion_skip(&check, ServiceClock::Wall, "destination_unavailable")?;
+                    return Ok(false);
+                }
+                match access.with_delivery_authorization(
+                    &check.credential_id,
+                    &check.credential_generation,
+                    &check.namespace,
+                    &check.destination.id,
+                    || {
+                        store
+                            .completion_begin_dispatch(&check, ServiceClock::Wall)
+                            .map_err(Into::into)
+                    },
+                ) {
+                    Ok(true) => Ok(true),
+                    Ok(false) => {
+                        store.completion_skip(
+                            &check,
+                            ServiceClock::Wall,
+                            "hook_or_lease_unavailable",
+                        )?;
+                        Ok(false)
+                    }
+                    Err(AccessError::Forbidden | AccessError::Unauthenticated) => {
+                        store.completion_skip(
+                            &check,
+                            ServiceClock::Wall,
+                            "authorization_revoked",
+                        )?;
+                        Ok(false)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            })
+            .await?;
+        if !ready {
+            continue;
+        }
+        let endpoint = job
+            .destination
+            .endpoint
+            .as_ref()
+            .ok_or(ServiceError::InvalidConfiguration)?;
+        let mut request = client
+            .post(endpoint)
+            .header("content-type", "application/json")
+            .header("x-delivery-id", &job.id)
+            .body(job.payload.clone());
+        if job.destination.kind == crate::delivery::DestinationKind::NotionMock {
+            request = request.header("notion-version", "2026-03-11");
+        }
+        let observation = tokio::select! {
+            _ = shared.shutdown.cancelled() => Observation::Ambiguous,
+            response = request.send() => match response {
+                Ok(response) if response.status().is_success()
+                    && (job.destination.kind != crate::delivery::DestinationKind::NotionMock || response.status().as_u16() == 200)
+                    => Observation::Delivered,
+                Err(error) if error.is_connect() => Observation::NotDispatched,
+                _ => Observation::Ambiguous,
+            }
+        };
+        shared
+            .database
+            .call(move |store| {
+                store
+                    .completion_observe(&job, ServiceClock::Wall, retry, observation)
+                    .map_err(Into::into)
+            })
+            .await?;
+    }
+    Ok(())
 }
 
 async fn worker(shared: Arc<Shared>) {

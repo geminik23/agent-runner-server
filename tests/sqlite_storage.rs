@@ -361,9 +361,53 @@ fn existing_version_two_database_preserves_skill_versions_and_adds_registry() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let policy: (String, bool) = connection.query_row("SELECT required_capabilities, enabled FROM skill_policies WHERE skill_id = 'report' AND version = '1'", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
     assert_eq!(policy, ("[]".into(), true));
+}
+
+#[test]
+fn version_three_preserves_legacy_intents_without_enrolling_them_for_dispatch() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("v3.sqlite");
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(include_str!("../migrations/0001_initial.sql"))
+        .unwrap();
+    connection
+        .execute_batch(include_str!("../migrations/0002_run_service.sql"))
+        .unwrap();
+    connection
+        .execute_batch(include_str!("../migrations/0003_skill_registry.sql"))
+        .unwrap();
+    connection
+        .pragma_update(None, "application_id", 0x41525353_i64)
+        .unwrap();
+    connection.pragma_update(None, "user_version", 3).unwrap();
+    connection.execute_batch("INSERT INTO namespaces VALUES ('owner', 'client-a');
+        INSERT INTO runs (owner_id,client_id,run_id,idempotency_key,normalized_request,manifest,runtime,synthetic,scenario,state) VALUES ('owner','client-a','legacy','key',X'01',X'02','dummy',1,'success','succeeded');
+        INSERT INTO events VALUES ('owner','client-a','legacy','event',0,'run.finished',X'03');
+        INSERT INTO hook_bindings VALUES ('owner','client-a','legacy','binding','old-hook','old-destination',X'04');
+        INSERT INTO delivery_intents VALUES ('owner','client-a','delivery','legacy','event','binding',X'0506','pending');").unwrap();
+    drop(connection);
+    let store = SqliteStore::open(&path).unwrap();
+    let deliveries = store
+        .get_deliveries(&namespace("client-a"), "legacy")
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].payload, vec![5, 6]);
+    drop(store);
+    let connection = Connection::open(&path).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    let enrolled: i64 = connection
+        .query_row("SELECT COUNT(*) FROM completion_delivery_jobs", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, 4);
+    assert_eq!(enrolled, 0);
 }
 
 #[test]
@@ -401,7 +445,7 @@ fn existing_version_one_database_is_upgraded_without_losing_records() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let created: bool = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'service_jobs')",
@@ -861,17 +905,17 @@ fn newer_schema_is_rejected_without_changing_it() {
     let path = temp.path().join("storage.sqlite");
     drop(SqliteStore::open(&path).unwrap());
     let connection = Connection::open(&path).unwrap();
-    connection.pragma_update(None, "user_version", 4).unwrap();
+    connection.pragma_update(None, "user_version", 5).unwrap();
     drop(connection);
     assert!(matches!(
         SqliteStore::open(&path),
-        Err(StorageError::UnsupportedSchema(4))
+        Err(StorageError::UnsupportedSchema(5))
     ));
     let connection = Connection::open(&path).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
 }
 
 #[test]

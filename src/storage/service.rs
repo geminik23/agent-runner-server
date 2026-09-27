@@ -1,4 +1,7 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashSet,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
@@ -50,6 +53,10 @@ pub(crate) struct ServiceAdmission {
     pub skills: Option<Vec<SkillRef>>,
     pub may_use_skills: bool,
     pub skill_bounds: super::skills::SkillBounds,
+    pub hooks: Option<Vec<super::HookRef>>,
+    pub may_use_hooks: bool,
+    pub destination_grants: HashSet<String>,
+    pub delivery: Option<crate::delivery::DeliveryConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,7 +88,7 @@ impl From<i64> for ServiceClock {
     }
 }
 impl ServiceClock {
-    fn read(self) -> Result<i64, StorageError> {
+    pub(super) fn read(self) -> Result<i64, StorageError> {
         match self {
             Self::Wall => wall_clock_ms(),
             Self::Fixed(value) => Ok(value),
@@ -121,6 +128,12 @@ impl StopCause {
             Self::Interrupted => TerminalState::Interrupted,
         }
     }
+}
+
+struct FinishContext {
+    stop: Option<StopCause>,
+    max_result_bytes: usize,
+    now_ms: i64,
 }
 
 pub(crate) struct Candidate {
@@ -196,6 +209,7 @@ impl SqliteStore {
             admission.may_use_skills,
             admission.skill_bounds,
         )?;
+        let selected_hooks = super::hooks::resolve(&tx, admission)?;
         let outstanding: i64 = tx.query_row(
             "SELECT COUNT(*) FROM service_jobs j JOIN runs r USING (owner_id, client_id, run_id) WHERE r.state IN ('queued', 'preparing', 'running', 'validating')",
             [],
@@ -265,6 +279,18 @@ impl SqliteStore {
             "INSERT INTO runs (owner_id, client_id, run_id, session_id, idempotency_key, normalized_request, manifest, runtime, synthetic, scenario, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'queued')",
             params![ns.owner_id, ns.client_id, run_id, session_id, admission.idempotency_key, admission.normalized_request, admission.manifest, admission.metadata.runtime, admission.metadata.synthetic, admission.metadata.scenario],
         )?;
+        if !selected_hooks.is_empty() {
+            super::hooks::pin(
+                &tx,
+                ns,
+                &run_id,
+                &selected_hooks,
+                admission
+                    .delivery
+                    .as_ref()
+                    .ok_or(StorageError::InvalidState)?,
+            )?;
+        }
         for (position, skill) in selected_skills.iter().enumerate() {
             tx.execute(
                 "INSERT INTO run_skills (owner_id, client_id, run_id, skill_id, version, position) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -413,8 +439,11 @@ impl SqliteStore {
                 &job.run_id,
                 &job.attempt_id,
                 &Candidate::stopped(),
-                Some(cause),
-                4096,
+                FinishContext {
+                    stop: Some(cause),
+                    max_result_bytes: 4096,
+                    now_ms,
+                },
             )?;
             tx.commit()?;
             return Ok(false);
@@ -489,8 +518,11 @@ impl SqliteStore {
             &job.run_id,
             &job.attempt_id,
             &Candidate::stopped(),
-            Some(cause),
-            4096,
+            FinishContext {
+                stop: Some(cause),
+                max_result_bytes: 4096,
+                now_ms,
+            },
         )?;
         tx.commit()?;
         Ok(())
@@ -533,8 +565,11 @@ impl SqliteStore {
                 run_id,
                 &attempt_id,
                 &Candidate::stopped(),
-                Some(actual),
-                4096,
+                FinishContext {
+                    stop: Some(actual),
+                    max_result_bytes: 4096,
+                    now_ms,
+                },
             )?;
         }
         tx.commit()?;
@@ -630,8 +665,11 @@ impl SqliteStore {
             &job.run_id,
             &job.attempt_id,
             candidate,
-            stop,
-            max_result_bytes,
+            FinishContext {
+                stop,
+                max_result_bytes,
+                now_ms,
+            },
         )?;
         tx.commit()?;
         Ok(())
@@ -840,8 +878,11 @@ impl SqliteStore {
                         &run_id,
                         &attempt_id,
                         &candidate,
-                        Some(cause),
-                        4096,
+                        FinishContext {
+                            stop: Some(cause),
+                            max_result_bytes: 4096,
+                            now_ms,
+                        },
                     )?;
                 } else {
                     tx.execute("UPDATE service_jobs SET claim_token = NULL WHERE owner_id = ?1 AND client_id = ?2 AND run_id = ?3", params![namespace.owner_id, namespace.client_id, run_id])?;
@@ -929,8 +970,11 @@ fn expire_waiting(tx: &Transaction<'_>, now_ms: i64) -> Result<(), StorageError>
             &run_id,
             &attempt_id,
             &Candidate::stopped(),
-            Some(stop),
-            4096,
+            FinishContext {
+                stop: Some(stop),
+                max_result_bytes: 4096,
+                now_ms,
+            },
         )?;
     }
     Ok(())
@@ -942,9 +986,13 @@ fn finish_tx(
     run_id: &str,
     attempt_id: &str,
     candidate: &Candidate,
-    stop: Option<StopCause>,
-    max_result_bytes: usize,
+    context: FinishContext,
 ) -> Result<(), StorageError> {
+    let FinishContext {
+        stop,
+        max_result_bytes,
+        now_ms,
+    } = context;
     let (state, session_id, spawn): (String, String, bool) = tx.query_row(
         "SELECT r.state, r.session_id, a.spawn_intent FROM runs r JOIN attempts a USING (owner_id, client_id, run_id) WHERE r.owner_id = ?1 AND r.client_id = ?2 AND r.run_id = ?3 AND a.attempt_id = ?4",
         params![namespace.owner_id, namespace.client_id, run_id, attempt_id],
@@ -995,6 +1043,7 @@ fn finish_tx(
             return Err(StorageError::InvalidState);
         }
     }
+    super::completion::enqueue_terminal(tx, namespace, run_id, terminal.as_str(), cleanup, now_ms)?;
     Ok(())
 }
 

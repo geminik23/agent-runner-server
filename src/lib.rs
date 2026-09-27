@@ -3,6 +3,7 @@
 pub mod access;
 pub mod application;
 pub mod core;
+pub mod delivery;
 pub mod runtimes;
 pub mod server;
 pub mod storage;

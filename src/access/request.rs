@@ -1,6 +1,8 @@
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
-use crate::storage::SkillRef;
+use crate::storage::{HookRef, SkillRef};
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -17,12 +19,24 @@ pub(crate) struct StartBody {
         skip_serializing_if = "Option::is_none"
     )]
     pub skills: Option<Vec<SkillRef>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_hooks",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub hooks: Option<Vec<HookRef>>,
 }
 
 fn deserialize_skills<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<Vec<SkillRef>>, D::Error> {
     Vec::<SkillRef>::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_hooks<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<HookRef>>, D::Error> {
+    Vec::<HookRef>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -49,10 +63,17 @@ pub struct AuthorizedStart {
     idempotency_key: String,
     session: StartSession,
     may_use_skills: bool,
+    may_use_hooks: bool,
+    destinations: HashSet<String>,
 }
 
 impl AuthorizedStart {
-    pub(super) fn from_body(body: StartBody, may_use_skills: bool) -> Self {
+    pub(super) fn from_body(
+        body: StartBody,
+        may_use_skills: bool,
+        may_use_hooks: bool,
+        destinations: HashSet<String>,
+    ) -> Self {
         Self {
             profile_id: body.profile_id,
             workspace_id: body.workspace_id,
@@ -60,7 +81,17 @@ impl AuthorizedStart {
             idempotency_key: body.idempotency_key,
             session: body.session,
             may_use_skills,
+            may_use_hooks,
+            destinations,
         }
+    }
+
+    pub(crate) fn may_use_hooks(&self) -> bool {
+        self.may_use_hooks
+    }
+
+    pub(crate) fn destinations(&self) -> &HashSet<String> {
+        &self.destinations
     }
 
     pub(crate) fn may_use_skills(&self) -> bool {
