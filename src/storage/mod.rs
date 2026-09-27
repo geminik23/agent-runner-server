@@ -5,6 +5,7 @@ pub(crate) mod dispatch;
 pub(crate) mod hooks;
 pub(crate) mod inbox;
 mod queries;
+mod retention;
 mod runs;
 pub(crate) mod service;
 pub(crate) mod skills;

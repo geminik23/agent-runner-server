@@ -241,6 +241,7 @@ impl Server {
             transport_stop,
         } = self;
         let graceful = transport_stop.clone();
+        let service_stop = service.shutdown_signal();
         let accept_failed = CancellationToken::new();
         let listener = listener::BoundedListener::new(
             listener,
@@ -265,6 +266,7 @@ impl Server {
             tokio::select! {
                 result = &mut task => break Some(result),
                 _ = stop.cancelled() => break None,
+                _ = service_stop.cancelled() => break None,
                 _ = accept_failed.cancelled() => { maintenance_failed = true; break None; },
                 _ = tokio::time::sleep(shared.limits.mcp_session_idle.min(shared.limits.request_timeout).min(Duration::from_secs(5))) => {
                     if !matches!(tokio::time::timeout(shared.limits.request_timeout, shared.sessions.expire(false)).await, Ok(Ok(()))) {

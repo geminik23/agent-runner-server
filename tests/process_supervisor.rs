@@ -1049,12 +1049,47 @@ async fn fake_backend_cancellation_preserves_the_service_stop_and_session_quaran
         terminal_state(&service, &client, &receipt.run_id).await,
         "cancelled"
     );
+    let session_id = receipt.session_id.as_ref().unwrap().clone();
     let db =
         rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
-    let (cleanup,disposition,reserved):(Option<String>,Option<String>,Option<String>)=db.query_row("SELECT cleanup,disposition,reserved_run_id FROM sessions WHERE owner_id='owner' AND client_id='client' AND session_id=?1",[receipt.session_id.unwrap()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+    let (cleanup,disposition,reserved,native):(Option<String>,Option<String>,Option<String>,Option<String>)=db.query_row("SELECT cleanup,disposition,reserved_run_id,native_id FROM sessions WHERE owner_id='owner' AND client_id='client' AND session_id=?1",[&session_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
     assert_eq!(cleanup.as_deref(), Some("uncertain"));
     assert_eq!(disposition.as_deref(), Some("uncertain"));
     assert_eq!(reserved.as_deref(), Some(receipt.run_id.as_str()));
+    assert_eq!(native.as_deref(), Some("native-cancel"));
+    drop(db);
+    for selection in [
+        serde_json::json!({"mode":"resume","session_id":session_id}),
+        serde_json::json!({"mode":"resume_native","native_id":"native-cancel"}),
+    ] {
+        let body = serde_json::to_vec(&serde_json::json!({"profile_id":"profile","workspace_id":"workspace","input":{"request":"fixture"},"idempotency_key":"blocked-before-restart","session":selection})).unwrap();
+        assert!(matches!(
+            service.start(&client, &body).await,
+            Err(agent_runner_server::application::ServiceError::Access(
+                agent_runner_server::access::AccessError::Storage(
+                    agent_runner_server::storage::StorageError::SessionBusy
+                )
+            ))
+        ));
+    }
     service.shutdown().await.unwrap();
+    let (reopened, access) =
+        fixture_service(&path, "native-cancel".into(), "signal_term", None).await;
+    let client = access.authenticate("test", &[7; 32]).unwrap();
+    for selection in [
+        serde_json::json!({"mode":"resume","session_id":session_id}),
+        serde_json::json!({"mode":"resume_native","native_id":"native-cancel"}),
+    ] {
+        let body = serde_json::to_vec(&serde_json::json!({"profile_id":"profile","workspace_id":"workspace","input":{"request":"fixture"},"idempotency_key":"blocked-after-restart","session":selection})).unwrap();
+        assert!(matches!(
+            reopened.start(&client, &body).await,
+            Err(agent_runner_server::application::ServiceError::Access(
+                agent_runner_server::access::AccessError::Storage(
+                    agent_runner_server::storage::StorageError::SessionBusy
+                )
+            ))
+        ));
+    }
+    reopened.shutdown().await.unwrap();
 }

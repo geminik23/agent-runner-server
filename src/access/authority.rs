@@ -395,8 +395,10 @@ impl ClientAccessControl {
         if body.len() > self.limits.max_request_bytes {
             return Err(AccessError::InvalidRequest);
         }
+        let value =
+            crate::validation::parse_unique_json(body).map_err(|_| AccessError::InvalidRequest)?;
         let request: StartBody =
-            serde_json::from_slice(body).map_err(|_| AccessError::InvalidRequest)?;
+            serde_json::from_value(value).map_err(|_| AccessError::InvalidRequest)?;
         if !valid_identifier(&request.profile_id)
             || !valid_identifier(&request.workspace_id)
             || request.profile_id.len() > self.limits.max_identifier_bytes
@@ -420,10 +422,21 @@ impl ClientAccessControl {
                 return Err(AccessError::Forbidden);
             }
         }
-        if let StartSession::Resume { session_id } = &request.session {
-            validate_resource_id(session_id, &self.limits)?;
-            if !registration.scopes.contains(&Scope::SessionRead) {
-                return Err(AccessError::Forbidden);
+        match &request.session {
+            StartSession::New => {}
+            StartSession::Resume { session_id } => {
+                validate_resource_id(session_id, &self.limits)?;
+                if !registration.scopes.contains(&Scope::SessionRead) {
+                    return Err(AccessError::Forbidden);
+                }
+            }
+            StartSession::ResumeNative { native_id } => {
+                if native_id.is_empty() || native_id.len() > self.limits.max_request_bytes {
+                    return Err(AccessError::InvalidRequest);
+                }
+                if !registration.scopes.contains(&Scope::SessionRead) {
+                    return Err(AccessError::Forbidden);
+                }
             }
         }
         if request
@@ -444,7 +457,12 @@ impl ClientAccessControl {
             {
                 return Err(AccessError::Forbidden);
             }
-            if request.input.request.len() > profile.max_input_bytes {
+            if request.input.request.len() > profile.max_input_bytes
+                || request
+                    .result_schema
+                    .as_ref()
+                    .is_some_and(|schema| !crate::validation::valid_schema(schema))
+            {
                 return Err(AccessError::InvalidRequest);
             }
             Ok(AuthorizedStart::from_body(

@@ -15,7 +15,13 @@ use agent_runner_server::{
     server::{Server, ServerLimits},
     storage::Namespace,
 };
-use axum::{Router, body::Bytes, extract::State, http::HeaderMap, routing::post};
+use axum::{
+    Router,
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    routing::post,
+};
 use reqwest::Client;
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
@@ -40,6 +46,27 @@ async fn receive(State(received): State<Arc<Mutex<Vec<Value>>>>, body: Bytes) ->
         .unwrap()
         .push(serde_json::from_slice(&body).unwrap());
     "ok"
+}
+
+async fn receive_deduplicated(
+    State(received): State<Arc<Mutex<Vec<Value>>>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    let id = headers
+        .get("x-delivery-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_owned();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    let mut received = received.lock().unwrap();
+    let seen = received.iter().any(|item| item["dedup_id"] == id);
+    received.push(json!({"dedup_id":id,"payload":payload,"applied":!seen}));
+    if seen {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 async fn receive_notion(
@@ -79,6 +106,8 @@ struct Fixture {
     task: JoinHandle<Result<(), agent_runner_server::server::ServerError>>,
     receiver: JoinHandle<()>,
     received: Arc<Mutex<Vec<Value>>>,
+    backend: Arc<DummyBackend>,
+    delivery: DeliveryConfig,
 }
 
 impl Fixture {
@@ -100,6 +129,7 @@ impl Fixture {
         let receiver_address = listener.local_addr().unwrap();
         let router = Router::new()
             .route("/hook", post(receive))
+            .route("/dedup", post(receive_deduplicated))
             .route("/slow", post(receive_slow))
             .route("/v1/pages", post(receive_notion))
             .with_state(Arc::clone(&received));
@@ -136,6 +166,7 @@ impl Fixture {
                     .with_destinations([
                         "inbox".into(),
                         "webhook".into(),
+                        "dedup".into(),
                         "notion".into(),
                         "slow".into(),
                     ])
@@ -199,7 +230,7 @@ impl Fixture {
             profile_id: "profile".into(),
             revision: "v1".into(),
             state_realm: "dummy".into(),
-            backend,
+            backend: backend.clone(),
         }];
         let runs = RunLimits {
             max_outstanding: 8,
@@ -231,6 +262,15 @@ impl Fixture {
                 endpoint: Some(format!("http://{receiver_address}/hook")),
                 notion_parent: None,
                 deduplication: false,
+                enabled: true,
+            },
+            Destination {
+                id: "dedup".into(),
+                revision: "v1".into(),
+                kind: DestinationKind::WebhookTest,
+                endpoint: Some(format!("http://{receiver_address}/dedup")),
+                notion_parent: None,
+                deduplication: true,
                 enabled: true,
             },
             Destination {
@@ -271,7 +311,7 @@ impl Fixture {
             Arc::clone(&access),
             profiles,
             runs.clone(),
-            Some(delivery),
+            Some(delivery.clone()),
         )
         .await
         .unwrap();
@@ -313,6 +353,8 @@ impl Fixture {
             task,
             receiver,
             received,
+            backend,
+            delivery,
         }
     }
 
@@ -403,7 +445,7 @@ impl Fixture {
             profile_id: "profile".into(),
             revision: "v1".into(),
             state_realm: "dummy".into(),
-            backend: Arc::new(DummyBackend::new(DummyScenario::Success, 64)),
+            backend: self.backend.clone(),
         }];
         let service = RunService::open(
             &self.path,
@@ -884,6 +926,7 @@ async fn lost_webhook_response_is_uncertain_and_does_not_rerun_the_task() {
     .await
     .unwrap();
     assert_eq!(f.received.lock().unwrap().len(), 1);
+    assert_eq!(f.backend.captured_inputs().len(), 1);
     let response = f
         .client
         .get(format!("{}/v1/runs/{run}", f.url))
@@ -933,5 +976,584 @@ async fn lost_webhook_response_is_uncertain_and_does_not_rerun_the_task() {
         )
         .await;
     assert_eq!(status, 409);
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    assert_eq!(f.received.lock().unwrap().len(), 1);
+    f.shutdown().await;
+}
+
+#[tokio::test]
+async fn schema_failure_commits_failed_result_and_matching_notification_without_leaking_output() {
+    let f = Fixture::new().await;
+    let (status, _) = f.post("/v1/hooks", "full", 7, json!({"hook_id":"validation-failed","version":"1","destination_id":"webhook","events":["failed"]})).await;
+    assert_eq!(status, 200);
+    let (status, receipt) = f.post("/v1/runs", "full", 7, json!({"profile_id":"profile","workspace_id":"workspace","input":{"request":"validation fixture"},"idempotency_key":"validation-notification","result_schema":{"type":"object"},"hooks":[{"hook_id":"validation-failed","version":"1"}]})).await;
+    assert_eq!(status, 202);
+    let run = receipt["run_id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while f.received.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let received = f.received.lock().unwrap().clone();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0]["state"], "failed");
+    assert!(received[0].get("output").is_none());
+    assert!(!received[0].to_string().contains("Scripted dummy output"));
+    let result: Value = f
+        .client
+        .get(format!("{}/v1/runs/{run}/result", f.url))
+        .bearer_auth(format!("full.{}", "07".repeat(32)))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let data: Value = serde_json::from_str(result["data"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        data["details"]["validation"]["reason"],
+        "invalid_or_unsupported_json"
+    );
+    assert_eq!(
+        data["details"]["outcome"]["output"],
+        "Scripted dummy output"
+    );
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    f.shutdown().await;
+}
+
+#[tokio::test]
+async fn hook_binding_stays_pinned_after_ack_and_default_change_before_terminal() {
+    let f = Fixture::with_settings(128, DummyScenario::DelayedSuccess).await;
+    let (status, body) = f.post("/v1/hooks", "full", 7, json!({"hook_id":"pinned","version":"1","destination_id":"webhook","events":["cancelled"]})).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, _) = f
+        .post(
+            "/v1/hook-defaults",
+            "full",
+            7,
+            json!({"hooks":[{"hook_id":"pinned","version":"1"}]}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let request = json!({"profile_id":"profile","workspace_id":"workspace","input":{"request":"pinned fixture"},"idempotency_key":"pinned-before-terminal"});
+    let (status, receipt) = f.post("/v1/runs", "full", 7, request.clone()).await;
+    assert_eq!(status, 202);
+    let run = receipt["run_id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while f.backend.captured_inputs().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (status, _) = f
+        .post("/v1/hook-defaults", "full", 7, json!({"hooks":[]}))
+        .await;
+    assert_eq!(status, 200);
+    let (status, _) = f.post("/v1/hooks", "full", 7, json!({"hook_id":"pinned","version":"2","destination_id":"notion","events":["cancelled"]})).await;
+    assert_eq!(status, 200);
+    let (status, replay) = f.post("/v1/runs", "full", 7, request).await;
+    assert_eq!(status, 200);
+    assert_eq!(replay["run_id"], run);
+    assert_eq!(replay["replay"], true);
+    let (status, _) = f
+        .post(&format!("/v1/runs/{run}/cancel"), "full", 7, json!({}))
+        .await;
+    assert_eq!(status, 200);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while f.received.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let received = f.received.lock().unwrap().clone();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0]["state"], "cancelled");
+    assert_eq!(received[0]["synthetic"], true);
+    assert!(received[0].get("notion").is_none());
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    f.shutdown().await;
+}
+
+#[tokio::test]
+async fn lost_inbox_ack_response_can_be_retried_after_reconnection() {
+    use tokio::io::AsyncWriteExt;
+    let f = Fixture::new().await;
+    let (status, body) = f.post("/v1/hooks", "full", 7, json!({"hook_id":"ack-hook","version":"1","destination_id":"inbox","events":["succeeded"]})).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, _) = f.post("/v1/runs", "full", 7, json!({"profile_id":"profile","workspace_id":"workspace","input":{"request":"ack fixture"},"idempotency_key":"ack-run","hooks":[{"hook_id":"ack-hook","version":"1"}]})).await;
+    assert_eq!(status, 202);
+    let inbox_id = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let (_, page) = f
+                .post("/v1/inbox/list", "full", 7, json!({"limit":5}))
+                .await;
+            if let Some(id) = page["items"][0]["inbox_id"].as_str() {
+                break id.to_owned();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (_, page) = f
+        .post("/v1/inbox/list", "full", 7, json!({"limit":5}))
+        .await;
+    assert_eq!(page["items"][0]["inbox_id"], inbox_id);
+    let address = f.url.strip_prefix("http://").unwrap();
+    let mut connection = tokio::net::TcpStream::connect(address).await.unwrap();
+    let body = json!({"inbox_id":inbox_id}).to_string();
+    let request = format!(
+        "POST /v1/inbox/ack HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer full.{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "07".repeat(32),
+        body.len()
+    );
+    connection.write_all(request.as_bytes()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let db = rusqlite::Connection::open(&f.path).unwrap();
+            let acknowledged: bool = db
+                .query_row(
+                    "SELECT acknowledged_ms IS NOT NULL FROM completion_inbox WHERE inbox_id=?1",
+                    [&inbox_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if acknowledged {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("ack was not committed before response loss");
+    drop(connection);
+    let result = f
+        .mcp(
+            "tools/call",
+            Some("inbox_ack"),
+            json!({"inbox_id":inbox_id}),
+            "full",
+            7,
+        )
+        .await;
+    assert_eq!(result["result"]["structuredContent"]["acknowledged"], true);
+    let (_, page) = f
+        .post("/v1/inbox/list", "full", 7, json!({"limit":5}))
+        .await;
+    assert_eq!(page["items"][0]["acknowledged"], true);
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    f.shutdown().await;
+}
+
+#[tokio::test]
+async fn changed_destination_after_ack_never_retargets_the_pinned_delivery() {
+    let mut f = Fixture::with_settings(128, DummyScenario::DelayedSuccess).await;
+    let (status, _) = f.post("/v1/hooks", "full", 7, json!({"hook_id":"pinned-destination","version":"1","destination_id":"webhook","events":["interrupted"]})).await;
+    assert_eq!(status, 200);
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    db.execute_batch("CREATE TRIGGER block_pinned_dispatch BEFORE UPDATE OF dispatch_started ON completion_delivery_jobs WHEN NEW.dispatch_started=1 BEGIN SELECT RAISE(ABORT, 'dispatch barrier'); END;").unwrap();
+    drop(db);
+    let request = json!({"profile_id":"profile","workspace_id":"workspace","input":{"request":"destination snapshot"},"idempotency_key":"pinned-destination","hooks":[{"hook_id":"pinned-destination","version":"1"}]});
+    let (status, receipt) = f.post("/v1/runs", "full", 7, request.clone()).await;
+    assert_eq!(status, 202);
+    let run = receipt["run_id"].as_str().unwrap().to_owned();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while f.backend.captured_inputs().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.stop.cancel();
+    tokio::time::timeout(Duration::from_secs(5), &mut f.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    db.execute_batch("DROP TRIGGER block_pinned_dispatch")
+        .unwrap();
+    let snapshot: Vec<u8> = db
+        .query_row(
+            "SELECT destination_snapshot FROM completion_bindings WHERE run_id=?1",
+            [&run],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let pinned: Value = serde_json::from_slice(&snapshot).unwrap();
+    let original = pinned["endpoint"].as_str().unwrap();
+    assert!(original.ends_with("/hook"));
+    drop(db);
+    let destination = f
+        .delivery
+        .destinations
+        .iter_mut()
+        .find(|destination| destination.id == "webhook")
+        .unwrap();
+    destination.endpoint = Some(original.replace("/hook", "/dedup"));
+    let profiles = vec![BackendProfile {
+        profile_id: "profile".into(),
+        revision: "v1".into(),
+        state_realm: "dummy".into(),
+        backend: f.backend.clone(),
+    }];
+    let service = RunService::open_with_delivery(
+        &f.path,
+        f.access.clone(),
+        profiles,
+        f.runs.clone(),
+        Some(f.delivery.clone()),
+    )
+    .await
+    .unwrap();
+    let server = Server::bind("127.0.0.1:0".parse().unwrap(), service, f.transport.clone())
+        .await
+        .unwrap();
+    f.url = format!("http://{}", server.local_addr().unwrap());
+    f.stop = CancellationToken::new();
+    f.task = tokio::spawn(server.run(f.stop.clone()));
+    let (status, replay) = f.post("/v1/runs", "full", 7, request).await;
+    assert_eq!(status, 200);
+    assert_eq!(replay["run_id"], run);
+    assert_eq!(replay["replay"], true);
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let (_, page) = f
+                .post(
+                    "/v1/deliveries/list",
+                    "full",
+                    7,
+                    json!({"run_id":run,"limit":5}),
+                )
+                .await;
+            if page["items"][0]["state"] == "skipped" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(f.received.lock().unwrap().is_empty());
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    f.shutdown().await;
+}
+
+#[tokio::test]
+async fn revocation_before_dispatch_blocks_the_actual_webhook_worker() {
+    let f = Fixture::new().await;
+    let (status, _) = f.post("/v1/hooks", "full", 7, json!({"hook_id":"revoked-before","version":"1","destination_id":"webhook","events":["succeeded"]})).await;
+    assert_eq!(status, 200);
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    db.execute_batch("CREATE TRIGGER pause_authorized_dispatch BEFORE UPDATE OF dispatch_started ON completion_delivery_jobs WHEN NEW.dispatch_started=1 BEGIN SELECT RAISE(ABORT, 'dispatch barrier'); END;").unwrap();
+    drop(db);
+    let (status, receipt) = f.post("/v1/runs", "full", 7, json!({"profile_id":"profile","workspace_id":"workspace","input":{"request":"revocation fixture"},"idempotency_key":"revoked-before","hooks":[{"hook_id":"revoked-before","version":"1"}]})).await;
+    assert_eq!(status, 202);
+    let run = receipt["run_id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let db = rusqlite::Connection::open(&f.path).unwrap();
+            let state: Option<String> = db
+                .query_row(
+                    "SELECT state FROM delivery_intents WHERE run_id=?1",
+                    [run],
+                    |row| row.get(0),
+                )
+                .ok();
+            if state.as_deref() == Some("leased") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(f.access.revoke("full").unwrap());
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    db.execute_batch("DROP TRIGGER pause_authorized_dispatch")
+        .unwrap();
+    drop(db);
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let (_, page) = f
+                .post(
+                    "/v1/deliveries/list",
+                    "control",
+                    10,
+                    json!({"run_id":run,"limit":5}),
+                )
+                .await;
+            if page["items"][0]["state"] == "skipped" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(f.received.lock().unwrap().is_empty());
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    f.shutdown().await;
+}
+
+#[tokio::test]
+async fn revocation_after_dispatch_preserves_uncertain_effect_and_payload() {
+    let f = Fixture::new().await;
+    let (status, _) = f.post("/v1/hooks", "full", 7, json!({"hook_id":"revoked-after","version":"1","destination_id":"slow","events":["succeeded"]})).await;
+    assert_eq!(status, 200);
+    let (status, receipt) = f.post("/v1/runs", "full", 7, json!({"profile_id":"profile","workspace_id":"workspace","input":{"request":"revocation fixture"},"idempotency_key":"revoked-after","hooks":[{"hook_id":"revoked-after","version":"1"}]})).await;
+    assert_eq!(status, 202);
+    let run = receipt["run_id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while f.received.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(f.access.revoke("full").unwrap());
+    let delivery = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let (_, page) = f
+                .post(
+                    "/v1/deliveries/list",
+                    "control",
+                    10,
+                    json!({"run_id":run,"limit":5}),
+                )
+                .await;
+            if page["items"][0]["state"] == "uncertain" {
+                break page["items"][0]["delivery_id"].as_str().unwrap().to_owned();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    let bytes: i64 = db
+        .query_row(
+            "SELECT length(payload) FROM delivery_intents WHERE delivery_id=?1",
+            [&delivery],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(bytes > 0);
+    assert_eq!(f.received.lock().unwrap().len(), 1);
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    drop(db);
+    f.shutdown().await;
+}
+
+#[tokio::test]
+async fn deduplicating_receiver_observes_stable_retry_without_duplicate_effect_or_run() {
+    let f = Fixture::new().await;
+    let (status, body) = f.post("/v1/hooks", "full", 7, json!({"hook_id":"dedup-hook","version":"1","destination_id":"dedup","events":["succeeded"]})).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, receipt) = f.post("/v1/runs", "full", 7, json!({"profile_id":"profile","workspace_id":"workspace","input":{"request":"dedup fixture"},"idempotency_key":"dedup-run","hooks":[{"hook_id":"dedup-hook","version":"1"}]})).await;
+    assert_eq!(status, 202);
+    let run = receipt["run_id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let (_, page) = f
+                .post(
+                    "/v1/deliveries/list",
+                    "full",
+                    7,
+                    json!({"run_id":run,"limit":5}),
+                )
+                .await;
+            if page["items"][0]["state"] == "succeeded" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let received = f.received.lock().unwrap().clone();
+    assert_eq!(received.len(), 2);
+    assert_eq!(received[0]["dedup_id"], received[1]["dedup_id"]);
+    assert_eq!(received[0]["payload"], received[1]["payload"]);
+    assert_eq!(received[0]["applied"], true);
+    assert_eq!(received[1]["applied"], false);
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    f.shutdown().await;
+}
+
+#[tokio::test]
+async fn committed_terminal_survives_delivery_worker_fault_and_restart() {
+    let mut f = Fixture::new().await;
+    let (status, body) = f.post("/v1/hooks", "full", 7, json!({"hook_id":"postcommit","version":"1","destination_id":"webhook","events":["succeeded"]})).await;
+    assert_eq!(status, 200, "{body}");
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    db.execute_batch("CREATE TRIGGER block_dispatch BEFORE UPDATE OF dispatch_started ON completion_delivery_jobs WHEN NEW.dispatch_started=1 BEGIN SELECT RAISE(ABORT, 'injected dispatch fault'); END;").unwrap();
+    drop(db);
+    let request = json!({"profile_id":"profile","workspace_id":"workspace","input":{"request":"postcommit fixture"},"idempotency_key":"postcommit","hooks":[{"hook_id":"postcommit","version":"1"}]});
+    let (status, receipt) = f.post("/v1/runs", "full", 7, request.clone()).await;
+    assert_eq!(status, 202);
+    let run = receipt["run_id"].as_str().unwrap().to_owned();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let db = rusqlite::Connection::open(&f.path).unwrap();
+            let state: Option<String> = db
+                .query_row(
+                    "SELECT state FROM delivery_intents WHERE run_id=?1",
+                    [&run],
+                    |row| row.get(0),
+                )
+                .ok();
+            if state.as_deref() == Some("leased") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("delivery lease not observed");
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    let (state, result, terminal): (String,i64,i64) = db.query_row("SELECT state,(SELECT COUNT(*) FROM results WHERE run_id=r.run_id),(SELECT COUNT(*) FROM events WHERE run_id=r.run_id AND kind='run.finished') FROM runs r WHERE run_id=?1", [&run], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+    assert_eq!((state.as_str(), result, terminal), ("succeeded", 1, 1));
+    assert!(f.received.lock().unwrap().is_empty());
+    drop(db);
+    f.stop.cancel();
+    tokio::time::timeout(Duration::from_secs(5), &mut f.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    db.execute_batch("DROP TRIGGER block_dispatch").unwrap();
+    drop(db);
+    let profiles = vec![BackendProfile {
+        profile_id: "profile".into(),
+        revision: "v1".into(),
+        state_realm: "dummy".into(),
+        backend: f.backend.clone(),
+    }];
+    let service = RunService::open_with_delivery(
+        &f.path,
+        f.access.clone(),
+        profiles,
+        f.runs.clone(),
+        Some(f.delivery.clone()),
+    )
+    .await
+    .unwrap();
+    let server = Server::bind("127.0.0.1:0".parse().unwrap(), service, f.transport.clone())
+        .await
+        .unwrap();
+    f.url = format!("http://{}", server.local_addr().unwrap());
+    f.stop = CancellationToken::new();
+    f.task = tokio::spawn(server.run(f.stop.clone()));
+    let (status, replay) = f.post("/v1/runs", "full", 7, request).await;
+    assert_eq!(status, 200);
+    assert_eq!(replay["run_id"], run);
+    assert_eq!(replay["replay"], true);
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while f.received.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(f.received.lock().unwrap().len(), 1);
+    assert_eq!(f.received.lock().unwrap()[0]["state"], "succeeded");
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    f.shutdown().await;
+}
+
+#[tokio::test]
+async fn terminal_fault_rolls_back_the_real_service_and_recovery_does_not_rerun() {
+    let mut f = Fixture::new().await;
+    for (hook, destination) in [("fault-webhook", "webhook"), ("fault-inbox", "inbox")] {
+        let (status, body) = f.post("/v1/hooks", "full", 7, json!({"hook_id":hook,"version":"1","destination_id":destination,"events":["succeeded","interrupted"]})).await;
+        assert_eq!(status, 200, "{body}");
+    }
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_terminal_inbox BEFORE INSERT ON completion_inbox BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+    drop(db);
+    let request = json!({"profile_id":"profile","workspace_id":"workspace","input":{"request":"synthetic terminal fault"},"idempotency_key":"terminal-fault","hooks":[{"hook_id":"fault-webhook","version":"1"},{"hook_id":"fault-inbox","version":"1"}]});
+    let response = f
+        .client
+        .post(format!("{}/v1/runs", f.url))
+        .bearer_auth(format!("full.{}", "07".repeat(32)))
+        .json(&request)
+        .send()
+        .await;
+    if let Ok(response) = response {
+        assert!([202, 503].contains(&response.status().as_u16()));
+    }
+    let stopped = tokio::time::timeout(Duration::from_secs(5), &mut f.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stopped.is_err());
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    let run: String = db
+        .query_row(
+            "SELECT run_id FROM runs WHERE idempotency_key='terminal-fault'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let (state, results, terminals, deliveries, inbox): (String,i64,i64,i64,i64) = db.query_row("SELECT state,(SELECT COUNT(*) FROM results WHERE run_id=r.run_id),(SELECT COUNT(*) FROM events WHERE run_id=r.run_id AND kind='run.finished'),(SELECT COUNT(*) FROM delivery_intents WHERE run_id=r.run_id),(SELECT COUNT(*) FROM inbox_items WHERE run_id=r.run_id) FROM runs r WHERE run_id=?1", [&run], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).unwrap();
+    assert_eq!(
+        (state.as_str(), results, terminals, deliveries, inbox),
+        ("running", 0, 0, 0, 0)
+    );
+    assert!(f.received.lock().unwrap().is_empty());
+    drop(db);
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    db.execute_batch("DROP TRIGGER fail_terminal_inbox")
+        .unwrap();
+    drop(db);
+    let profiles = vec![BackendProfile {
+        profile_id: "profile".into(),
+        revision: "v1".into(),
+        state_realm: "dummy".into(),
+        backend: f.backend.clone(),
+    }];
+    let service = RunService::open_with_delivery(
+        &f.path,
+        f.access.clone(),
+        profiles,
+        f.runs.clone(),
+        Some(f.delivery.clone()),
+    )
+    .await
+    .unwrap();
+    let server = Server::bind("127.0.0.1:0".parse().unwrap(), service, f.transport.clone())
+        .await
+        .unwrap();
+    f.url = format!("http://{}", server.local_addr().unwrap());
+    f.stop = CancellationToken::new();
+    f.task = tokio::spawn(server.run(f.stop.clone()));
+    let (status, replay) = f.post("/v1/runs", "full", 7, request).await;
+    assert_eq!(status, 200);
+    assert_eq!(replay["run_id"], run);
+    assert_eq!(replay["replay"], true);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while f.received.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(f.received.lock().unwrap()[0]["state"], "interrupted");
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    let (state,results,terminals,deliveries,inbox): (String,i64,i64,i64,i64) = db.query_row("SELECT state,(SELECT COUNT(*) FROM results WHERE run_id=r.run_id),(SELECT COUNT(*) FROM events WHERE run_id=r.run_id AND kind='run.finished'),(SELECT COUNT(*) FROM delivery_intents WHERE run_id=r.run_id),(SELECT COUNT(*) FROM inbox_items WHERE run_id=r.run_id) FROM runs r WHERE run_id=?1", [&run], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).unwrap();
+    assert_eq!(
+        (state.as_str(), results, terminals, deliveries, inbox),
+        ("interrupted", 1, 1, 1, 1)
+    );
+    drop(db);
     f.shutdown().await;
 }

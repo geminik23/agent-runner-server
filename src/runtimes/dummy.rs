@@ -17,7 +17,11 @@ pub const DELAYED_SCENARIO_DURATION: Duration = Duration::from_secs(5);
 pub enum DummyScenario {
     Success,
     DelayedSuccess,
+    StructuredSuccess,
     Warning,
+    MixedWarnings,
+    PartialWarnings,
+    Incomplete,
     Failure,
 }
 
@@ -26,7 +30,11 @@ impl DummyScenario {
         match self {
             Self::Success => "success",
             Self::DelayedSuccess => "delayed-success",
+            Self::StructuredSuccess => "structured-success",
             Self::Warning => "warning",
+            Self::MixedWarnings => "mixed-warnings",
+            Self::PartialWarnings => "partial-warnings",
+            Self::Incomplete => "incomplete",
             Self::Failure => "failure",
         }
     }
@@ -132,7 +140,11 @@ impl DummyBackend {
             },
             session,
             warnings,
-            warning_observation: WarningObservation::Complete,
+            warning_observation: if self.scenario == DummyScenario::PartialWarnings {
+                WarningObservation::Partial
+            } else {
+                WarningObservation::Complete
+            },
             cleanup: CleanupState::Settled,
             outcome,
         };
@@ -217,9 +229,16 @@ impl DummyBackend {
         }
 
         let mut warnings = Vec::new();
-        if self.scenario == DummyScenario::Warning {
+        let codes: &[&str] = match self.scenario {
+            DummyScenario::Warning | DummyScenario::PartialWarnings => &["dummy_warning"],
+            DummyScenario::MixedWarnings => {
+                &["permission_denied", "question_cancelled", "tool_error"]
+            }
+            _ => &[],
+        };
+        for code in codes {
             let warning = ExecutionWarning {
-                code: "dummy_warning".into(),
+                code: (*code).into(),
                 message: "Scripted dummy warning".into(),
             };
             warnings.push(warning.clone());
@@ -230,10 +249,18 @@ impl DummyBackend {
         if cancellation.is_cancelled() {
             return result(ExecutionOutcome::Cancelled, Some(session), warnings);
         }
-        if self.scenario == DummyScenario::Failure {
+        if matches!(
+            self.scenario,
+            DummyScenario::Failure | DummyScenario::Incomplete
+        ) {
             return result(
                 ExecutionOutcome::Failed(BackendError::ExecutionFailed {
-                    code: "scripted_failure".into(),
+                    code: if self.scenario == DummyScenario::Incomplete {
+                        "incomplete_result"
+                    } else {
+                        "scripted_failure"
+                    }
+                    .into(),
                     message: "Scripted dummy failure".into(),
                 }),
                 Some(session),
@@ -243,7 +270,11 @@ impl DummyBackend {
 
         result(
             ExecutionOutcome::Succeeded {
-                output: "Scripted dummy output".into(),
+                output: if self.scenario == DummyScenario::StructuredSuccess {
+                    r#"{"message":"synthetic"}"#.into()
+                } else {
+                    "Scripted dummy output".into()
+                },
             },
             Some(session),
             warnings,

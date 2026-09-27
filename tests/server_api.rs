@@ -5,7 +5,7 @@ use agent_runner_server::{
         AccessLimits, ClientAccessControl, ClientRegistration, CredentialSecret, ExecutionProfile,
         Scope,
     },
-    application::{BackendProfile, RunLimits, RunService},
+    application::{BackendProfile, RetentionConfig, RunLimits, RunService},
     runtimes::dummy::{DummyBackend, DummyScenario},
     server::{Server, ServerLimits},
     storage::Namespace,
@@ -74,6 +74,15 @@ impl Fixture {
         request_timeout: Duration,
         configure_runs: impl FnOnce(&mut RunLimits),
         configure: impl FnOnce(&mut ServerLimits),
+    ) -> Self {
+        Self::with_retention(scenario, request_timeout, configure_runs, configure, None).await
+    }
+    async fn with_retention(
+        scenario: DummyScenario,
+        request_timeout: Duration,
+        configure_runs: impl FnOnce(&mut RunLimits),
+        configure: impl FnOnce(&mut ServerLimits),
+        retention: Option<RetentionConfig>,
     ) -> Self {
         let dir = tempdir().unwrap();
         let path = dir.path().join("runs.sqlite");
@@ -175,7 +184,11 @@ impl Fixture {
             ClientAccessControl::new(
                 entries,
                 [
-                    ExecutionProfile::dummy("profile", ["workspace".into()], 4096),
+                    ExecutionProfile::dummy(
+                        "profile",
+                        ["workspace".into(), "workspace-other".into()],
+                        4096,
+                    ),
                     ExecutionProfile::dummy("hidden", ["private".into()], 4096),
                 ],
                 AccessLimits {
@@ -215,9 +228,16 @@ impl Fixture {
             poll_interval: Duration::from_millis(5),
         };
         configure_runs(&mut runs);
-        let service = RunService::open(&path, access.clone(), profiles, runs.clone())
-            .await
-            .unwrap();
+        let service = RunService::open_with_retention(
+            &path,
+            access.clone(),
+            profiles,
+            runs.clone(),
+            None,
+            retention,
+        )
+        .await
+        .unwrap();
         let mut limits = ServerLimits {
             max_request_bytes: 16384,
             max_response_bytes: 1048576,
@@ -2663,5 +2683,524 @@ async fn continuously_dripping_headers_cannot_hold_a_connection_forever() {
     assert_eq!(result.status(), 200);
     dripper.abort();
     let _ = dripper.await;
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn selected_result_schema_is_pinned_validated_and_shared_across_transports() {
+    let f = Fixture::new(DummyScenario::StructuredSuccess).await;
+    let full = token("full", 7);
+    let mut unsupported = start("unsupported-schema");
+    unsupported["result_schema"] = json!({"type":"object","$ref":"https://example.invalid"});
+    assert_eq!(
+        f.post("/v1/runs", &unsupported, &full)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    assert!(f.backend.captured_inputs().is_empty());
+
+    let mut request = start("valid-schema");
+    request["result_schema"] = json!({"type":"object","required":["message"],"properties":{"message":{"type":"string"}},"additionalProperties":false});
+    let response = f.post("/v1/runs", &request, &full).send().await.unwrap();
+    assert_eq!(response.status(), 202);
+    let receipt = payload(response).await;
+    let id = receipt["run_id"].as_str().unwrap();
+    assert_eq!(f.wait_terminal(id).await["state"], "succeeded");
+    let replay = f.tool("agents_start", request.clone(), &full).await;
+    assert_eq!(replay["result"]["structuredContent"]["run_id"], id);
+    assert_eq!(replay["result"]["structuredContent"]["replay"], true);
+    let result = f.tool("runs_result", json!({"run_id":id}), &full).await;
+    let data: Value = serde_json::from_str(
+        result["result"]["structuredContent"]["data"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(data["details"]["validation"]["status"], "passed");
+    let mut changed = request.clone();
+    changed["result_schema"]["required"] = json!(["other"]);
+    assert_eq!(
+        f.post("/v1/runs", &changed, &full)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+
+    changed["idempotency_key"] = json!("invalid-result-schema");
+    let receipt = payload(f.post("/v1/runs", &changed, &full).send().await.unwrap()).await;
+    let failed = receipt["run_id"].as_str().unwrap();
+    assert_eq!(f.wait_terminal(failed).await["state"], "failed");
+    let result = f.tool("runs_result", json!({"run_id":failed}), &full).await;
+    let data: Value = serde_json::from_str(
+        result["result"]["structuredContent"]["data"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(data["details"]["validation"]["reason"], "schema_mismatch");
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    let (disposition, reserved): (String, Option<String>) = db
+        .query_row(
+            "SELECT disposition,reserved_run_id FROM sessions WHERE session_id=?1",
+            [receipt["session_id"].as_str().unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(disposition, "reusable");
+    assert_eq!(reserved, None);
+    drop(db);
+    let mut resumed = start("resume-after-validation-failure");
+    resumed["session"] = json!({"mode":"resume","session_id":receipt["session_id"]});
+    let response = f.post("/v1/runs", &resumed, &full).send().await.unwrap();
+    assert_eq!(response.status(), 202);
+    let resumed = payload(response).await;
+    assert_eq!(
+        f.wait_terminal(resumed["run_id"].as_str().unwrap()).await["state"],
+        "succeeded"
+    );
+    let response = f
+        .post(
+            "/v1/runs",
+            &start("other-after-validation-failure"),
+            &token("other", 10),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while f.backend.captured_inputs().len() < 4 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(f.backend.captured_inputs().len(), 4);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn registered_native_session_resume_is_canonical_and_namespace_scoped() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let full = token("full", 7);
+    let first = payload(
+        f.post("/v1/runs", &start("native-original"), &full)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    let run = first["run_id"].as_str().unwrap();
+    assert_eq!(f.wait_terminal(run).await["state"], "succeeded");
+    let session = first["session_id"].as_str().unwrap();
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    let native: String = db
+        .query_row(
+            "SELECT native_id FROM sessions WHERE session_id=?1",
+            [session],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(db);
+    let mut request = start("native-resume");
+    request["session"] = json!({"mode":"resume_native","native_id":native});
+    assert_eq!(
+        f.post("/v1/runs", &request, &token("start", 8))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        f.post("/v1/runs", &request, &token("other", 10))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    for selection in [
+        json!({"mode":"resume","session_id":session}),
+        request["session"].clone(),
+    ] {
+        let mut incompatible = start("wrong-session-workspace");
+        incompatible["workspace_id"] = json!("workspace-other");
+        incompatible["session"] = selection;
+        let response = f
+            .post("/v1/runs", &incompatible, &full)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 409);
+        assert_eq!(
+            payload(response).await["error"]["code"],
+            "session_incompatible"
+        );
+    }
+    let result = f.tool("agents_start", request.clone(), &full).await;
+    assert_eq!(result["result"]["structuredContent"]["session_id"], session);
+    let resumed = result["result"]["structuredContent"]["run_id"]
+        .as_str()
+        .unwrap();
+    assert_eq!(f.wait_terminal(resumed).await["state"], "succeeded");
+    let replay = f.post("/v1/runs", &request, &full).send().await.unwrap();
+    assert_eq!(replay.status(), 200);
+    assert_eq!(payload(replay).await["run_id"], resumed);
+    assert_eq!(f.backend.captured_inputs().len(), 2);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn busy_native_and_server_session_references_do_not_launch_another_run() {
+    let f = Fixture::new(DummyScenario::DelayedSuccess).await;
+    let full = token("full", 7);
+    let first = payload(
+        f.post("/v1/runs", &start("native-busy"), &full)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    let session = first["session_id"].as_str().unwrap();
+    let native = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let db = rusqlite::Connection::open(&f.path).unwrap();
+            let native: Option<String> = db
+                .query_row(
+                    "SELECT native_id FROM sessions WHERE session_id=?1",
+                    [session],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if let Some(native) = native {
+                break native;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for selection in [
+        json!({"mode":"resume","session_id":session}),
+        json!({"mode":"resume_native","native_id":native}),
+    ] {
+        let mut request = start("busy-resume");
+        request["session"] = selection;
+        assert_eq!(
+            f.post("/v1/runs", &request, &full)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            409
+        );
+    }
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn synthetic_warnings_coverage_and_incomplete_output_remain_distinct() {
+    for (scenario, expected_state, expected_coverage, expected_codes) in [
+        (
+            DummyScenario::MixedWarnings,
+            "succeeded",
+            "complete",
+            vec!["permission_denied", "question_cancelled", "tool_error"],
+        ),
+        (
+            DummyScenario::PartialWarnings,
+            "succeeded",
+            "partial",
+            vec!["dummy_warning"],
+        ),
+        (DummyScenario::Incomplete, "failed", "complete", vec![]),
+        (DummyScenario::Failure, "failed", "complete", vec![]),
+    ] {
+        let f = Fixture::new(scenario).await;
+        let full = token("full", 7);
+        let receipt = payload(
+            f.post("/v1/runs", &start("warning-coverage"), &full)
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        let run = receipt["run_id"].as_str().unwrap();
+        let status = f.wait_terminal(run).await;
+        assert_eq!(status["state"], expected_state);
+        assert_eq!(status["metadata"]["synthetic"], true);
+        let result = f.tool("runs_result", json!({"run_id":run}), &full).await;
+        let data: Value = serde_json::from_str(
+            result["result"]["structuredContent"]["data"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(data["details"]["warning_observation"], expected_coverage);
+        let codes: Vec<&str> = data["details"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|warning| warning["code"].as_str().unwrap())
+            .collect();
+        assert_eq!(codes, expected_codes);
+        if scenario == DummyScenario::Incomplete {
+            assert!(
+                data["details"]["outcome"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("incomplete_result")
+            );
+        }
+        if scenario == DummyScenario::Failure {
+            assert!(
+                data["details"]["outcome"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("scripted_failure")
+            );
+        }
+        let events = f
+            .tool("runs_events", json!({"run_id":run,"limit":16}), &full)
+            .await;
+        let events = events["result"]["structuredContent"]["events"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["kind"] == "run.warning")
+                .count(),
+            expected_codes.len()
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event["metadata"]["synthetic"] == true)
+        );
+        f.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn selected_schema_with_insufficient_result_budget_is_rejected_before_execution() {
+    let f = Fixture::with_limits(
+        DummyScenario::Success,
+        Duration::from_secs(3),
+        |limits| limits.max_result_bytes = 128,
+        |_| {},
+    )
+    .await;
+    let mut request = start("small-validation-budget");
+    request["result_schema"] = json!({"type":"object"});
+    let response = f
+        .post("/v1/runs", &request, &token("full", 7))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert!(f.backend.captured_inputs().is_empty());
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn invalid_json_result_is_not_a_success_when_schema_is_selected() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let full = token("full", 7);
+    let mut request = start("invalid-json");
+    request["result_schema"] = json!({"type":"object"});
+    let receipt = payload(f.post("/v1/runs", &request, &full).send().await.unwrap()).await;
+    let id = receipt["run_id"].as_str().unwrap();
+    assert_eq!(f.wait_terminal(id).await["state"], "failed");
+    let result = f.tool("runs_result", json!({"run_id":id}), &full).await;
+    let data: Value = serde_json::from_str(
+        result["result"]["structuredContent"]["data"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        data["details"]["validation"]["reason"],
+        "invalid_or_unsupported_json"
+    );
+    assert_eq!(
+        data["details"]["outcome"]["output"],
+        "Scripted dummy output"
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn retention_storage_failure_stops_the_server_without_losing_the_result() {
+    let mut f = Fixture::with_retention(
+        DummyScenario::Success,
+        Duration::from_secs(3),
+        |_| {},
+        |_| {},
+        Some(RetentionConfig {
+            result_event_retention_ms: 60_000,
+        }),
+    )
+    .await;
+    let full = token("full", 7);
+    let receipt = payload(
+        f.post("/v1/runs", &start("retention-maintenance-failure"), &full)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    let run = receipt["run_id"].as_str().unwrap();
+    assert_eq!(f.wait_terminal(run).await["state"], "succeeded");
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE; CREATE TRIGGER fail_retention_delete BEFORE DELETE ON results BEGIN SELECT RAISE(ABORT, 'injected retention failure'); END;").unwrap();
+    db.execute(
+        "UPDATE run_retention SET expires_ms=1 WHERE run_id=?1",
+        [run],
+    )
+    .unwrap();
+    db.execute_batch("COMMIT").unwrap();
+    drop(db);
+    let stopped = tokio::time::timeout(Duration::from_secs(5), &mut f.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stopped.is_err());
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    let (results,purged): (i64,bool) = db.query_row("SELECT (SELECT COUNT(*) FROM results WHERE run_id=?1),purged FROM run_retention WHERE run_id=?1", [run], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_eq!((results, purged), (1, false));
+    assert!(
+        f.client
+            .post(format!("{}/v1/runs", f.url))
+            .bearer_auth(&full)
+            .json(&start("after-retention-failure"))
+            .send()
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn expired_result_and_events_keep_cross_transport_replay_and_namespace_isolation() {
+    let f = Fixture::with_retention(
+        DummyScenario::Success,
+        Duration::from_secs(3),
+        |_| {},
+        |_| {},
+        Some(RetentionConfig {
+            result_event_retention_ms: 60_000,
+        }),
+    )
+    .await;
+    let full = token("full", 7);
+    let request = start("expiring-result");
+    let response = f.post("/v1/runs", &request, &full).send().await.unwrap();
+    assert_eq!(response.status(), 202);
+    let receipt = payload(response).await;
+    let id = receipt["run_id"].as_str().unwrap();
+    assert_eq!(f.wait_terminal(id).await["state"], "succeeded");
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    let pinned: i64 = db
+        .query_row(
+            "SELECT retention_ms FROM run_retention WHERE run_id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pinned, 60_000);
+    db.execute(
+        "UPDATE run_retention SET expires_ms=1 WHERE run_id=?1",
+        [id],
+    )
+    .unwrap();
+    drop(db);
+    let result = f.tool("runs_result", json!({"run_id":id}), &full).await;
+    assert_eq!(
+        result["result"]["structuredContent"]["availability"],
+        "expired"
+    );
+    assert_eq!(result["result"]["structuredContent"]["state"], "succeeded");
+    assert_eq!(
+        result["result"]["structuredContent"]["metadata"]["synthetic"],
+        true
+    );
+    let rest_result = f
+        .client
+        .get(format!("{}/v1/runs/{id}/result", f.url))
+        .bearer_auth(&full)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rest_result.status(), 200);
+    assert_eq!(payload(rest_result).await["availability"], "expired");
+    let events = f
+        .tool("runs_events", json!({"run_id":id,"limit":1}), &full)
+        .await;
+    assert_eq!(events["result"]["isError"], true);
+    assert_eq!(
+        events["result"]["structuredContent"]["error"]["code"],
+        "expired"
+    );
+    assert_eq!(
+        f.client
+            .get(format!("{}/v1/runs/{id}/events?limit=1", f.url))
+            .bearer_auth(&full)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        410
+    );
+    let replay = f.tool("agents_start", request.clone(), &full).await;
+    assert_eq!(replay["result"]["structuredContent"]["run_id"], id);
+    assert_eq!(replay["result"]["structuredContent"]["replay"], true);
+    let mut different = request;
+    different["input"]["request"] = json!("different");
+    assert_eq!(
+        f.post("/v1/runs", &different, &full)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+    assert_eq!(
+        f.client
+            .get(format!("{}/v1/runs/{id}/result", f.url))
+            .bearer_auth(token("other", 10))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    assert_eq!(
+        f.client
+            .get(format!("{}/v1/runs/{id}/result", f.url))
+            .bearer_auth(token("start", 8))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(f.backend.captured_inputs().len(), 1);
+    let mut resume = start("resume-after-result-expiry");
+    resume["session"] = json!({"mode":"resume","session_id":receipt["session_id"]});
+    let response = f.post("/v1/runs", &resume, &full).send().await.unwrap();
+    assert_eq!(response.status(), 202);
+    let resumed = payload(response).await;
+    assert_eq!(
+        f.wait_terminal(resumed["run_id"].as_str().unwrap()).await["state"],
+        "succeeded"
+    );
+    assert_eq!(f.backend.captured_inputs().len(), 2);
     f.finish().await;
 }

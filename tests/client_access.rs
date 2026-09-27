@@ -83,6 +83,35 @@ fn access() -> ClientAccessControl {
     .unwrap()
 }
 
+#[test]
+fn native_session_ids_use_request_limit_not_server_identifier_limit() {
+    for identifier_limit in [40, 64, 85, 86] {
+        let mut bounds = limits();
+        bounds.max_identifier_bytes = identifier_limit;
+        let access = ClientAccessControl::new(
+            vec![registration(
+                "cred-a",
+                1,
+                "client-a",
+                all_scopes(),
+                &["standard"],
+            )],
+            profiles(),
+            bounds,
+        )
+        .unwrap();
+        let client = access.authenticate("cred-a", &[1; 32]).unwrap();
+        let mut request = start_body("standard", "workspace_a", "work");
+        request["session"] = json!({"mode":"resume_native","native_id":"n".repeat(86)});
+        assert!(access.authorize_start(&client, &encode(&request)).is_ok());
+        request["session"] = json!({"mode":"resume_native","native_id":""});
+        assert!(matches!(
+            access.authorize_start(&client, &encode(&request)),
+            Err(AccessError::InvalidRequest)
+        ));
+    }
+}
+
 fn start_body(profile: &str, workspace: &str, text: &str) -> Value {
     json!({"profile_id": profile, "workspace_id": workspace, "input": {"request": text}, "idempotency_key": "request-1"})
 }

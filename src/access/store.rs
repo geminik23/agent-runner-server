@@ -66,7 +66,7 @@ impl<'a> AuthorizedStore<'a> {
             .with_permissions(self.client, &[Scope::RunRead], |namespace, limits| {
                 validate_resource_id(run_id, limits)?;
                 self.storage
-                    .get_event_summaries(namespace, run_id, after)
+                    .visible_event_summaries(namespace, run_id, after)
                     .map_err(Into::into)
             })
     }
@@ -77,7 +77,7 @@ impl<'a> AuthorizedStore<'a> {
             .with_permissions(self.client, &[Scope::RunRead], |namespace, limits| {
                 validate_resource_id(run_id, limits)?;
                 self.storage
-                    .get_result(namespace, run_id)
+                    .visible_result(namespace, run_id)
                     .map_err(Into::into)
             })
     }

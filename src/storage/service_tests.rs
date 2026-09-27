@@ -30,7 +30,9 @@ fn admission(key: &str) -> ServiceAdmission {
         workspace_id: "workspace".into(),
         state_realm: "dummy".into(),
         resume_session_id: None,
+        resume_native_id: None,
         deadline_ms: 10_000,
+        retention_ms: None,
         max_outstanding: 8,
         skills: None,
         may_use_skills: true,
@@ -994,4 +996,494 @@ fn completion_filter_uses_result_limit_failure_not_backend_success() {
     assert_eq!(deliveries.len(), 1);
     let payload: serde_json::Value = serde_json::from_slice(&deliveries[0].payload).unwrap();
     assert_eq!(payload["state"], "failed");
+}
+
+#[test]
+fn native_aliases_share_the_session_reservation_and_profile_binding() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let first = admission("native-first");
+    let AdmissionOutcome::Accepted(original) = store.service_admit(&first).unwrap() else {
+        panic!()
+    };
+    let job = store.service_claim(1000).unwrap().unwrap();
+    store.service_launch(&job, 1001).unwrap();
+    let native = SessionRef {
+        runtime: "dummy".into(),
+        state_realm: "dummy".into(),
+        native_id: "native-identity".into(),
+    };
+    store
+        .service_event(&job, "run.session", b"{}", Some(&native), 8)
+        .unwrap();
+    let mut alias = admission("native-alias");
+    alias.profile_id = "another-profile".into();
+    alias.resume_native_id = Some(native.native_id.clone());
+    assert!(matches!(
+        store.service_admit(&alias),
+        Err(StorageError::SessionBusy)
+    ));
+    let mut other = admission("foreign-native");
+    other.namespace.client_id = "other".into();
+    other.resume_native_id = Some(native.native_id.clone());
+    assert!(matches!(
+        store.service_admit(&other),
+        Err(StorageError::NotFound)
+    ));
+    store.service_finish(&job, &success(), 1002, 1024).unwrap();
+    assert!(matches!(
+        store.service_admit(&alias),
+        Err(StorageError::SessionIncompatible)
+    ));
+    alias.profile_id = first.profile_id.clone();
+    let AdmissionOutcome::Accepted(resumed) = store.service_admit(&alias).unwrap() else {
+        panic!()
+    };
+    assert_eq!(resumed.session_id, original.session_id);
+}
+
+#[test]
+fn result_retention_expires_once_and_preserves_replay_and_session() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("retention.sqlite");
+    let mut store = SqliteStore::open(&path).unwrap();
+    let mut input = admission("retained-run");
+    input.retention_ms = Some(100);
+    let AdmissionOutcome::Accepted(run) = store.service_admit(&input).unwrap() else {
+        panic!()
+    };
+    let job = store.service_claim(1000).unwrap().unwrap();
+    store.service_launch(&job, 1001).unwrap();
+    store.service_finish(&job, &success(), 1002, 1024).unwrap();
+    let retention = &super::retention::expired;
+    assert!(!retention(&store.connection, &input.namespace, &run.run_id, 1101).unwrap());
+    assert!(retention(&store.connection, &input.namespace, &run.run_id, 1102).unwrap());
+    assert!(retention(&store.connection, &input.namespace, &run.run_id, 1).unwrap());
+    drop(store);
+    let mut store = SqliteStore::open(&path).unwrap();
+    store.run_retention_maintenance(1103).unwrap();
+    assert!(
+        store
+            .get_result(&input.namespace, &run.run_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get_events(&input.namespace, &run.run_id, None)
+            .unwrap()
+            .iter()
+            .all(|e| e.payload.is_empty())
+    );
+    assert!(matches!(
+        store
+            .service_result_view(&input.namespace, &run.run_id, 1024, 1024)
+            .unwrap(),
+        crate::storage::ResultView::Expired(_)
+    ));
+    assert!(matches!(
+        store.service_event_view(&input.namespace, &run.run_id, None, 10, 1024),
+        Err(StorageError::Expired)
+    ));
+    let replay = store
+        .service_replay(
+            &input.namespace,
+            &input.idempotency_key,
+            &input.normalized_request,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.run_id, run.run_id);
+    assert!(matches!(
+        store.service_replay(&input.namespace, &input.idempotency_key, b"different"),
+        Err(StorageError::IdempotencyConflict)
+    ));
+    assert_eq!(
+        store
+            .get_session(&input.namespace, &job.session_id)
+            .unwrap()
+            .unwrap()
+            .reserved_run_id
+            .as_deref(),
+        Some(run.run_id.as_str())
+    );
+}
+
+#[test]
+fn result_retention_waits_for_its_own_inbox_without_blocking_another_run() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let mut first = admission("retained-inbox");
+    first.retention_ms = Some(1);
+    let AdmissionOutcome::Accepted(run) = store.service_admit(&first).unwrap() else {
+        panic!()
+    };
+    bind_completion(
+        &store,
+        &run.run_id,
+        "retained-inbox",
+        "inbox",
+        r#"["succeeded"]"#,
+    );
+    let job = store.service_claim(1000).unwrap().unwrap();
+    store.service_launch(&job, 1001).unwrap();
+    store.service_finish(&job, &success(), 1002, 1024).unwrap();
+    let mut second = admission("other-realm");
+    second.state_realm = "other".into();
+    second.retention_ms = Some(1);
+    let AdmissionOutcome::Accepted(other) = store.service_admit(&second).unwrap() else {
+        panic!()
+    };
+    let other_job = store.service_claim(1003).unwrap().unwrap();
+    store.service_launch(&other_job, 1004).unwrap();
+    store
+        .service_finish(&other_job, &success(), 1005, 1024)
+        .unwrap();
+    assert!(
+        !super::retention::expired(&store.connection, &first.namespace, &run.run_id, 1007).unwrap()
+    );
+    store.run_retention_maintenance(1007).unwrap();
+    assert!(
+        store
+            .get_result(&second.namespace, &other.run_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get_result(&first.namespace, &run.run_id)
+            .unwrap()
+            .is_some()
+    );
+    store.completion_maintenance(12000).unwrap();
+    assert!(
+        super::retention::expired(&store.connection, &first.namespace, &run.run_id, 12000).unwrap()
+    );
+    store.run_retention_maintenance(12000).unwrap();
+    assert!(
+        store
+            .get_result(&first.namespace, &run.run_id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn recovery_samples_retention_clock_after_the_write_lock() {
+    use crate::storage::service::ServiceClock;
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("recovery-retention.sqlite");
+    let mut store = SqliteStore::open(&path).unwrap();
+    let mut input = admission("recovery-clock");
+    input.deadline_ms = i64::MAX - 10000;
+    input.retention_ms = Some(2000);
+    let AdmissionOutcome::Accepted(run) = store.service_admit(&input).unwrap() else {
+        panic!()
+    };
+    let job = store.service_claim(1000).unwrap().unwrap();
+    store.service_launch(&job, 1001).unwrap();
+    let lock = rusqlite::Connection::open(&path).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let signal = barrier.clone();
+    let worker = thread::spawn(move || {
+        signal.wait();
+        store.service_recover(ServiceClock::Wall).unwrap();
+    });
+    barrier.wait();
+    thread::sleep(Duration::from_millis(100));
+    let release_ms = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    lock.execute_batch("COMMIT").unwrap();
+    worker.join().unwrap();
+    let store = SqliteStore::open(&path).unwrap();
+    let expires: i64 = store
+        .connection
+        .query_row(
+            "SELECT expires_ms FROM run_retention WHERE run_id=?1",
+            [&run.run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(expires >= release_ms + 2000);
+    assert_eq!(
+        store
+            .get_run(&input.namespace, &run.run_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "interrupted"
+    );
+}
+
+#[test]
+fn result_retention_storage_failures_roll_back_terminal_and_cleanup() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let mut input = admission("retention-fault");
+    input.retention_ms = Some(1);
+    let AdmissionOutcome::Accepted(run) = store.service_admit(&input).unwrap() else {
+        panic!()
+    };
+    bind_completion(
+        &store,
+        &run.run_id,
+        "fault-inbox",
+        "inbox",
+        r#"["succeeded"]"#,
+    );
+    let job = store.service_claim(1000).unwrap().unwrap();
+    store.service_launch(&job, 1001).unwrap();
+    store.connection.execute_batch("CREATE TRIGGER ignore_expiry BEFORE UPDATE OF expires_ms ON run_retention BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+    assert!(store.service_finish(&job, &success(), 1002, 1024).is_err());
+    assert!(
+        store
+            .get_result(&input.namespace, &run.run_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get_inbox_items(&input.namespace, &run.run_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .get_run(&input.namespace, &run.run_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "running"
+    );
+    store
+        .connection
+        .execute_batch("DROP TRIGGER ignore_expiry")
+        .unwrap();
+    store.service_finish(&job, &success(), 1002, 1024).unwrap();
+    store.completion_maintenance(12000).unwrap();
+    store.connection.execute_batch("CREATE TRIGGER ignore_result_delete BEFORE DELETE ON results BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+    assert!(store.run_retention_maintenance(12000).is_err());
+    assert!(
+        store
+            .get_result(&input.namespace, &run.run_id)
+            .unwrap()
+            .is_some()
+    );
+    let flags: (bool, bool) = store
+        .connection
+        .query_row(
+            "SELECT expired,purged FROM run_retention WHERE run_id=?1",
+            [&run.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(flags, (false, false));
+    store
+        .connection
+        .execute_batch("DROP TRIGGER ignore_result_delete")
+        .unwrap();
+    store.run_retention_maintenance(12000).unwrap();
+    assert!(
+        store
+            .get_result(&input.namespace, &run.run_id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn retention_admission_noop_rolls_back_the_entire_run() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let mut input = admission("retention-insert-noop");
+    input.retention_ms = Some(100);
+    store.connection.execute_batch("CREATE TRIGGER ignore_retention_insert BEFORE INSERT ON run_retention BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+    assert!(matches!(
+        store.service_admit(&input),
+        Err(StorageError::InvalidState)
+    ));
+    assert!(
+        store
+            .service_replay(
+                &input.namespace,
+                &input.idempotency_key,
+                &input.normalized_request
+            )
+            .unwrap()
+            .is_none()
+    );
+    let count: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn ignored_terminal_event_insert_rolls_back_all_completion() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let input = admission("terminal-event-noop");
+    let AdmissionOutcome::Accepted(run) = store.service_admit(&input).unwrap() else {
+        panic!()
+    };
+    let job = store.service_claim(1000).unwrap().unwrap();
+    store.service_launch(&job, 1001).unwrap();
+    store.connection.execute_batch("CREATE TRIGGER ignore_terminal_event BEFORE INSERT ON events WHEN NEW.kind='run.finished' BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+    assert!(matches!(
+        store.service_finish(&job, &success(), 1002, 1024),
+        Err(StorageError::InvalidState)
+    ));
+    assert_eq!(
+        store
+            .get_run(&input.namespace, &run.run_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "running"
+    );
+    assert!(
+        store
+            .get_result(&input.namespace, &run.run_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !store
+            .get_events(&input.namespace, &run.run_id, None)
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "run.finished")
+    );
+}
+
+#[test]
+fn ignored_terminal_notification_inserts_never_commit_partial_completion() {
+    for table in [
+        "delivery_intents",
+        "completion_delivery_jobs",
+        "inbox_items",
+        "completion_inbox",
+    ] {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let input = admission("notification-noop");
+        let AdmissionOutcome::Accepted(run) = store.service_admit(&input).unwrap() else {
+            panic!()
+        };
+        bind_completion(
+            &store,
+            &run.run_id,
+            "hook-webhook",
+            "webhook_test",
+            r#"["succeeded"]"#,
+        );
+        bind_completion(
+            &store,
+            &run.run_id,
+            "hook-inbox",
+            "inbox",
+            r#"["succeeded"]"#,
+        );
+        let job = store.service_claim(1000).unwrap().unwrap();
+        store.service_launch(&job, 1001).unwrap();
+        store.connection.execute_batch(&format!("CREATE TRIGGER ignore_notification BEFORE INSERT ON {table} BEGIN SELECT RAISE(IGNORE); END;")).unwrap();
+        assert!(
+            matches!(
+                store.service_finish(&job, &success(), 1002, 1024),
+                Err(StorageError::InvalidState)
+            ),
+            "{table}"
+        );
+        assert_eq!(
+            store
+                .get_run(&input.namespace, &run.run_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "running"
+        );
+        assert!(
+            store
+                .get_result(&input.namespace, &run.run_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_deliveries(&input.namespace, &run.run_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_inbox_items(&input.namespace, &run.run_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !store
+                .get_events(&input.namespace, &run.run_id, None)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "run.finished")
+        );
+    }
+}
+
+#[test]
+fn result_retention_does_not_disguise_missing_terminal_data_as_expiry() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let mut input = admission("corrupt-result");
+    input.retention_ms = Some(1);
+    let AdmissionOutcome::Accepted(run) = store.service_admit(&input).unwrap() else {
+        panic!()
+    };
+    let job = store.service_claim(1000).unwrap().unwrap();
+    store.service_launch(&job, 1001).unwrap();
+    store.service_finish(&job, &success(), 1002, 1024).unwrap();
+    store
+        .connection
+        .execute("DELETE FROM results WHERE run_id=?1", [&run.run_id])
+        .unwrap();
+    assert!(matches!(
+        store.service_result_view(&input.namespace, &run.run_id, 1024, 1024),
+        Err(StorageError::InvalidState)
+    ));
+    assert!(matches!(
+        store.run_retention_maintenance(1004),
+        Err(StorageError::InvalidState)
+    ));
+}
+
+#[test]
+fn validation_failure_reason_survives_result_encoding_limit() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let input = admission("validation-limit");
+    let AdmissionOutcome::Accepted(run) = store.service_admit(&input).unwrap() else {
+        panic!()
+    };
+    let job = store.service_claim(1000).unwrap().unwrap();
+    store.service_launch(&job, 1001).unwrap();
+    let candidate = Candidate {
+        state: TerminalState::Failed,
+        details: json!({"validation":{"status":"failed","reason":"schema_mismatch"},"warnings":["x".repeat(1000)],"warning_observation":"partial"}),
+        cleanup: CleanupState::Settled,
+        disposition: SessionDisposition::Uncertain,
+    };
+    store.service_finish(&job, &candidate, 1002, 192).unwrap();
+    let result = store
+        .get_result(&input.namespace, &run.run_id)
+        .unwrap()
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&result.payload).unwrap();
+    assert_eq!(result["details"]["validation"]["reason"], "schema_mismatch");
+    assert_eq!(result["details"]["warning_observation"], "partial");
+    assert_eq!(result["details"]["warnings_omitted"], true);
+    assert_eq!(result["details"]["output_omitted"], true);
 }

@@ -84,6 +84,24 @@ impl RunLimits {
     }
 }
 
+/// Trusted retention for new runs; existing runs keep their previously recorded policy.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionConfig {
+    pub result_event_retention_ms: u64,
+}
+
+impl RetentionConfig {
+    pub(crate) fn milliseconds(&self) -> Result<i64, ServiceError> {
+        const TEN_YEARS_MS: u64 = 10 * 365 * 24 * 60 * 60 * 1000;
+        if self.result_event_retention_ms == 0 || self.result_event_retention_ms > TEN_YEARS_MS {
+            return Err(ServiceError::InvalidConfiguration);
+        }
+        i64::try_from(self.result_event_retention_ms)
+            .map_err(|_| ServiceError::InvalidConfiguration)
+    }
+}
+
 /// Binds an approved profile to a backend and its native state realm.
 #[derive(Clone)]
 pub struct BackendProfile {
@@ -160,6 +178,8 @@ struct Manifest {
     compiler_revision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     policy_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result_schema: Option<Value>,
 }
 
 impl Manifest {
@@ -211,6 +231,7 @@ struct Shared {
     profiles: Arc<HashMap<String, BackendProfile>>,
     limits: RunLimits,
     delivery: Option<crate::delivery::DeliveryConfig>,
+    retention_ms: Option<i64>,
     delivery_client: Option<reqwest::Client>,
     wake: Notify,
     changes: watch::Sender<u64>,
@@ -254,7 +275,23 @@ impl RunService {
         limits: RunLimits,
         delivery: Option<crate::delivery::DeliveryConfig>,
     ) -> Result<Self, ServiceError> {
+        Self::open_with_retention(path, access, profiles, limits, delivery, None).await
+    }
+
+    /// Opens the service with optional retention pinned independently for each new admission.
+    pub async fn open_with_retention(
+        path: impl AsRef<Path>,
+        access: Arc<ClientAccessControl>,
+        profiles: Vec<BackendProfile>,
+        limits: RunLimits,
+        delivery: Option<crate::delivery::DeliveryConfig>,
+        retention: Option<RetentionConfig>,
+    ) -> Result<Self, ServiceError> {
         limits.validate()?;
+        let retention_ms = retention
+            .as_ref()
+            .map(RetentionConfig::milliseconds)
+            .transpose()?;
         if delivery.as_ref().is_some_and(|config| {
             !config.validate(access.identifier_limit(), limits.max_event_bytes)
         }) {
@@ -327,9 +364,12 @@ impl RunService {
                 }
             }
         });
-        let now = now_ms()?;
         if let Err(error) = database
-            .call(move |store| store.service_recover(now).map_err(Into::into))
+            .call(move |store| {
+                store
+                    .service_recover(ServiceClock::Wall)
+                    .map_err(Into::into)
+            })
             .await
         {
             let _ = database.stop().await;
@@ -344,6 +384,7 @@ impl RunService {
             profiles: Arc::new(profile_map),
             limits,
             delivery,
+            retention_ms,
             delivery_client,
             wake: Notify::new(),
             changes,
@@ -390,6 +431,10 @@ impl RunService {
 
     pub(crate) fn access_control(&self) -> Arc<ClientAccessControl> {
         Arc::clone(&self.shared.access)
+    }
+
+    pub(crate) fn shutdown_signal(&self) -> CancellationToken {
+        self.shared.shutdown.clone()
     }
 
     /// Creates a request handle without transferring shutdown ownership.
@@ -468,6 +513,7 @@ impl RunHandle {
         let body = body.to_vec();
         let limits = self.shared.limits.clone();
         let delivery = self.shared.delivery.clone();
+        let retention_ms = self.shared.retention_ms;
         let available = Arc::clone(&self.shared.available);
         let notify_shared = Arc::clone(&self.shared);
         let outcome = self
@@ -492,6 +538,12 @@ impl RunHandle {
                             )? {
                                 return Ok(AdmissionOutcome::Existing(existing));
                             }
+                            if request.result_schema.is_some()
+                                && limits.max_result_bytes
+                                    < crate::validation::MIN_VALIDATED_RESULT_BYTES
+                            {
+                                return Err(AccessError::InvalidRequest);
+                            }
                             let approved = authorize()?;
                             let generation = generation.ok_or(AccessError::InvalidConfiguration)?;
                             let profile = profiles
@@ -515,13 +567,14 @@ impl RunHandle {
                                 synthetic: metadata.synthetic,
                                 scenario: metadata.scenario.clone(),
                                 state_realm: profile.state_realm.clone(),
-                                resume: approved.resume_session_id().is_some(),
+                                resume: approved.is_resume(),
                                 compiler_revision: Some(
                                     crate::storage::skills::COMPILER_REVISION.to_owned(),
                                 ),
                                 policy_revision: Some(
                                     crate::storage::skills::POLICY_REVISION.to_owned(),
                                 ),
+                                result_schema: request.result_schema.clone(),
                             };
                             let manifest = serde_json::to_vec(&manifest)
                                 .map_err(|_| AccessError::InvalidRequest)?;
@@ -546,7 +599,11 @@ impl RunHandle {
                                     resume_session_id: approved
                                         .resume_session_id()
                                         .map(str::to_owned),
+                                    resume_native_id: approved
+                                        .resume_native_id()
+                                        .map(str::to_owned),
                                     deadline_ms,
+                                    retention_ms,
                                     max_outstanding: limits.max_outstanding,
                                     skills: request.skills.clone(),
                                     may_use_skills: approved.may_use_skills(),
@@ -1302,6 +1359,23 @@ fn supervise(shared: Arc<Shared>, maintenance: bool) -> JoinHandle<()> {
 async fn maintain_deadlines(shared: Arc<Shared>) {
     let mut changes = shared.changes.subscribe();
     while !shared.shutdown.is_cancelled() {
+        let retention_shared = Arc::clone(&shared);
+        let retention = shared
+            .database
+            .call(
+                move |store| match store.run_retention_maintenance(ServiceClock::Wall) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        fail_service(&retention_shared);
+                        Err(error.into())
+                    }
+                },
+            )
+            .await;
+        if retention.is_err() {
+            fail_service(&shared);
+            return;
+        }
         if shared.delivery.is_none() {
             let maintenance = shared
                 .database
@@ -1613,6 +1687,13 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
     let Some(profile) = shared.profiles.get(&job.profile_id).cloned() else {
         return finish_prelaunch(shared, &job, "profile_unavailable").await;
     };
+    if manifest
+        .result_schema
+        .as_ref()
+        .is_some_and(|schema| !crate::validation::valid_schema(schema))
+    {
+        return finish_prelaunch(shared, &job, "invalid_execution_snapshot").await;
+    }
     if !matches!(manifest.version, 1 | 2)
         || (manifest.version == 2
             && (manifest.compiler_revision.as_deref()
@@ -2062,15 +2143,49 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
                     disposition: result.session_disposition,
                 }
             } else {
-                let (state, details) = match result.outcome {
+                let validation_error = match (&manifest.result_schema, &result.outcome) {
+                    (Some(_), ExecutionOutcome::Succeeded { output })
+                        if output.len() > crate::validation::MAX_RESULT_VALIDATION_BYTES =>
+                    {
+                        Some("validation_limit_exceeded")
+                    }
+                    (Some(schema), ExecutionOutcome::Succeeded { output }) => {
+                        match crate::validation::parse_unique_json(output.as_bytes()) {
+                            Err(_) => Some("invalid_or_unsupported_json"),
+                            Ok(value) if !crate::validation::matches_schema(schema, &value) => {
+                                Some("schema_mismatch")
+                            }
+                            Ok(_) => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let validated = manifest.result_schema.is_some()
+                    && matches!(&result.outcome, ExecutionOutcome::Succeeded { .. });
+                let (state, details, output_omitted) = match result.outcome {
+                    ExecutionOutcome::Succeeded { .. }
+                        if validation_error == Some("validation_limit_exceeded") =>
+                    {
+                        (
+                            TerminalState::Failed,
+                            json!({"error":"result_validation_failed"}),
+                            true,
+                        )
+                    }
+                    ExecutionOutcome::Succeeded { output } if validation_error.is_some() => (
+                        TerminalState::Failed,
+                        json!({"error":"result_validation_failed", "output":output}),
+                        false,
+                    ),
                     ExecutionOutcome::Succeeded { output } => {
-                        (TerminalState::Succeeded, json!({"output": output}))
+                        (TerminalState::Succeeded, json!({"output": output}), false)
                     }
                     ExecutionOutcome::Failed(error) => (
                         TerminalState::Failed,
                         json!({"error": format!("{error:?}")}),
+                        false,
                     ),
-                    ExecutionOutcome::Cancelled => (TerminalState::Cancelled, Value::Null),
+                    ExecutionOutcome::Cancelled => (TerminalState::Cancelled, Value::Null, false),
                 };
                 let warnings: Vec<_> = result
                     .warnings
@@ -2082,9 +2197,19 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
                     WarningObservation::Partial => "partial",
                     WarningObservation::Unavailable => "unavailable",
                 };
+                let mut details = json!({"outcome": details, "warnings": warnings, "warning_observation": observation});
+                if output_omitted {
+                    details["output_omitted"] = Value::Bool(true);
+                }
+                if validated {
+                    details["validation"] = match validation_error {
+                        Some(reason) => json!({"status":"failed", "reason":reason}),
+                        None => json!({"status":"passed"}),
+                    };
+                }
                 Candidate {
                     state,
-                    details: json!({"outcome": details, "warnings": warnings, "warning_observation": observation}),
+                    details,
                     cleanup: result.cleanup,
                     disposition: result.session_disposition,
                 }

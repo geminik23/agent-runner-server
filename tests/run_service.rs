@@ -165,6 +165,158 @@ impl ExecutionBackend for GateBackend {
     }
 }
 
+struct WarningThenCancelBackend {
+    inner: DummyBackend,
+    ready: Notify,
+}
+impl ExecutionBackend for WarningThenCancelBackend {
+    fn metadata(&self) -> ExecutionMetadata {
+        self.inner.metadata()
+    }
+    fn state_realm(&self) -> &str {
+        self.inner.state_realm()
+    }
+    fn execute<'a>(
+        &'a self,
+        request: ExecutionRequest,
+        events: EventSink,
+        cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = ExecutionResult> + Send + 'a>> {
+        Box::pin(async move {
+            let result = self
+                .inner
+                .execute(request, events, CancellationToken::new())
+                .await;
+            self.ready.notify_one();
+            cancellation.cancelled().await;
+            result
+        })
+    }
+}
+
+#[tokio::test]
+async fn cancellation_preserves_observed_warning_without_publishing_late_output() {
+    let temp = tempdir().unwrap();
+    let access = access();
+    let client = access.authenticate("credential", &[7; 32]).unwrap();
+    let backend = Arc::new(WarningThenCancelBackend {
+        inner: DummyBackend::new(DummyScenario::Warning, 0),
+        ready: Notify::new(),
+    });
+    let service = RunService::open(
+        temp.path().join("warning-cancel.sqlite"),
+        access,
+        vec![profile(backend.clone())],
+        limits(),
+    )
+    .await
+    .unwrap();
+    let run = service
+        .start(&client, &body("warning-cancel", "fixture"))
+        .await
+        .unwrap();
+    backend.ready.notified().await;
+    assert_eq!(
+        service.cancel(&client, &run.run_id).await.unwrap(),
+        CancelOutcome::CancelRequested
+    );
+    assert_eq!(
+        wait_terminal(&service, &client, &run.run_id).await,
+        "cancelled"
+    );
+    let result = service
+        .get_result(&client, &run.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let result: Value = serde_json::from_slice(&result.payload).unwrap();
+    assert_eq!(result["details"]["warnings"][0]["code"], "dummy_warning");
+    assert_eq!(result["details"]["warning_observation"], "complete");
+    assert!(result["details"].get("outcome").is_none());
+    service.shutdown().await.unwrap();
+}
+
+struct OutputBackend {
+    inner: DummyBackend,
+    output: String,
+}
+impl ExecutionBackend for OutputBackend {
+    fn metadata(&self) -> ExecutionMetadata {
+        self.inner.metadata()
+    }
+    fn state_realm(&self) -> &str {
+        self.inner.state_realm()
+    }
+    fn execute<'a>(
+        &'a self,
+        request: ExecutionRequest,
+        events: EventSink,
+        cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = ExecutionResult> + Send + 'a>> {
+        Box::pin(async move {
+            let mut result = self.inner.execute(request, events, cancellation).await;
+            result.outcome = agent_runner_server::core::ExecutionOutcome::Succeeded {
+                output: self.output.clone(),
+            };
+            result
+        })
+    }
+}
+
+#[tokio::test]
+async fn selected_validation_rejects_ambiguous_and_over_budget_backend_output() {
+    for (output, reason) in [
+        (
+            r#"{"value":1,"value":2}"#.to_owned(),
+            "invalid_or_unsupported_json",
+        ),
+        (
+            format!("\"{}\"", "x".repeat(256 * 1024)),
+            "validation_limit_exceeded",
+        ),
+    ] {
+        let temp = tempdir().unwrap();
+        let access = access();
+        let client = access.authenticate("credential", &[7; 32]).unwrap();
+        let backend = Arc::new(OutputBackend {
+            inner: DummyBackend::new(DummyScenario::Success, 0),
+            output,
+        });
+        let mut config = limits();
+        config.max_result_bytes = 512 * 1024;
+        let service = RunService::open(
+            temp.path().join("validation.sqlite"),
+            access,
+            vec![profile(backend)],
+            config,
+        )
+        .await
+        .unwrap();
+        let request = serde_json::to_vec(&json!({"profile_id":"profile","workspace_id":"workspace","input":{"request":"fixture"},"idempotency_key":"validate-output","result_schema":{"type":"object"}})).unwrap();
+        let receipt = service.start(&client, &request).await.unwrap();
+        assert_eq!(
+            wait_terminal(&service, &client, &receipt.run_id).await,
+            "failed"
+        );
+        let result = service
+            .get_result(&client, &receipt.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let result: Value = serde_json::from_slice(&result.payload).unwrap();
+        assert_eq!(result["details"]["validation"]["reason"], reason);
+        if reason == "validation_limit_exceeded" {
+            assert_eq!(result["details"]["output_omitted"], true);
+        } else {
+            assert_eq!(
+                result["details"]["outcome"]["output"],
+                r#"{"value":1,"value":2}"#
+            );
+        }
+        service.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn legacy_v2_database_replays_the_original_normalized_request() {
     let temp = tempdir().unwrap();
@@ -359,7 +511,8 @@ async fn cancellation_commits_before_backend_response() {
     )
     .unwrap();
     assert_eq!(payload["state"], "cancelled");
-    assert!(payload["details"].is_null());
+    assert_eq!(payload["details"]["warnings"], json!([]));
+    assert_eq!(payload["details"]["warning_observation"], "complete");
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
     service.shutdown().await.unwrap();
 }

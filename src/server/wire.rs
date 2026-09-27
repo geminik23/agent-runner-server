@@ -1,12 +1,7 @@
-use std::fmt;
-
 use axum::http::StatusCode;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use serde::{
-    Deserialize,
-    de::{self, MapAccess, SeqAccess, Visitor},
-};
-use serde_json::{Map, Value, json};
+use serde::Deserialize;
+use serde_json::{Value, json};
 
 use crate::{
     access::{AccessError, AuthenticatedClient, Scope},
@@ -100,10 +95,14 @@ impl From<StorageError> for ApiError {
     fn from(value: StorageError) -> Self {
         match value {
             StorageError::NotFound => Self::new(StatusCode::NOT_FOUND, "not_found"),
+            StorageError::Expired => Self::new(StatusCode::GONE, "expired"),
             StorageError::IdempotencyConflict => {
                 Self::new(StatusCode::CONFLICT, "idempotency_conflict")
             }
             StorageError::SessionBusy => Self::new(StatusCode::CONFLICT, "session_busy"),
+            StorageError::SessionIncompatible => {
+                Self::new(StatusCode::CONFLICT, "session_incompatible")
+            }
             StorageError::SkillVersionConflict => {
                 Self::new(StatusCode::CONFLICT, "skill_version_conflict")
             }
@@ -205,6 +204,9 @@ pub(crate) async fn execute(
                 ResultView::Pending(run) => Ok(
                     json!({"run_id": run.run_id, "state": run.state, "availability": "pending", "metadata": metadata(&run.metadata)}),
                 ),
+                ResultView::Expired(run) => Ok(
+                    json!({"run_id": run.run_id, "state": run.state, "availability": "expired", "metadata": metadata(&run.metadata)}),
+                ),
                 ResultView::Available { run, result } => {
                     let (encoding, data) = match String::from_utf8(result.payload) {
                         Ok(s) => ("utf8", s),
@@ -257,62 +259,7 @@ pub(crate) async fn execute(
 
 /// Detect duplicate keys before an SDK can collapse objects into a map.
 pub(crate) fn parse_json(bytes: &[u8]) -> Result<Value, ApiError> {
-    serde_json::from_slice::<UniqueValue>(bytes)
-        .map(|v| v.0)
-        .map_err(|_| ApiError::invalid())
-}
-struct UniqueValue(Value);
-impl<'de> Deserialize<'de> for UniqueValue {
-    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct UniqueVisitor;
-        impl<'de> Visitor<'de> for UniqueVisitor {
-            type Value = UniqueValue;
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("JSON without duplicate keys")
-            }
-            fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
-                let mut m = Map::new();
-                while let Some(key) = a.next_key::<String>()? {
-                    if m.contains_key(&key) {
-                        return Err(de::Error::custom("duplicate key"));
-                    }
-                    m.insert(key, a.next_value::<UniqueValue>()?.0);
-                }
-                Ok(UniqueValue(Value::Object(m)))
-            }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
-                let mut v = Vec::new();
-                while let Some(e) = a.next_element::<UniqueValue>()? {
-                    v.push(e.0);
-                }
-                Ok(UniqueValue(Value::Array(v)))
-            }
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                Ok(UniqueValue(Value::String(v.into())))
-            }
-            fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
-                Ok(UniqueValue(Value::String(v)))
-            }
-            fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
-                Ok(UniqueValue(Value::Bool(v)))
-            }
-            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
-                Ok(UniqueValue(v.into()))
-            }
-            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-                Ok(UniqueValue(v.into()))
-            }
-            fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
-                serde_json::Number::from_f64(v)
-                    .map(|n| UniqueValue(Value::Number(n)))
-                    .ok_or_else(|| de::Error::custom("invalid number"))
-            }
-            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-                Ok(UniqueValue(Value::Null))
-            }
-        }
-        d.deserialize_any(UniqueVisitor)
-    }
+    crate::validation::parse_unique_json(bytes).map_err(|_| ApiError::invalid())
 }
 
 pub(crate) fn schema(name: &str, max_skill_page: usize) -> Value {
@@ -321,10 +268,11 @@ pub(crate) fn schema(name: &str, max_skill_page: usize) -> Value {
         "agents_start" => {
             json!({"type":"object","required":["profile_id","workspace_id","input","idempotency_key"],"additionalProperties":false,"properties":{
                 "profile_id":{"type":"string"},"workspace_id":{"type":"string"},"idempotency_key":{"type":"string"},
+                "result_schema":{"type":"object","description":"Optional JSON result schema subset. Each node requires a single type: object, array, string, number, boolean or null. Object keywords are properties, required and boolean additionalProperties; array supports items. Maximum schema depth is 12 and maximum nodes is 128. Validated output is limited to 262144 bytes. Unsupported types and keywords are rejected."},
                 "skills":{"description":"When omitted, use defaults. When present, replace defaults with exactly this ordered list; an empty list selects no skills. Nonempty selection requires SkillRead.","type":"array","maxItems":32,"items":{"type":"object","required":["skill_id","version"],"additionalProperties":false,"properties":{"skill_id":{"type":"string"},"version":{"type":"string"}}}},
                 "hooks":{"type":"array","maxItems":32,"description":"Omitted uses defaults; an explicit list replaces them.","items":{"type":"object","required":["hook_id","version"],"additionalProperties":false,"properties":{"hook_id":{"type":"string"},"version":{"type":"string"}}}},
                 "input":{"type":"object","required":["request"],"additionalProperties":false,"properties":{"request":{"type":"string"}}},
-                "session":{"oneOf":[{"type":"object","required":["mode"],"additionalProperties":false,"properties":{"mode":{"const":"new"}}},{"type":"object","required":["mode","session_id"],"additionalProperties":false,"properties":{"mode":{"const":"resume"},"session_id":{"type":"string"}}}]}
+                "session":{"oneOf":[{"type":"object","required":["mode"],"additionalProperties":false,"properties":{"mode":{"const":"new"}}},{"type":"object","required":["mode","session_id"],"additionalProperties":false,"properties":{"mode":{"const":"resume"},"session_id":{"type":"string"}}},{"type":"object","required":["mode","native_id"],"additionalProperties":false,"properties":{"mode":{"const":"resume_native"},"native_id":{"type":"string"}}}]}
             }})
         }
         "skills_register" => {

@@ -55,10 +55,10 @@ pub(super) fn enqueue_terminal(
         let events: Vec<String> =
             serde_json::from_str(&binding.events).map_err(|_| StorageError::InvalidState)?;
         if !events.iter().any(|event| event == terminal) {
-            tx.execute(
+            if tx.execute(
                 "UPDATE completion_bindings SET charged = 0 WHERE owner_id = ?1 AND client_id = ?2 AND run_id = ?3 AND binding_id = ?4",
                 params![namespace.owner_id, namespace.client_id, run_id, binding.binding_id],
-            )?;
+            )? != 1 { return Err(StorageError::InvalidState); }
             continue;
         }
         let id = new_id(
@@ -103,23 +103,23 @@ pub(super) fn enqueue_terminal(
             .checked_add(binding.delivery_ttl_ms)
             .ok_or(StorageError::InvalidState)?;
         if binding.connector == "inbox" {
-            tx.execute(
+            if tx.execute(
                 "INSERT INTO inbox_items (owner_id, client_id, inbox_id, run_id, event_id, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![namespace.owner_id, namespace.client_id, id, run_id, event_id, payload],
-            )?;
-            tx.execute(
+            )? != 1 { return Err(StorageError::InvalidState); }
+            if tx.execute(
                 "INSERT INTO completion_inbox (owner_id, client_id, inbox_id, run_id, binding_id, created_ms, expires_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![namespace.owner_id, namespace.client_id, id, run_id, binding.binding_id, now_ms, expires_ms],
-            )?;
+            )? != 1 { return Err(StorageError::InvalidState); }
         } else {
-            tx.execute(
+            if tx.execute(
                 "INSERT INTO delivery_intents (owner_id, client_id, delivery_id, run_id, event_id, binding_id, payload, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending')",
                 params![namespace.owner_id, namespace.client_id, id, run_id, event_id, binding.binding_id, payload],
-            )?;
-            tx.execute(
+            )? != 1 { return Err(StorageError::InvalidState); }
+            if tx.execute(
                 "INSERT INTO completion_delivery_jobs (owner_id, client_id, delivery_id, next_attempt_ms, expires_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![namespace.owner_id, namespace.client_id, id, now_ms, expires_ms],
-            )?;
+            )? != 1 { return Err(StorageError::InvalidState); }
         }
     }
     Ok(())

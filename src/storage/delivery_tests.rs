@@ -21,9 +21,18 @@ fn fixture(deduplication: bool, max_pending: usize) -> (SqliteStore, ServiceAdmi
 }
 
 fn fixture_in(
+    store: SqliteStore,
+    deduplication: bool,
+    max_pending: usize,
+) -> (SqliteStore, ServiceAdmission, String) {
+    fixture_in_with_retention(store, deduplication, max_pending, None)
+}
+
+fn fixture_in_with_retention(
     mut store: SqliteStore,
     deduplication: bool,
     max_pending: usize,
+    retention_ms: Option<i64>,
 ) -> (SqliteStore, ServiceAdmission, String) {
     let namespace = Namespace {
         owner_id: "owner".into(),
@@ -75,7 +84,9 @@ fn fixture_in(
         workspace_id: "workspace".into(),
         state_realm: "dummy".into(),
         resume_session_id: None,
+        resume_native_id: None,
         deadline_ms: 10000,
+        retention_ms,
         max_outstanding: 8,
         skills: None,
         may_use_skills: false,
@@ -200,6 +211,81 @@ fn uncertain_delivery_preserves_payload_until_operator_reconciliation() {
         store.get_deliveries(&input.namespace, &run).unwrap()[0]
             .payload
             .is_empty()
+    );
+}
+
+#[test]
+fn known_undispatched_failure_retries_with_the_same_payload() {
+    let (mut store, input, run) = fixture(false, 4);
+    let first = store.completion_claim(1100, 100).unwrap().unwrap();
+    assert!(store.completion_begin_dispatch(&first, 1101).unwrap());
+    store
+        .completion_observe(&first, 1102, 10, Observation::NotDispatched)
+        .unwrap();
+    assert_eq!(
+        store.get_deliveries(&input.namespace, &run).unwrap()[0].state,
+        "retry_pending"
+    );
+    assert!(store.completion_claim(1111, 100).unwrap().is_none());
+    let second = store.completion_claim(1112, 100).unwrap().unwrap();
+    assert_eq!(first.id, second.id);
+    assert_eq!(first.payload, second.payload);
+    assert!(second.generation > first.generation);
+    assert!(store.completion_begin_dispatch(&second, 1113).unwrap());
+    store
+        .completion_observe(&second, 1114, 10, Observation::Delivered)
+        .unwrap();
+    assert_eq!(
+        store.get_deliveries(&input.namespace, &run).unwrap()[0].state,
+        "succeeded"
+    );
+    assert_eq!(
+        store
+            .get_run(&input.namespace, &run)
+            .unwrap()
+            .unwrap()
+            .state,
+        "succeeded"
+    );
+}
+
+#[test]
+fn uncertain_delivery_pins_result_until_reconciled_and_retained() {
+    let (mut store, input, run) =
+        fixture_in_with_retention(SqliteStore::open_in_memory().unwrap(), false, 4, Some(1));
+    let job = store.completion_claim(1100, 100).unwrap().unwrap();
+    assert!(store.completion_begin_dispatch(&job, 1101).unwrap());
+    store
+        .completion_observe(&job, 1102, 10, Observation::Ambiguous)
+        .unwrap();
+    store.completion_maintenance(30000).unwrap();
+    store.run_retention_maintenance(30000).unwrap();
+    assert!(store.get_result(&input.namespace, &run).unwrap().is_some());
+    assert_eq!(
+        store.get_deliveries(&input.namespace, &run).unwrap()[0].state,
+        "uncertain"
+    );
+    assert!(
+        !store.get_deliveries(&input.namespace, &run).unwrap()[0]
+            .payload
+            .is_empty()
+    );
+    let reconciliation = crate::storage::inbox::DeliveryReconciliation {
+        id: &job.id,
+        actor: "operator",
+        generation: "v1",
+        outcome: "confirmed_delivered",
+        grants: &input.destination_grants,
+    };
+    store
+        .reconcile_delivery(&input.namespace, &reconciliation, 30001)
+        .unwrap();
+    store.completion_maintenance(30102).unwrap();
+    store.run_retention_maintenance(30102).unwrap();
+    assert!(store.get_result(&input.namespace, &run).unwrap().is_none());
+    assert_eq!(
+        store.get_deliveries(&input.namespace, &run).unwrap()[0].state,
+        "uncertain"
     );
 }
 

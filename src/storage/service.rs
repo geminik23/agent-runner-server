@@ -48,7 +48,9 @@ pub(crate) struct ServiceAdmission {
     pub workspace_id: String,
     pub state_realm: String,
     pub resume_session_id: Option<String>,
+    pub resume_native_id: Option<String>,
     pub deadline_ms: i64,
+    pub retention_ms: Option<i64>,
     pub max_outstanding: usize,
     pub skills: Option<Vec<SkillRef>>,
     pub may_use_skills: bool,
@@ -218,9 +220,19 @@ impl SqliteStore {
         if usize::try_from(outstanding).map_or(true, |count| count >= admission.max_outstanding) {
             return Err(StorageError::QueueFull);
         }
+        let resume_session_id = match (&admission.resume_session_id, &admission.resume_native_id) {
+            (Some(_), Some(_)) => return Err(StorageError::InvalidInput("session")),
+            (Some(id), None) => Some(id.clone()),
+            (None, Some(native_id)) => Some(tx.query_row(
+                "SELECT session_id FROM sessions WHERE owner_id=?1 AND client_id=?2 AND runtime=?3 AND state_realm=?4 AND native_id=?5",
+                params![ns.owner_id, ns.client_id, admission.metadata.runtime, admission.state_realm, native_id],
+                |row| row.get::<_, String>(0),
+            ).optional()?.ok_or(StorageError::NotFound)?),
+            (None, None) => None,
+        };
         let quarantined: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM sessions s LEFT JOIN service_jobs j ON j.owner_id = s.owner_id AND j.client_id = s.client_id AND j.run_id = s.reserved_run_id LEFT JOIN attempts a ON a.owner_id = j.owner_id AND a.client_id = j.client_id AND a.run_id = j.run_id AND a.attempt_id = j.attempt_id LEFT JOIN runs r ON r.owner_id = s.owner_id AND r.client_id = s.client_id AND r.run_id = s.reserved_run_id WHERE s.runtime = ?1 AND s.state_realm = ?2 AND s.reserved_run_id IS NOT NULL AND ((s.native_id IS NULL AND (j.queue_id IS NULL OR a.spawn_intent = 1)) OR (?3 AND s.native_id IS NOT NULL AND r.state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted'))))",
-            params![admission.metadata.runtime, admission.state_realm, admission.resume_session_id.is_none()],
+            params![admission.metadata.runtime, admission.state_realm, resume_session_id.is_none()],
             |row| row.get(0),
         )?;
         if quarantined {
@@ -232,7 +244,7 @@ impl SqliteStore {
         )?;
         let run_id = new_id(&tx, "run")?;
         let attempt_id = new_id(&tx, "attempt")?;
-        let session_id = if let Some(id) = &admission.resume_session_id {
+        let session_id = if let Some(id) = &resume_session_id {
             let session = load_session(&tx, ns, id)?.ok_or(StorageError::NotFound)?;
             if session.reserved_run_id.is_some() {
                 return Err(StorageError::SessionBusy);
@@ -241,7 +253,7 @@ impl SqliteStore {
                 || session.session.runtime != admission.metadata.runtime
                 || session.session.state_realm != admission.state_realm
             {
-                return Err(StorageError::InvalidState);
+                return Err(StorageError::SessionIncompatible);
             }
             let compatible: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM service_sessions WHERE owner_id = ?1 AND client_id = ?2 AND session_id = ?3 AND profile_id = ?4 AND profile_revision = ?5 AND workspace_id = ?6)",
@@ -249,7 +261,7 @@ impl SqliteStore {
                 |row| row.get(0),
             )?;
             if !compatible {
-                return Err(StorageError::InvalidState);
+                return Err(StorageError::SessionIncompatible);
             }
             if super::skills::bundle(&tx, "session", ns, id, admission.skill_bounds)?
                 != selected_skills
@@ -279,6 +291,17 @@ impl SqliteStore {
             "INSERT INTO runs (owner_id, client_id, run_id, session_id, idempotency_key, normalized_request, manifest, runtime, synthetic, scenario, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'queued')",
             params![ns.owner_id, ns.client_id, run_id, session_id, admission.idempotency_key, admission.normalized_request, admission.manifest, admission.metadata.runtime, admission.metadata.synthetic, admission.metadata.scenario],
         )?;
+        if let Some(retention_ms) = admission.retention_ms {
+            if retention_ms <= 0 {
+                return Err(StorageError::InvalidInput("retention"));
+            }
+            if tx.execute(
+                "INSERT INTO run_retention (owner_id,client_id,run_id,retention_ms) VALUES (?1,?2,?3,?4)",
+                params![ns.owner_id, ns.client_id, run_id, retention_ms],
+            )? != 1 {
+                return Err(StorageError::InvalidState);
+            }
+        }
         if !selected_hooks.is_empty() {
             super::hooks::pin(
                 &tx,
@@ -712,6 +735,24 @@ impl SqliteStore {
         max_bytes: usize,
         max_metadata_bytes: usize,
     ) -> Result<Option<StoredResult>, StorageError> {
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        if super::retention::expired(&tx, namespace, run_id, ServiceClock::Wall)? {
+            tx.commit()?;
+            return Err(StorageError::Expired);
+        }
+        let result =
+            self.service_result_unchecked(namespace, run_id, max_bytes, max_metadata_bytes)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn service_result_unchecked(
+        &self,
+        namespace: &Namespace,
+        run_id: &str,
+        max_bytes: usize,
+        max_metadata_bytes: usize,
+    ) -> Result<Option<StoredResult>, StorageError> {
         let limit =
             i64::try_from(max_bytes).map_err(|_| StorageError::InvalidInput("result limit"))?;
         let metadata_limit = i64::try_from(max_metadata_bytes)
@@ -747,11 +788,19 @@ impl SqliteStore {
         max_bytes: usize,
         max_metadata_bytes: usize,
     ) -> Result<super::ResultView, StorageError> {
-        let tx = self.connection.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let view = match self.service_run_summary(namespace, run_id, max_metadata_bytes)? {
             None => super::ResultView::NotFound,
+            Some(run) if super::retention::expired(&tx, namespace, run_id, ServiceClock::Wall)? => {
+                super::ResultView::Expired(run)
+            }
             Some(run) => {
-                match self.service_result(namespace, run_id, max_bytes, max_metadata_bytes)? {
+                match self.service_result_unchecked(
+                    namespace,
+                    run_id,
+                    max_bytes,
+                    max_metadata_bytes,
+                )? {
                     Some(result) if is_terminal(&run.state) => {
                         super::ResultView::Available { run, result }
                     }
@@ -772,12 +821,16 @@ impl SqliteStore {
         limit: usize,
         max_bytes: usize,
     ) -> Result<Option<Vec<super::EventSummary>>, StorageError> {
-        let tx = self.connection.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        if super::retention::expired(&tx, namespace, run_id, ServiceClock::Wall)? {
+            tx.commit()?;
+            return Err(StorageError::Expired);
+        }
         let page = if self
             .service_run_summary(namespace, run_id, max_bytes)?
             .is_some()
         {
-            Some(self.service_events_page(namespace, run_id, after, limit, max_bytes)?)
+            Some(self.service_events_page_unchecked(namespace, run_id, after, limit, max_bytes)?)
         } else {
             None
         };
@@ -786,6 +839,25 @@ impl SqliteStore {
     }
 
     pub(crate) fn service_events_page(
+        &self,
+        namespace: &Namespace,
+        run_id: &str,
+        after: Option<i64>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<EventSummary>, StorageError> {
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        if super::retention::expired(&tx, namespace, run_id, ServiceClock::Wall)? {
+            tx.commit()?;
+            return Err(StorageError::Expired);
+        }
+        let page =
+            self.service_events_page_unchecked(namespace, run_id, after, limit, max_bytes)?;
+        tx.commit()?;
+        Ok(page)
+    }
+
+    fn service_events_page_unchecked(
         &self,
         namespace: &Namespace,
         run_id: &str,
@@ -823,7 +895,11 @@ impl SqliteStore {
         Ok(result)
     }
 
-    pub(crate) fn service_recover(&mut self, now_ms: i64) -> Result<(), StorageError> {
+    pub(crate) fn service_recover(
+        &mut self,
+        now: impl Into<ServiceClock>,
+    ) -> Result<(), StorageError> {
+        let clock = now.into();
         let mut cursor = 0_i64;
         loop {
             let tx = self
@@ -862,6 +938,7 @@ impl SqliteStore {
             }
             for (queue_id, namespace, run_id, attempt_id, stop, deadline, spawn) in jobs {
                 cursor = queue_id;
+                let now_ms = clock.read()?;
                 let stop = stop.as_deref().map(StopCause::from_str).transpose()?;
                 let cause = stop.or_else(|| (now_ms >= deadline).then_some(StopCause::TimedOut));
                 if spawn || cause.is_some() {
@@ -1002,10 +1079,48 @@ fn finish_tx(
         return Err(StorageError::AlreadyTerminal);
     }
     let mut terminal = stop.map_or(candidate.state, StopCause::terminal);
-    let mut payload = json!({"state": terminal.as_str(), "details": if stop.is_some() { Value::Null } else { candidate.details.clone() }}).to_string().into_bytes();
+    let warnings = candidate.details.get("warnings").and_then(Value::as_array);
+    let observation = candidate
+        .details
+        .get("warning_observation")
+        .and_then(Value::as_str)
+        .filter(|value| ["complete", "partial", "unavailable"].contains(value));
+    let stopped_details = match (warnings, observation) {
+        (Some(warnings), Some(observation)) => {
+            json!({"warnings":warnings,"warning_observation":observation})
+        }
+        _ => Value::Null,
+    };
+    let mut payload = json!({"state": terminal.as_str(), "details": if stop.is_some() { stopped_details } else { candidate.details.clone() }}).to_string().into_bytes();
     if payload.len() > max_result_bytes {
-        terminal = TerminalState::Failed;
-        payload = br#"{"state":"failed","error":"result_limit_exceeded"}"#.to_vec();
+        let omitted = warnings.is_none_or(|warnings| !warnings.is_empty());
+        if stop.is_some() {
+            payload = json!({"state":terminal.as_str(),"details":{"warning_observation":observation.unwrap_or("unavailable"),"warnings_omitted":omitted}}).to_string().into_bytes();
+            if payload.len() > max_result_bytes {
+                return Err(StorageError::InvalidInput("result limit"));
+            }
+        } else {
+            terminal = TerminalState::Failed;
+            let reason = candidate
+                .details
+                .get("validation")
+                .filter(|validation| {
+                    validation.get("status").and_then(Value::as_str) == Some("failed")
+                })
+                .and_then(|validation| validation.get("reason"))
+                .and_then(Value::as_str)
+                .filter(|reason| {
+                    [
+                        "invalid_or_unsupported_json",
+                        "schema_mismatch",
+                        "validation_limit_exceeded",
+                    ]
+                    .contains(reason)
+                });
+            payload = reason.map(|reason| json!({"state":"failed","details":{"validation":{"status":"failed","reason":reason},"warning_observation":observation.unwrap_or("unavailable"),"warnings_omitted":omitted,"output_omitted":true}}).to_string().into_bytes())
+                .filter(|payload| payload.len() <= max_result_bytes)
+                .unwrap_or_else(|| br#"{"state":"failed","error":"result_limit_exceeded"}"#.to_vec());
+        }
     }
     let cleanup = match candidate.cleanup {
         CleanupState::Settled => "settled",
@@ -1016,7 +1131,7 @@ fn finish_tx(
         SessionDisposition::Reusable => "reusable",
         SessionDisposition::Uncertain => "uncertain",
     };
-    tx.execute(
+    if tx.execute(
         "UPDATE runs SET state = ?1 WHERE owner_id = ?2 AND client_id = ?3 AND run_id = ?4",
         params![
             terminal.as_str(),
@@ -1024,17 +1139,28 @@ fn finish_tx(
             namespace.client_id,
             run_id
         ],
-    )?;
-    tx.execute("UPDATE attempts SET state = ?1, cleanup = ?2, disposition = ?3 WHERE owner_id = ?4 AND client_id = ?5 AND run_id = ?6 AND attempt_id = ?7", params![terminal.as_str(), cleanup, disposition, namespace.owner_id, namespace.client_id, run_id, attempt_id])?;
-    tx.execute("INSERT INTO results (owner_id, client_id, run_id, revision, payload) VALUES (?1, ?2, ?3, '1', ?4)", params![namespace.owner_id, namespace.client_id, run_id, payload])?;
+    )? != 1
+    {
+        return Err(StorageError::InvalidState);
+    }
+    if tx.execute("UPDATE attempts SET state = ?1, cleanup = ?2, disposition = ?3 WHERE owner_id = ?4 AND client_id = ?5 AND run_id = ?6 AND attempt_id = ?7", params![terminal.as_str(), cleanup, disposition, namespace.owner_id, namespace.client_id, run_id, attempt_id])? != 1 {
+        return Err(StorageError::InvalidState);
+    }
+    if tx.execute("INSERT INTO results (owner_id, client_id, run_id, revision, payload) VALUES (?1, ?2, ?3, '1', ?4)", params![namespace.owner_id, namespace.client_id, run_id, payload])? != 1 {
+        return Err(StorageError::InvalidState);
+    }
     let sequence: i64 = tx.query_row("SELECT COALESCE(MAX(sequence), -1) + 1 FROM events WHERE owner_id = ?1 AND client_id = ?2 AND run_id = ?3", params![namespace.owner_id, namespace.client_id, run_id], |row| row.get(0))?;
     let terminal_payload = json!({"state": terminal.as_str(), "cleanup": cleanup}).to_string();
-    tx.execute("INSERT INTO events (owner_id, client_id, run_id, event_id, sequence, kind, payload) VALUES (?1, ?2, ?3, ?4, ?5, 'run.finished', ?6)", params![namespace.owner_id, namespace.client_id, run_id, format!("{run_id}:finished"), sequence, terminal_payload.as_bytes()])?;
+    if tx.execute("INSERT INTO events (owner_id, client_id, run_id, event_id, sequence, kind, payload) VALUES (?1, ?2, ?3, ?4, ?5, 'run.finished', ?6)", params![namespace.owner_id, namespace.client_id, run_id, format!("{run_id}:finished"), sequence, terminal_payload.as_bytes()])? != 1 {
+        return Err(StorageError::InvalidState);
+    }
     if !spawn
         && candidate.disposition == SessionDisposition::NotApplicable
         && candidate.cleanup == CleanupState::Settled
     {
-        tx.execute("UPDATE sessions SET reserved_run_id = NULL, cleanup = CASE WHEN native_id IS NULL THEN 'settled' ELSE cleanup END, disposition = CASE WHEN native_id IS NULL THEN 'not_started' ELSE disposition END WHERE owner_id = ?1 AND client_id = ?2 AND session_id = ?3 AND reserved_run_id = ?4", params![namespace.owner_id, namespace.client_id, session_id, run_id])?;
+        if tx.execute("UPDATE sessions SET reserved_run_id = NULL, cleanup = CASE WHEN native_id IS NULL THEN 'settled' ELSE cleanup END, disposition = CASE WHEN native_id IS NULL THEN 'not_started' ELSE disposition END WHERE owner_id = ?1 AND client_id = ?2 AND session_id = ?3 AND reserved_run_id = ?4", params![namespace.owner_id, namespace.client_id, session_id, run_id])? != 1 {
+            return Err(StorageError::InvalidState);
+        }
     } else {
         let release = candidate.cleanup == CleanupState::Settled
             && candidate.disposition == SessionDisposition::Reusable;
@@ -1044,6 +1170,24 @@ fn finish_tx(
         }
     }
     super::completion::enqueue_terminal(tx, namespace, run_id, terminal.as_str(), cleanup, now_ms)?;
+    let retention: Option<i64> = tx
+        .query_row(
+            "SELECT retention_ms FROM run_retention WHERE owner_id=?1 AND client_id=?2 AND run_id=?3",
+            params![namespace.owner_id, namespace.client_id, run_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(retention) = retention {
+        let expires = now_ms
+            .checked_add(retention)
+            .ok_or(StorageError::InvalidState)?;
+        if tx.execute(
+            "UPDATE run_retention SET expires_ms=?1 WHERE owner_id=?2 AND client_id=?3 AND run_id=?4 AND expires_ms IS NULL",
+            params![expires, namespace.owner_id, namespace.client_id, run_id],
+        )? != 1 {
+            return Err(StorageError::InvalidState);
+        }
+    }
     Ok(())
 }
 

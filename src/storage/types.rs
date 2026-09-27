@@ -205,6 +205,7 @@ pub struct StoredResult {
 pub enum ResultView {
     NotFound,
     Pending(RunSummary),
+    Expired(RunSummary),
     Available {
         run: RunSummary,
         result: StoredResult,
@@ -237,6 +238,7 @@ pub enum StorageError {
     Database(rusqlite::Error),
     InvalidInput(&'static str),
     NotFound,
+    Expired,
     IdempotencyConflict,
     SkillVersionConflict,
     SkillUnavailable,
@@ -247,6 +249,7 @@ pub enum StorageError {
     HookUseForbidden,
     DeliveryQuota,
     SessionBusy,
+    SessionIncompatible,
     QueueFull,
     AlreadyTerminal,
     InvalidState,
@@ -260,6 +263,7 @@ impl fmt::Display for StorageError {
             Self::Database(error) => write!(formatter, "database error: {error}"),
             Self::InvalidInput(field) => write!(formatter, "invalid input: {field}"),
             Self::NotFound => formatter.write_str("record not found"),
+            Self::Expired => formatter.write_str("run result and events expired"),
             Self::IdempotencyConflict => {
                 formatter.write_str("idempotency key conflicts with another request")
             }
@@ -276,6 +280,9 @@ impl fmt::Display for StorageError {
             Self::HookUseForbidden => formatter.write_str("hook use is not authorized"),
             Self::DeliveryQuota => formatter.write_str("delivery capacity is full"),
             Self::SessionBusy => formatter.write_str("session is reserved"),
+            Self::SessionIncompatible => {
+                formatter.write_str("session is incompatible with the profile or workspace")
+            }
             Self::QueueFull => formatter.write_str("execution queue is full"),
             Self::AlreadyTerminal => formatter.write_str("run is already terminal"),
             Self::InvalidState => {

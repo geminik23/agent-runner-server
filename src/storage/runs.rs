@@ -164,6 +164,14 @@ impl SqliteStore {
         if is_terminal(&run.state) {
             return Err(StorageError::AlreadyTerminal);
         }
+        let managed: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM service_jobs WHERE owner_id=?1 AND client_id=?2 AND run_id=?3)",
+            params![namespace.owner_id, namespace.client_id, completion.run_id],
+            |row| row.get(0),
+        )?;
+        if managed {
+            return Err(StorageError::InvalidState);
+        }
         if run.session_id.is_none() && completion.disposition != SessionDisposition::NotApplicable {
             return Err(StorageError::InvalidInput("session disposition"));
         }

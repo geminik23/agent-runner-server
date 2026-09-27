@@ -18,7 +18,7 @@ use crate::{
         AccessLimits, ClientAccessControl, ClientRegistration, CredentialSecret, ExecutionProfile,
         Scope,
     },
-    application::{BackendProfile, RunLimits, RunService},
+    application::{BackendProfile, RetentionConfig, RunLimits, RunService},
     runtimes::dummy::{DummyBackend, DummyScenario},
     storage::Namespace,
 };
@@ -36,6 +36,8 @@ struct Configuration {
     profiles: Vec<ProfileSettings>,
     #[serde(default)]
     delivery: Option<crate::delivery::DeliveryConfig>,
+    #[serde(default)]
+    retention: Option<RetentionConfig>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -105,7 +107,11 @@ struct ProfileSettings {
 enum Scenario {
     Success,
     DelayedSuccess,
+    StructuredSuccess,
     Warning,
+    MixedWarnings,
+    PartialWarnings,
+    Incomplete,
     Failure,
 }
 
@@ -118,6 +124,7 @@ pub struct PreparedServer {
     runs: RunLimits,
     transport: ServerLimits,
     delivery: Option<crate::delivery::DeliveryConfig>,
+    retention: Option<RetentionConfig>,
 }
 impl PreparedServer {
     /// Loads paths relative to the configuration file, never relative to a client request.
@@ -141,6 +148,13 @@ impl PreparedServer {
             || config.database.as_os_str().is_empty()
             || config.clients.is_empty()
             || config.profiles.is_empty()
+        {
+            return Err(ServerError::InvalidConfiguration);
+        }
+        if config
+            .retention
+            .as_ref()
+            .is_some_and(|retention| retention.milliseconds().is_err())
         {
             return Err(ServerError::InvalidConfiguration);
         }
@@ -220,7 +234,11 @@ impl PreparedServer {
                 let scenario = match p.scenario {
                     Scenario::Success => DummyScenario::Success,
                     Scenario::DelayedSuccess => DummyScenario::DelayedSuccess,
+                    Scenario::StructuredSuccess => DummyScenario::StructuredSuccess,
                     Scenario::Warning => DummyScenario::Warning,
+                    Scenario::MixedWarnings => DummyScenario::MixedWarnings,
+                    Scenario::PartialWarnings => DummyScenario::PartialWarnings,
+                    Scenario::Incomplete => DummyScenario::Incomplete,
                     Scenario::Failure => DummyScenario::Failure,
                 };
                 profiles.push(BackendProfile {
@@ -273,15 +291,17 @@ impl PreparedServer {
             runs,
             transport,
             delivery: config.delivery,
+            retention: config.retention,
         })
     }
     pub async fn start(self) -> Result<Server, ServerError> {
-        let service = RunService::open_with_delivery(
+        let service = RunService::open_with_retention(
             self.database,
             self.access,
             self.profiles,
             self.runs,
             self.delivery,
+            self.retention,
         )
         .await
         .map_err(ServerError::Service)?;

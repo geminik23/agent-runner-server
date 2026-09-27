@@ -37,14 +37,14 @@ fn tool(name: &str, max_skill_page: usize) -> Option<Tool> {
     let description = match name {
         "agents_list" => "List the profiles and workspaces currently granted to this caller.",
         "agents_start" => {
-            "Durably admit a run and return its receipt, not its result. Omitted skills use defaults; an explicit ordered list replaces defaults, and an empty list disables them. Nonempty skills require SkillRead. Retry lost responses with the same idempotency_key and request. Disconnecting does not cancel the run."
+            "Durably admit a run and return its receipt, not its result. Omitted skills use defaults; an explicit ordered list replaces defaults, and an empty list disables them. Nonempty skills require SkillRead. Resume by server ID or an already registered native ID in the same namespace. Optional result_schema supports only the documented bounded subset. Retry lost responses with the same idempotency_key and request. Disconnecting does not cancel the run."
         }
         "runs_get" => "Read current run status. A failed run is data, not a failed lookup.",
         "runs_result" => {
-            "Read result availability and exact UTF-8 or base64 payload. Pending is a normal result; do not resubmit the work with a new key."
+            "Read result availability and exact UTF-8 or base64 payload. Pending and expired are distinct normal results; do not resubmit the work with a new key."
         }
         "runs_events" => {
-            "Read a bounded page of event summaries without raw payloads. Continue with next_after; an empty page does not mean a running run has finished."
+            "Read a bounded page of event summaries without raw payloads. Continue with next_after; an empty page does not mean a running run has finished. Expired event history returns an expired error."
         }
         "runs_cancel" => {
             "Commit an explicit stop decision. The response does not prove cleanup has completed."

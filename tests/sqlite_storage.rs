@@ -361,7 +361,7 @@ fn existing_version_two_database_preserves_skill_versions_and_adds_registry() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     let policy: (String, bool) = connection.query_row("SELECT required_capabilities, enabled FROM skill_policies WHERE skill_id = 'report' AND version = '1'", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
     assert_eq!(policy, ("[]".into(), true));
 }
@@ -406,8 +406,51 @@ fn version_three_preserves_legacy_intents_without_enrolling_them_for_dispatch() 
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     assert_eq!(enrolled, 0);
+}
+
+#[test]
+fn version_four_results_are_preserved_without_retroactive_retention() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("v4.sqlite");
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(include_str!("../migrations/0001_initial.sql"))
+        .unwrap();
+    connection
+        .execute_batch(include_str!("../migrations/0002_run_service.sql"))
+        .unwrap();
+    connection
+        .execute_batch(include_str!("../migrations/0003_skill_registry.sql"))
+        .unwrap();
+    connection
+        .execute_batch(include_str!("../migrations/0004_completion_delivery.sql"))
+        .unwrap();
+    connection
+        .pragma_update(None, "application_id", 0x41525353_i64)
+        .unwrap();
+    connection.pragma_update(None, "user_version", 4).unwrap();
+    connection.execute_batch("INSERT INTO namespaces VALUES ('owner','client-a'); INSERT INTO runs (owner_id,client_id,run_id,idempotency_key,normalized_request,manifest,runtime,synthetic,scenario,state) VALUES ('owner','client-a','legacy','key',X'01',X'02','dummy',1,'success','succeeded'); INSERT INTO results VALUES ('owner','client-a','legacy','1',X'0102'); INSERT INTO events VALUES ('owner','client-a','legacy','event',0,'run.finished',X'03');").unwrap();
+    drop(connection);
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(
+        store
+            .get_result(&namespace("client-a"), "legacy")
+            .unwrap()
+            .unwrap()
+            .payload,
+        vec![1, 2]
+    );
+    drop(store);
+    let connection = Connection::open(&path).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    let policies: i64 = connection
+        .query_row("SELECT COUNT(*) FROM run_retention", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!((version, policies), (5, 0));
 }
 
 #[test]
@@ -445,7 +488,7 @@ fn existing_version_one_database_is_upgraded_without_losing_records() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     let created: bool = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'service_jobs')",
@@ -905,17 +948,17 @@ fn newer_schema_is_rejected_without_changing_it() {
     let path = temp.path().join("storage.sqlite");
     drop(SqliteStore::open(&path).unwrap());
     let connection = Connection::open(&path).unwrap();
-    connection.pragma_update(None, "user_version", 5).unwrap();
+    connection.pragma_update(None, "user_version", 6).unwrap();
     drop(connection);
     assert!(matches!(
         SqliteStore::open(&path),
-        Err(StorageError::UnsupportedSchema(5))
+        Err(StorageError::UnsupportedSchema(6))
     ));
     let connection = Connection::open(&path).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
 }
 
 #[test]

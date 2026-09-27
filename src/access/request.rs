@@ -25,6 +25,22 @@ pub(crate) struct StartBody {
         skip_serializing_if = "Option::is_none"
     )]
     pub hooks: Option<Vec<HookRef>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_result_schema",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub result_schema: Option<serde_json::Value>,
+}
+
+fn deserialize_result_schema<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Err(serde::de::Error::custom("result schema cannot be null"));
+    }
+    Ok(Some(value))
 }
 
 fn deserialize_skills<'de, D: serde::Deserializer<'de>>(
@@ -46,6 +62,9 @@ pub enum StartSession {
     New,
     Resume {
         session_id: String,
+    },
+    ResumeNative {
+        native_id: String,
     },
 }
 
@@ -125,9 +144,20 @@ impl AuthorizedStart {
 
     pub(crate) fn resume_session_id(&self) -> Option<&str> {
         match &self.session {
-            StartSession::New => None,
+            StartSession::New | StartSession::ResumeNative { .. } => None,
             StartSession::Resume { session_id } => Some(session_id),
         }
+    }
+
+    pub(crate) fn resume_native_id(&self) -> Option<&str> {
+        match &self.session {
+            StartSession::ResumeNative { native_id } => Some(native_id),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_resume(&self) -> bool {
+        !matches!(self.session, StartSession::New)
     }
 
     /// Only the synthetic runtime is available in this profile implementation.

@@ -141,7 +141,7 @@ async fn resume_is_bound_to_the_original_profile_revision() {
             .start(&client, &body("changed_revision", Some(&session)))
             .await,
         Err(ServiceError::Access(AccessError::Storage(
-            StorageError::InvalidState
+            StorageError::SessionIncompatible
         )))
     ));
     service.shutdown().await.unwrap();
