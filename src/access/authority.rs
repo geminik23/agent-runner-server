@@ -49,9 +49,10 @@ pub struct AccessLimits {
     pub max_identifier_bytes: usize,
 }
 
-/// Describes a server-defined synthetic profile with opaque workspace IDs.
+/// Describes a server-defined runtime profile with opaque workspace IDs.
 pub struct ExecutionProfile {
     id: String,
+    runtime: String,
     workspaces: HashSet<String>,
     max_input_bytes: usize,
 }
@@ -63,8 +64,19 @@ impl ExecutionProfile {
         workspaces: impl IntoIterator<Item = String>,
         max_input_bytes: usize,
     ) -> Self {
+        Self::for_runtime(id, "dummy", workspaces, max_input_bytes)
+    }
+
+    /// Creates a profile bound to a trusted runtime and approved workspace IDs.
+    pub fn for_runtime(
+        id: impl Into<String>,
+        runtime: impl Into<String>,
+        workspaces: impl IntoIterator<Item = String>,
+        max_input_bytes: usize,
+    ) -> Self {
         Self {
             id: id.into(),
+            runtime: runtime.into(),
             workspaces: workspaces.into_iter().collect(),
             max_input_bytes,
         }
@@ -229,6 +241,8 @@ impl ClientAccessControl {
         for profile in profiles {
             if !valid_identifier(&profile.id)
                 || profile.id.len() > limits.max_identifier_bytes
+                || !valid_identifier(&profile.runtime)
+                || profile.runtime.len() > limits.max_identifier_bytes
                 || profile.max_input_bytes == 0
                 || profile.workspaces.is_empty()
                 || profile
@@ -369,7 +383,7 @@ impl ClientAccessControl {
         self.with_permissions(client, &[scope], |_, _| Ok(()))
     }
 
-    /// Validates a new dummy request without writing to storage or starting a backend.
+    /// Validates a new request without writing to storage or starting a backend.
     pub fn authorize_start(
         &self,
         client: &AuthenticatedClient,
@@ -467,6 +481,7 @@ impl ClientAccessControl {
             }
             Ok(AuthorizedStart::from_body(
                 request.clone(),
+                profile.runtime.clone(),
                 registration.scopes.contains(&Scope::SkillRead),
                 registration.scopes.contains(&Scope::HookRead)
                     && registration.scopes.contains(&Scope::RunRead),

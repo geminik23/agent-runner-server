@@ -15,6 +15,7 @@ fn request() -> ExecutionRequest {
     ExecutionRequest {
         run_id: "run-1".into(),
         attempt_id: "attempt-1".into(),
+        workspace_id: "workspace".into(),
         session: SessionRequest::New,
         prompt: "Literal input: {{not a template}}".into(),
     }

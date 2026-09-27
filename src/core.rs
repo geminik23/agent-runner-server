@@ -47,6 +47,8 @@ pub enum SessionRequest {
 pub struct ExecutionRequest {
     pub run_id: String,
     pub attempt_id: String,
+    /// The approved workspace identifier, resolved by the trusted backend profile.
+    pub workspace_id: String,
     pub session: SessionRequest,
     pub prompt: String,
 }

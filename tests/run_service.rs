@@ -355,6 +355,58 @@ async fn legacy_v2_database_replays_the_original_normalized_request() {
 }
 
 #[tokio::test]
+async fn trusted_profile_runtime_mismatch_is_rejected_before_admission() {
+    let temp = tempdir().unwrap();
+    let access = Arc::new(
+        ClientAccessControl::new(
+            [ClientRegistration::new(
+                "credential",
+                CredentialSecret::new([7; 32]),
+                Namespace {
+                    owner_id: "owner".into(),
+                    client_id: "client".into(),
+                },
+                [Scope::RunStart, Scope::RunRead],
+                ["profile".into()],
+            )
+            .with_generation("registration_1")],
+            [ExecutionProfile::for_runtime(
+                "profile",
+                "codex",
+                ["workspace".into()],
+                4096,
+            )],
+            AccessLimits {
+                max_request_bytes: 8192,
+                max_skill_bytes: 1024,
+                max_identifier_bytes: 128,
+            },
+        )
+        .unwrap(),
+    );
+    let client = access.authenticate("credential", &[7; 32]).unwrap();
+    let backend = Arc::new(DummyBackend::new(DummyScenario::Success, 4));
+    let service = RunService::open(
+        temp.path().join("runs.sqlite"),
+        access,
+        vec![profile(backend.clone())],
+        limits(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        service
+            .start(&client, &body("runtime-mismatch", "literal"))
+            .await,
+        Err(ServiceError::Access(
+            agent_runner_server::access::AccessError::Forbidden
+        ))
+    ));
+    assert!(backend.captured_inputs().is_empty());
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn durable_admission_replay_execution_and_scoped_result() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("runs.sqlite");
@@ -436,6 +488,10 @@ async fn durable_admission_replay_execution_and_scoped_result() {
     assert_eq!(
         backend.inner.captured_inputs()[0].request.prompt,
         "literal {{input}}"
+    );
+    assert_eq!(
+        backend.inner.captured_inputs()[0].request.workspace_id,
+        "workspace"
     );
     let first_page = service
         .get_events(&client, &first.run_id, None, 2)

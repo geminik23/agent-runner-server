@@ -74,9 +74,10 @@ pub(crate) struct StartInput {
     pub request: String,
 }
 
-/// Contains a validated dummy request, not a persistent authorization grant.
+/// Contains a validated request, not a persistent authorization grant.
 pub struct AuthorizedStart {
     profile_id: String,
+    runtime: String,
     workspace_id: String,
     input: String,
     idempotency_key: String,
@@ -89,12 +90,14 @@ pub struct AuthorizedStart {
 impl AuthorizedStart {
     pub(super) fn from_body(
         body: StartBody,
+        runtime: String,
         may_use_skills: bool,
         may_use_hooks: bool,
         destinations: HashSet<String>,
     ) -> Self {
         Self {
             profile_id: body.profile_id,
+            runtime,
             workspace_id: body.workspace_id,
             input: body.input.request,
             idempotency_key: body.idempotency_key,
@@ -160,8 +163,8 @@ impl AuthorizedStart {
         !matches!(self.session, StartSession::New)
     }
 
-    /// Only the synthetic runtime is available in this profile implementation.
-    pub fn runtime(&self) -> &'static str {
-        "dummy"
+    /// Returns the runtime bound to the approved profile.
+    pub fn runtime(&self) -> &str {
+        &self.runtime
     }
 }

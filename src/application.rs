@@ -1838,6 +1838,7 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
     let request = ExecutionRequest {
         run_id: job.run_id.clone(),
         attempt_id: job.attempt_id.clone(),
+        workspace_id: job.workspace_id.clone(),
         session,
         prompt,
     };

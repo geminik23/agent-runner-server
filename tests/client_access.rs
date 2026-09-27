@@ -120,6 +120,37 @@ fn encode(value: &Value) -> Vec<u8> {
     serde_json::to_vec(value).unwrap()
 }
 
+#[test]
+fn runtime_is_selected_by_the_trusted_profile_not_the_request() {
+    let access = ClientAccessControl::new(
+        [registration(
+            "cred-a",
+            1,
+            "client-a",
+            all_scopes(),
+            &["standard"],
+        )],
+        [ExecutionProfile::for_runtime(
+            "standard",
+            "codex",
+            ["workspace_a".into()],
+            16,
+        )],
+        limits(),
+    )
+    .unwrap();
+    let client = access.authenticate("cred-a", &[1; 32]).unwrap();
+    let mut body = start_body("standard", "workspace_a", "work");
+    let approved = access.authorize_start(&client, &encode(&body)).unwrap();
+    assert_eq!(approved.runtime(), "codex");
+    assert_eq!(approved.workspace_id(), "workspace_a");
+    body["runtime"] = json!("claude");
+    assert!(matches!(
+        access.authorize_start(&client, &encode(&body)),
+        Err(AccessError::InvalidRequest)
+    ));
+}
+
 fn skill(id: &str) -> SkillRef {
     SkillRef {
         skill_id: id.into(),
