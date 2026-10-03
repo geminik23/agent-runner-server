@@ -805,16 +805,37 @@ async fn cancellation_sends_selected_signal_to_the_owned_group() {
         let mut input = spec(scenario);
         input.stop_signal = signal;
         ready_env(&mut input, &ready);
+        // Output reaches the observer only after the supervisor confirms the launch.
+        // Cancelling earlier takes the launch cancellation path, which stops the group without the selected signal.
+        let (started, launched) = tokio::sync::oneshot::channel();
+        let started = std::sync::Mutex::new(Some(started));
+        let observer: ProcessObserver = Arc::new(move |_, _| {
+            if let Some(sender) = started.lock().unwrap().take() {
+                let _ = sender.send(());
+            }
+            Ok(())
+        });
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(ProcessSupervisor::run(input, cancel.clone()));
+        let task = tokio::spawn(ProcessSupervisor::run_with_observer(
+            input,
+            cancel.clone(),
+            Some(observer),
+        ));
         wait_for_file(&ready).await;
+        tokio::time::timeout(Duration::from_secs(2), launched)
+            .await
+            .unwrap()
+            .unwrap();
         cancel.cancel();
         let report = task.await.unwrap().unwrap();
         assert_eq!(report.reason, StopReason::Cancelled);
         assert!(report.signals.graceful_attempted);
         assert!(report.signals.force_attempted);
         assert!(report.direct_io_settled());
-        assert!(String::from_utf8_lossy(&report.stdout.bytes).contains(marker));
+        assert!(
+            String::from_utf8_lossy(&report.stdout.bytes).contains(marker),
+            "{scenario}: selected signal was not reported"
+        );
     }
 }
 

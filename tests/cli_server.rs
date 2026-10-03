@@ -480,97 +480,272 @@ async fn configured_cli_profiles_use_real_server_and_owned_state_without_live_pr
     assert!(created_anchors.iter().all(|path| !path.exists()));
 }
 
+/// Calls one MCP tool and returns its structured content after rejecting transport and tool errors.
+async fn mcp(client: &reqwest::Client, url: &str, bearer: &str, name: &str, args: Value) -> Value {
+    let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+        "name":name,"arguments":args,
+        "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}
+    }});
+    let response = client
+        .post(format!("{url}/mcp"))
+        .bearer_auth(bearer)
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", name)
+        .json(&body)
+        .send()
+        .await
+        .expect("MCP request");
+    assert_eq!(response.status(), 200, "MCP transport");
+    let text = response.text().await.unwrap();
+    let payload = if text.starts_with('{') {
+        text.as_str()
+    } else {
+        text.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .find(|line| line.starts_with('{'))
+            .expect("MCP JSON payload")
+    };
+    let value: Value = serde_json::from_str(payload).unwrap();
+    assert_ne!(value["result"]["isError"], true, "MCP tool failure");
+    value["result"]["structuredContent"].clone()
+}
+
+/// Admits one run through REST and checks the expected admission status.
+async fn rest_start(
+    client: &reqwest::Client,
+    url: &str,
+    bearer: &str,
+    body: &Value,
+    status: u16,
+) -> Value {
+    let response = client
+        .post(format!("{url}/v1/runs"))
+        .bearer_auth(bearer)
+        .json(body)
+        .send()
+        .await
+        .expect("REST admission");
+    assert_eq!(response.status().as_u16(), status, "REST admission status");
+    response.json().await.unwrap()
+}
+
+/// Waits for a live run to succeed and fails fast on any other terminal state.
+async fn wait_success(client: &reqwest::Client, url: &str, bearer: &str, run: &str, label: &str) {
+    tokio::time::timeout(Duration::from_secs(110), async {
+        loop {
+            let response = client
+                .get(format!("{url}/v1/runs/{run}"))
+                .bearer_auth(bearer)
+                .send()
+                .await
+                .expect("run status");
+            assert_eq!(response.status(), 200);
+            let value: Value = response.json().await.unwrap();
+            let state = value["state"].as_str().expect("run state");
+            if state == "succeeded" {
+                break;
+            }
+            assert!(
+                !["failed", "cancelled", "timed_out", "interrupted"].contains(&state),
+                "{label}: {state}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("live run timed out");
+}
+
+/// Builds the shipped profile for the executable found in PATH after checking its exact version.
+fn live_cli_profile(kind: &str) -> Value {
+    let executable = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .map(|directory| directory.join(kind))
+        .find(|path| path.is_file())
+        .expect("CLI executable in PATH");
+    let mut value = example_profile(kind);
+    let expected = value["version"]["expected_stdout"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let version = Command::new(&executable)
+        .arg("--version")
+        .output()
+        .expect("CLI version");
+    assert!(
+        version.status.success()
+            && std::str::from_utf8(&version.stdout).ok().map(str::trim) == Some(expected.as_str()),
+        "{kind}: unverified version"
+    );
+    value["program"] = json!(executable);
+    value["helper_program"] = json!(env!("CARGO_BIN_EXE_agent-runner-cli-helper"));
+    value
+}
+
+/// Starts the daemon from `config`, runs the approved REST and MCP new, replay and resume flow, and stops it cleanly.
+/// `suffix` keeps idempotency keys unique when the database already holds earlier live runs.
+async fn live_rest_mcp_flow(
+    config: &Path,
+    log: std::fs::File,
+    port: u16,
+    secret: &str,
+    suffix: &str,
+) {
+    let child = Command::new(env!("CARGO_BIN_EXE_agent-runner-server"))
+        .arg("--config")
+        .arg(config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log))
+        .spawn()
+        .unwrap();
+    let mut child = ChildGuard(child);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let url = format!("http://127.0.0.1:{port}");
+    let bearer = format!("live.{secret}");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if client
+                .get(format!("{url}/v1/agents"))
+                .bearer_auth(&bearer)
+                .send()
+                .await
+                .is_ok_and(|response| response.status() == 200)
+            {
+                break;
+            }
+            if let Some(status) = child.0.try_wait().unwrap() {
+                panic!("daemon exited before readiness: {status}");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("daemon readiness");
+
+    let new = |profile: &str, workspace: &str, key: &str, token: &str| {
+        json!({
+            "profile_id":profile,"workspace_id":workspace,"session":{"mode":"new"},
+            "idempotency_key":key,"input":{"request":format!("Remember token {token}. Reply OK only. Do not use tools.")}
+        })
+    };
+    let codex = new("codex", "a", &format!("codex-new{suffix}"), "ORBIT642");
+    let claude = new("claude", "b", &format!("claude-new{suffix}"), "MEADOW317");
+    let a = rest_start(&client, &url, &bearer, &codex, 202).await;
+    let b = mcp(&client, &url, &bearer, "agents_start", claude.clone()).await;
+    let a_replay = mcp(&client, &url, &bearer, "agents_start", codex).await;
+    let b_replay = rest_start(&client, &url, &bearer, &claude, 200).await;
+    assert_eq!(a_replay["run_id"], a["run_id"]);
+    assert_eq!(b_replay["run_id"], b["run_id"]);
+    assert_eq!(a_replay["replay"], true);
+    assert_eq!(b_replay["replay"], true);
+    let a_id = a["run_id"].as_str().unwrap();
+    let b_id = b["run_id"].as_str().unwrap();
+    wait_success(&client, &url, &bearer, a_id, "codex new").await;
+    wait_success(&client, &url, &bearer, b_id, "claude new").await;
+    println!("both new requests completed through the live daemon");
+    let resume = |profile: &str, workspace: &str, key: &str, session: &Value| {
+        json!({
+            "profile_id":profile,"workspace_id":workspace,"session":{"mode":"resume","session_id":session},
+            "idempotency_key":key,"input":{"request":"Reply with only the token I asked you to remember. Do not use tools."}
+        })
+    };
+    let a_next = resume(
+        "codex",
+        "a",
+        &format!("codex-resume{suffix}"),
+        &a["session_id"],
+    );
+    let b_next = resume(
+        "claude",
+        "b",
+        &format!("claude-resume{suffix}"),
+        &b["session_id"],
+    );
+    let a_next = mcp(&client, &url, &bearer, "agents_start", a_next).await;
+    let b_next = rest_start(&client, &url, &bearer, &b_next, 202).await;
+    for (result, token, label) in [
+        (&a_next, "ORBIT642", "codex resume"),
+        (&b_next, "MEADOW317", "claude resume"),
+    ] {
+        let run = result["run_id"].as_str().unwrap();
+        wait_success(&client, &url, &bearer, run, label).await;
+        let view = mcp(&client, &url, &bearer, "runs_result", json!({"run_id":run})).await;
+        assert_eq!(view["availability"], "available");
+        let data: Value =
+            serde_json::from_str(view["data"].as_str().expect("UTF-8 result")).unwrap();
+        assert!(
+            data["details"]["outcome"]["output"]
+                .as_str()
+                .is_some_and(|output| output.contains(token)),
+            "{label}: context recall failed"
+        );
+    }
+    println!("both explicit continuations recalled their tokens");
+    // SAFETY: The PID identifies the daemon spawned by this test.
+    assert_eq!(unsafe { libc::kill(child.0.id() as i32, libc::SIGTERM) }, 0);
+    let status = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("daemon shutdown");
+    assert!(status.success());
+    drop(child);
+}
+
+/// Returns the explicitly selected retained live directory after checking its location and private permissions.
+fn existing_live_root() -> PathBuf {
+    let root = PathBuf::from(
+        std::env::var_os("AGENT_RUNNER_LIVE_EXISTING_DIR")
+            .expect("explicit existing test directory"),
+    )
+    .canonicalize()
+    .expect("existing test directory");
+    let allowed = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("temp")
+        .canonicalize()
+        .unwrap();
+    assert!(
+        root.starts_with(allowed),
+        "test directory must be inside the project temp directory"
+    );
+    assert_eq!(
+        std::fs::metadata(&root).unwrap().permissions().mode() & 0o077,
+        0
+    );
+    assert_eq!(
+        std::fs::metadata(root.join("runs.sqlite"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o077,
+        0
+    );
+    assert_eq!(
+        std::fs::metadata(root.join("secret"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o077,
+        0
+    );
+    root
+}
+
 #[tokio::test]
 #[ignore = "uses real CLI authentication, sends provider requests, and retains the database and owner records"]
 async fn approved_real_cli_daemon_rest_mcp_and_owner_integration() {
     use std::{io::Read, os::unix::fs::OpenOptionsExt};
-
-    async fn mcp(
-        client: &reqwest::Client,
-        url: &str,
-        bearer: &str,
-        name: &str,
-        args: Value,
-    ) -> Value {
-        let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
-            "name":name,"arguments":args,
-            "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}
-        }});
-        let response = client
-            .post(format!("{url}/mcp"))
-            .bearer_auth(bearer)
-            .header("Accept", "application/json, text/event-stream")
-            .header("MCP-Protocol-Version", "2026-07-28")
-            .header("Mcp-Method", "tools/call")
-            .header("Mcp-Name", name)
-            .json(&body)
-            .send()
-            .await
-            .expect("MCP request");
-        assert_eq!(response.status(), 200, "MCP transport");
-        let text = response.text().await.unwrap();
-        let payload = if text.starts_with('{') {
-            text.as_str()
-        } else {
-            text.lines()
-                .filter_map(|line| line.strip_prefix("data: "))
-                .find(|line| line.starts_with('{'))
-                .expect("MCP JSON payload")
-        };
-        let value: Value = serde_json::from_str(payload).unwrap();
-        assert_ne!(value["result"]["isError"], true, "MCP tool failure");
-        value["result"]["structuredContent"].clone()
-    }
-
-    async fn rest_start(
-        client: &reqwest::Client,
-        url: &str,
-        bearer: &str,
-        body: &Value,
-        status: u16,
-    ) -> Value {
-        let response = client
-            .post(format!("{url}/v1/runs"))
-            .bearer_auth(bearer)
-            .json(body)
-            .send()
-            .await
-            .expect("REST admission");
-        assert_eq!(response.status().as_u16(), status, "REST admission status");
-        response.json().await.unwrap()
-    }
-
-    async fn wait_success(
-        client: &reqwest::Client,
-        url: &str,
-        bearer: &str,
-        run: &str,
-        label: &str,
-    ) {
-        tokio::time::timeout(Duration::from_secs(110), async {
-            loop {
-                let response = client
-                    .get(format!("{url}/v1/runs/{run}"))
-                    .bearer_auth(bearer)
-                    .send()
-                    .await
-                    .expect("run status");
-                assert_eq!(response.status(), 200);
-                let value: Value = response.json().await.unwrap();
-                let state = value["state"].as_str().expect("run state");
-                if state == "succeeded" {
-                    break;
-                }
-                assert!(
-                    !["failed", "cancelled", "timed_out", "interrupted"].contains(&state),
-                    "{label}: {state}"
-                );
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect("live run timed out");
-    }
 
     let base = PathBuf::from(
         std::env::var_os("AGENT_RUNNER_LIVE_TEST_DIR").expect("explicit persistent test directory"),
@@ -635,33 +810,6 @@ async fn approved_real_cli_daemon_rest_mcp_and_owner_integration() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
-    let find_program = |name: &str| {
-        std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
-            .map(|directory| directory.join(name))
-            .find(|path| path.is_file())
-            .expect("CLI executable in PATH")
-    };
-    let cli = |kind: &str| {
-        let executable = find_program(kind);
-        let mut value = example_profile(kind);
-        let expected = value["version"]["expected_stdout"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let version = Command::new(&executable)
-            .arg("--version")
-            .output()
-            .expect("CLI version");
-        assert!(
-            version.status.success()
-                && std::str::from_utf8(&version.stdout).ok().map(str::trim)
-                    == Some(expected.as_str()),
-            "{kind}: unverified version"
-        );
-        value["program"] = json!(executable);
-        value["helper_program"] = json!(env!("CARGO_BIN_EXE_agent-runner-cli-helper"));
-        value
-    };
     let value = json!({
         "schema_version":1,"listen":format!("127.0.0.1:{port}"),"database":"runs.sqlite",
         "access":{"max_request_bytes":16384,"max_skill_bytes":1024,"max_identifier_bytes":128},
@@ -673,8 +821,8 @@ async fn approved_real_cli_daemon_rest_mcp_and_owner_integration() {
             {"id":"b","revision":"v1","access":"exclusive","location":{"kind":"existing","path":"b"}}
         ]},
         "profiles":[
-            {"profile_id":"codex","revision":"v1","workspaces":["a"],"max_input_bytes":4096,"cli":cli("codex")},
-            {"profile_id":"claude","revision":"v1","workspaces":["b"],"max_input_bytes":4096,"cli":cli("claude")}
+            {"profile_id":"codex","revision":"v1","workspaces":["a"],"max_input_bytes":4096,"cli":live_cli_profile("codex")},
+            {"profile_id":"claude","revision":"v1","workspaces":["b"],"max_input_bytes":4096,"cli":live_cli_profile("claude")}
         ]
     });
     let config = root.join("config.json");
@@ -685,105 +833,7 @@ async fn approved_real_cli_daemon_rest_mcp_and_owner_integration() {
         .mode(0o600)
         .open(root.join("server.log"))
         .unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_agent-runner-server"))
-        .arg("--config")
-        .arg(&config)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .unwrap();
-    let mut child = ChildGuard(child);
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap();
-    let url = format!("http://127.0.0.1:{port}");
-    let bearer = format!("live.{secret}");
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if client
-                .get(format!("{url}/v1/agents"))
-                .bearer_auth(&bearer)
-                .send()
-                .await
-                .is_ok_and(|response| response.status() == 200)
-            {
-                break;
-            }
-            if let Some(status) = child.0.try_wait().unwrap() {
-                panic!("daemon exited before readiness: {status}");
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("daemon readiness");
-
-    let new = |profile: &str, workspace: &str, key: &str, token: &str| {
-        json!({
-            "profile_id":profile,"workspace_id":workspace,"session":{"mode":"new"},
-            "idempotency_key":key,"input":{"request":format!("Remember token {token}. Reply OK only. Do not use tools.")}
-        })
-    };
-    let codex = new("codex", "a", "codex-new", "ORBIT642");
-    let claude = new("claude", "b", "claude-new", "MEADOW317");
-    let a = rest_start(&client, &url, &bearer, &codex, 202).await;
-    let b = mcp(&client, &url, &bearer, "agents_start", claude.clone()).await;
-    let a_replay = mcp(&client, &url, &bearer, "agents_start", codex).await;
-    let b_replay = rest_start(&client, &url, &bearer, &claude, 200).await;
-    assert_eq!(a_replay["run_id"], a["run_id"]);
-    assert_eq!(b_replay["run_id"], b["run_id"]);
-    assert_eq!(a_replay["replay"], true);
-    assert_eq!(b_replay["replay"], true);
-    let a_id = a["run_id"].as_str().unwrap();
-    let b_id = b["run_id"].as_str().unwrap();
-    wait_success(&client, &url, &bearer, a_id, "codex new").await;
-    wait_success(&client, &url, &bearer, b_id, "claude new").await;
-    println!("both new requests completed through the live daemon");
-    let resume = |profile: &str, workspace: &str, key: &str, session: &Value| {
-        json!({
-            "profile_id":profile,"workspace_id":workspace,"session":{"mode":"resume","session_id":session},
-            "idempotency_key":key,"input":{"request":"Reply with only the token I asked you to remember. Do not use tools."}
-        })
-    };
-    let a_next = resume("codex", "a", "codex-resume", &a["session_id"]);
-    let b_next = resume("claude", "b", "claude-resume", &b["session_id"]);
-    let a_next = mcp(&client, &url, &bearer, "agents_start", a_next).await;
-    let b_next = rest_start(&client, &url, &bearer, &b_next, 202).await;
-    for (result, token, label) in [
-        (&a_next, "ORBIT642", "codex resume"),
-        (&b_next, "MEADOW317", "claude resume"),
-    ] {
-        let run = result["run_id"].as_str().unwrap();
-        wait_success(&client, &url, &bearer, run, label).await;
-        let view = mcp(&client, &url, &bearer, "runs_result", json!({"run_id":run})).await;
-        assert_eq!(view["availability"], "available");
-        let data: Value =
-            serde_json::from_str(view["data"].as_str().expect("UTF-8 result")).unwrap();
-        assert!(
-            data["details"]["outcome"]["output"]
-                .as_str()
-                .is_some_and(|output| output.contains(token)),
-            "{label}: context recall failed"
-        );
-    }
-    println!("both explicit continuations recalled their tokens");
-    // SAFETY: The PID identifies the daemon spawned by this test.
-    assert_eq!(unsafe { libc::kill(child.0.id() as i32, libc::SIGTERM) }, 0);
-    let status = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            if let Some(status) = child.0.try_wait().unwrap() {
-                break status;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("daemon shutdown");
-    assert!(status.success());
-    drop(child);
+    live_rest_mcp_flow(&config, log, port, &secret, "").await;
     let db = rusqlite::Connection::open_with_flags(
         root.join("runs.sqlite"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -808,40 +858,7 @@ async fn approved_real_cli_daemon_rest_mcp_and_owner_integration() {
 #[ignore = "reopens an explicitly selected live test database and real CLI owner records without provider requests"]
 async fn real_owned_state_reopens_without_provider_requests() {
     use std::io::Write;
-    let root = PathBuf::from(
-        std::env::var_os("AGENT_RUNNER_LIVE_EXISTING_DIR")
-            .expect("explicit existing test directory"),
-    )
-    .canonicalize()
-    .expect("existing test directory");
-    let allowed = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("temp")
-        .canonicalize()
-        .unwrap();
-    assert!(
-        root.starts_with(allowed),
-        "test directory must be inside the project temp directory"
-    );
-    assert_eq!(
-        std::fs::metadata(&root).unwrap().permissions().mode() & 0o077,
-        0
-    );
-    assert_eq!(
-        std::fs::metadata(root.join("runs.sqlite"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o077,
-        0
-    );
-    assert_eq!(
-        std::fs::metadata(root.join("secret"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o077,
-        0
-    );
+    let root = existing_live_root();
     let mut config: Value =
         serde_json::from_slice(&std::fs::read(root.join("config.json")).unwrap()).unwrap();
     let secret = std::fs::read_to_string(root.join("secret")).unwrap();
@@ -911,5 +928,82 @@ async fn real_owned_state_reopens_without_provider_requests() {
     assert!(status.success());
     println!(
         "existing private test database and both native owners reopened without a provider request"
+    );
+}
+
+#[tokio::test]
+#[ignore = "reopens an explicitly selected live test database, sends provider requests, and adds runs to its retained records"]
+async fn approved_real_cli_daemon_rest_mcp_on_existing_owned_state() {
+    use std::{
+        io::{Read, Write},
+        os::unix::fs::OpenOptionsExt,
+    };
+    // The native state already belongs to this database, so the live flow reuses it instead of creating a new owner.
+    let root = existing_live_root();
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(root.join("config.json")).unwrap()).unwrap();
+    let secret = std::fs::read_to_string(root.join("secret")).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    config["listen"] = json!(format!("127.0.0.1:{port}"));
+    for profile in config["profiles"].as_array_mut().unwrap() {
+        let Some(kind) = profile
+            .get("cli")
+            .and_then(|cli| cli["kind"].as_str())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        profile["cli"] = live_cli_profile(&kind);
+    }
+    let mut bytes = [0_u8; 8];
+    std::fs::File::open("/dev/urandom")
+        .unwrap()
+        .read_exact(&mut bytes)
+        .unwrap();
+    let suffix: String = std::iter::once("-".to_owned())
+        .chain(bytes.iter().map(|byte| format!("{byte:02x}")))
+        .collect();
+    let mut config_copy = tempfile::NamedTempFile::new_in(&root).unwrap();
+    config_copy
+        .write_all(&serde_json::to_vec(&config).unwrap())
+        .unwrap();
+    config_copy.flush().unwrap();
+    let log = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(root.join(format!("server{suffix}.log")))
+        .unwrap();
+    let counts = || {
+        let db = rusqlite::Connection::open_with_flags(
+            root.join("runs.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let runs: i64 = db
+            .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+            .unwrap();
+        let sessions: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE native_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (runs, sessions)
+    };
+    let before = counts();
+    live_rest_mcp_flow(config_copy.path(), log, port, &secret, &suffix).await;
+    let after = counts();
+    assert_eq!(
+        after.0 - before.0,
+        4,
+        "cross-transport replay must not create extra runs"
+    );
+    assert_eq!(after.1 - before.1, 2);
+    println!(
+        "live daemon on existing owned state, cross-transport replay and durable sessions passed"
     );
 }

@@ -10,8 +10,13 @@ use std::{
 };
 use tempfile::tempdir;
 
+/// Serializes tests that assert a pipe is closed against every other test that spawns processes.
+/// A process forked by another test holds copies of this process's descriptors until it executes, which can keep a closed pipe open.
+static SPAWN_GATE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
 #[tokio::test]
 async fn helper_waits_for_a_detached_pipe_free_descendant_before_success() {
+    let _gate = SPAWN_GATE.read().await;
     let temp = tempdir().unwrap();
     let script = temp.path().join("cli-fixture");
     let marker = temp.path().join("descendant-finished");
@@ -55,6 +60,7 @@ async fn helper_waits_for_a_detached_pipe_free_descendant_before_success() {
 
 #[tokio::test]
 async fn helper_does_not_keep_cli_stdin_open_after_the_cli_exits() {
+    let _gate = SPAWN_GATE.write().await;
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -108,6 +114,7 @@ async fn helper_does_not_keep_cli_stdin_open_after_the_cli_exits() {
 
 #[tokio::test]
 async fn brokered_input_closes_before_child_exit_is_reported() {
+    let _gate = SPAWN_GATE.write().await;
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -163,6 +170,7 @@ async fn brokered_input_closes_before_child_exit_is_reported() {
 
 #[tokio::test]
 async fn brokered_input_forwards_data_and_eof_to_a_live_child() {
+    let _gate = SPAWN_GATE.read().await;
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
 
@@ -188,6 +196,7 @@ async fn brokered_input_forwards_data_and_eof_to_a_live_child() {
 
 #[tokio::test]
 async fn broker_does_not_change_the_callers_stdin_status_flags() {
+    let _gate = SPAWN_GATE.read().await;
     use std::{
         io::Write,
         os::fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -235,6 +244,7 @@ async fn broker_does_not_change_the_callers_stdin_status_flags() {
 
 #[tokio::test]
 async fn supervisor_can_drive_brokered_input_and_explicit_eof() {
+    let _gate = SPAWN_GATE.read().await;
     use agent_runner_server::process::{
         ControlledInput, InputCompletion, OutputStream, ProcessObserver,
     };
@@ -316,6 +326,7 @@ async fn supervisor_can_drive_brokered_input_and_explicit_eof() {
 
 #[tokio::test]
 async fn supervisor_cancels_brokered_input_without_reporting_completion() {
+    let _gate = SPAWN_GATE.read().await;
     use agent_runner_server::process::{InputCompletion, OutputStream, ProcessObserver};
     use std::sync::{Arc, Mutex};
 
@@ -392,6 +403,7 @@ async fn supervisor_cancels_brokered_input_without_reporting_completion() {
 
 #[tokio::test]
 async fn broker_rejects_a_write_only_stdin_pipe() {
+    let _gate = SPAWN_GATE.read().await;
     use std::{
         os::fd::{FromRawFd, OwnedFd},
         process::Stdio,
@@ -421,6 +433,7 @@ async fn broker_rejects_a_write_only_stdin_pipe() {
 
 #[tokio::test]
 async fn helper_kills_and_reaps_its_child_when_status_output_fails() {
+    let _gate = SPAWN_GATE.read().await;
     use std::process::Stdio;
 
     let full = std::fs::OpenOptions::new()
@@ -444,6 +457,7 @@ async fn helper_kills_and_reaps_its_child_when_status_output_fails() {
 
 #[tokio::test]
 async fn broker_failure_keeps_reaping_detached_descendants() {
+    let _gate = SPAWN_GATE.read().await;
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -491,6 +505,7 @@ async fn broker_failure_keeps_reaping_detached_descendants() {
 
 #[tokio::test]
 async fn brokered_input_forwards_large_stream_while_output_is_drained() {
+    let _gate = SPAWN_GATE.read().await;
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
 
@@ -521,6 +536,7 @@ async fn brokered_input_forwards_large_stream_while_output_is_drained() {
 
 #[tokio::test]
 async fn a_detached_descendant_outliving_deadline_never_reports_normal_completion() {
+    let _gate = SPAWN_GATE.read().await;
     let temp = tempdir().unwrap();
     let script = temp.path().join("cli-fixture");
     let marker = temp.path().join("descendant-finished");
