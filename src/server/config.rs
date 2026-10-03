@@ -19,8 +19,13 @@ use crate::{
         Scope,
     },
     application::{BackendProfile, RetentionConfig, RunLimits, RunService},
-    runtimes::dummy::{DummyBackend, DummyScenario},
+    core::ExecutionBackend,
+    runtimes::{
+        cli::{CliBackend, CliSettings},
+        dummy::{DummyBackend, DummyScenario},
+    },
     storage::Namespace,
+    workspace::{WorkspaceConfig, WorkspaceRegistry},
 };
 
 #[derive(Deserialize)]
@@ -38,6 +43,8 @@ struct Configuration {
     delivery: Option<crate::delivery::DeliveryConfig>,
     #[serde(default)]
     retention: Option<RetentionConfig>,
+    #[serde(default)]
+    workspaces: Option<WorkspaceConfig>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -100,7 +107,10 @@ struct ProfileSettings {
     revision: String,
     workspaces: Vec<String>,
     max_input_bytes: usize,
-    scenario: Scenario,
+    #[serde(default)]
+    scenario: Option<Scenario>,
+    #[serde(default)]
+    cli: Option<CliSettings>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -125,6 +135,7 @@ pub struct PreparedServer {
     transport: ServerLimits,
     delivery: Option<crate::delivery::DeliveryConfig>,
     retention: Option<RetentionConfig>,
+    workspaces: Option<WorkspaceConfig>,
 }
 impl PreparedServer {
     /// Loads paths relative to the configuration file, never relative to a client request.
@@ -174,6 +185,12 @@ impl PreparedServer {
             })
         }) {
             return Err(ServerError::InvalidConfiguration);
+        }
+        let mut workspaces = config.workspaces;
+        if let Some(workspaces) = &mut workspaces {
+            workspaces.resolve_relative(root);
+            WorkspaceRegistry::prepare(workspaces.clone(), Path::new("."))
+                .map_err(|_| ServerError::InvalidConfiguration)?;
         }
         let r = config.run;
         let runs = RunLimits {
@@ -227,29 +244,65 @@ impl PreparedServer {
             return Err(ServerError::InvalidConfiguration);
         }
         let mut profiles = Vec::new();
-        let grants = config
-            .profiles
-            .into_iter()
-            .map(|p| {
-                let scenario = match p.scenario {
-                    Scenario::Success => DummyScenario::Success,
-                    Scenario::DelayedSuccess => DummyScenario::DelayedSuccess,
-                    Scenario::StructuredSuccess => DummyScenario::StructuredSuccess,
-                    Scenario::Warning => DummyScenario::Warning,
-                    Scenario::MixedWarnings => DummyScenario::MixedWarnings,
-                    Scenario::PartialWarnings => DummyScenario::PartialWarnings,
-                    Scenario::Incomplete => DummyScenario::Incomplete,
-                    Scenario::Failure => DummyScenario::Failure,
-                };
-                profiles.push(BackendProfile {
-                    profile_id: p.profile_id.clone(),
-                    revision: p.revision,
-                    state_realm: "dummy".into(),
-                    backend: Arc::new(DummyBackend::new(scenario, 0)),
-                });
-                ExecutionProfile::dummy(p.profile_id, p.workspaces, p.max_input_bytes)
-            })
-            .collect::<Vec<_>>();
+        let mut grants = Vec::new();
+        for p in config.profiles {
+            let backend: Arc<dyn ExecutionBackend> = match (p.scenario, p.cli) {
+                (Some(scenario), None) => {
+                    let scenario = match scenario {
+                        Scenario::Success => DummyScenario::Success,
+                        Scenario::DelayedSuccess => DummyScenario::DelayedSuccess,
+                        Scenario::StructuredSuccess => DummyScenario::StructuredSuccess,
+                        Scenario::Warning => DummyScenario::Warning,
+                        Scenario::MixedWarnings => DummyScenario::MixedWarnings,
+                        Scenario::PartialWarnings => DummyScenario::PartialWarnings,
+                        Scenario::Incomplete => DummyScenario::Incomplete,
+                        Scenario::Failure => DummyScenario::Failure,
+                    };
+                    Arc::new(DummyBackend::new(scenario, 0))
+                }
+                (None, Some(mut cli)) => {
+                    cli.program = root.join(cli.program);
+                    cli.helper_program = root.join(cli.helper_program);
+                    Arc::new(CliBackend::new(cli).map_err(|_| ServerError::InvalidConfiguration)?)
+                }
+                _ => return Err(ServerError::InvalidConfiguration),
+            };
+            if backend
+                .cleanup_budget()
+                .is_some_and(|budget| budget >= runs.cleanup_grace)
+                || runs.max_events_per_run < backend.minimum_events()
+                || (backend.requires_workspace() && workspaces.is_none())
+            {
+                return Err(ServerError::InvalidConfiguration);
+            }
+            if let Some(workspaces) = &workspaces {
+                for id in &p.workspaces {
+                    let entry = workspaces.entries.iter().find(|entry| entry.id == *id);
+                    if (backend.requires_workspace() && entry.is_none())
+                        || entry.is_some_and(|entry| {
+                            entry.access == crate::workspace::WorkspaceAccess::SharedRead
+                                && !backend.supports_shared_read()
+                        })
+                    {
+                        return Err(ServerError::InvalidConfiguration);
+                    }
+                }
+            }
+            let runtime = backend.metadata().runtime;
+            let state_realm = backend.state_realm().to_owned();
+            profiles.push(BackendProfile {
+                profile_id: p.profile_id.clone(),
+                revision: p.revision,
+                state_realm,
+                backend,
+            });
+            grants.push(ExecutionProfile::for_runtime(
+                p.profile_id,
+                runtime,
+                p.workspaces,
+                p.max_input_bytes,
+            ));
+        }
         let registrations = config
             .clients
             .into_iter()
@@ -292,16 +345,18 @@ impl PreparedServer {
             transport,
             delivery: config.delivery,
             retention: config.retention,
+            workspaces,
         })
     }
     pub async fn start(self) -> Result<Server, ServerError> {
-        let service = RunService::open_with_retention(
+        let service = RunService::open_with_workspaces(
             self.database,
             self.access,
             self.profiles,
             self.runs,
             self.delivery,
             self.retention,
+            self.workspaces,
         )
         .await
         .map_err(ServerError::Service)?;

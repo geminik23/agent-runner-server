@@ -1,0 +1,95 @@
+{
+  "kind": "claude",
+  "program": "/usr/local/bin/claude",
+  "helper_program": "/usr/local/bin/agent-runner-cli-helper",
+  "compatibility": "claude-2.1.286-wsl2-x86_64-subreaper-v1",
+  "version": {
+    "args": [
+      "--version"
+    ],
+    "expected_stdout": "2.1.286 (Claude Code)"
+  },
+  "new_args": [
+    "-p",
+    "--output-format",
+    "json",
+    "--safe-mode",
+    "--restricted",
+    "--strict-mcp-config",
+    "--tools",
+    "Read,Glob,Grep",
+    "--permission-mode",
+    "dontAsk",
+    "--permission-prompts",
+    "none"
+  ],
+  "resume_args": [
+    "-p",
+    "--output-format",
+    "json",
+    "--safe-mode",
+    "--restricted",
+    "--strict-mcp-config",
+    "--tools",
+    "Read,Glob,Grep",
+    "--permission-mode",
+    "dontAsk",
+    "--permission-prompts",
+    "none",
+    "--resume",
+    "{native_session_id}"
+  ],
+  "environment": {
+    "inherit": [
+      "HOME",
+      "PATH",
+      "LANG",
+      "LC_ALL",
+      "LC_CTYPE",
+      "TERM",
+      "TMPDIR",
+      "SHELL",
+      "USER",
+      "LOGNAME",
+      "XDG_CONFIG_HOME",
+      "XDG_DATA_HOME",
+      "XDG_STATE_HOME",
+      "XDG_RUNTIME_DIR",
+      "DBUS_SESSION_BUS_ADDRESS",
+      "SSL_CERT_FILE",
+      "SSL_CERT_DIR"
+    ],
+    "state_directory_variable": "CLAUDE_CONFIG_DIR",
+    "default_state_directory": ".claude",
+    "forbidden_prefixes": [
+      "ANTHROPIC_",
+      "CLAUDE_CODE_USE_"
+    ],
+    "forbidden_names": [
+      "CLAUDE_CODE_OAUTH_TOKEN"
+    ]
+  },
+  "platform": {
+    "architecture": "x86_64",
+    "kernel_release_contains": [
+      "microsoft",
+      "wsl2"
+    ]
+  },
+  "forbidden_workspace_entries": [],
+  "session_store": {
+    "directory": "projects",
+    "file_suffix": ".jsonl",
+    "max_depth": 2,
+    "max_entries": 100000
+  },
+  "max_stdin_bytes": 65536,
+  "max_stdout_bytes": 1048576,
+  "max_stderr_bytes": 262144,
+  "max_line_bytes": 262144,
+  "timeout_ms": 90000,
+  "preflight_timeout_ms": 10000,
+  "signal_grace_ms": 1000,
+  "kill_grace_ms": 1000,
+  "pipe_grace_ms": 1000
+}

@@ -1,0 +1,112 @@
+{
+  "kind": "codex",
+  "program": "/usr/local/bin/codex",
+  "helper_program": "/usr/local/bin/agent-runner-cli-helper",
+  "compatibility": "codex-0.159.3-wsl2-x86_64-subreaper-v1",
+  "version": {
+    "args": [
+      "--version"
+    ],
+    "expected_stdout": "codex-cli 0.159.3"
+  },
+  "new_args": [
+    "--no-daemon",
+    "--ask-for-approval",
+    "never",
+    "--sandbox",
+    "read-only",
+    "--disable",
+    "hooks",
+    "--disable",
+    "plugins",
+    "--disable",
+    "apps",
+    "--disable",
+    "multi_agent",
+    "--disable",
+    "skill_mcp_dependency_install",
+    "exec",
+    "--ignore-user-config",
+    "--skip-git-repo-check",
+    "--json",
+    "-"
+  ],
+  "resume_args": [
+    "--no-daemon",
+    "--ask-for-approval",
+    "never",
+    "--sandbox",
+    "read-only",
+    "--disable",
+    "hooks",
+    "--disable",
+    "plugins",
+    "--disable",
+    "apps",
+    "--disable",
+    "multi_agent",
+    "--disable",
+    "skill_mcp_dependency_install",
+    "exec",
+    "resume",
+    "--ignore-user-config",
+    "--skip-git-repo-check",
+    "--json",
+    "{native_session_id}",
+    "-"
+  ],
+  "environment": {
+    "inherit": [
+      "HOME",
+      "PATH",
+      "LANG",
+      "LC_ALL",
+      "LC_CTYPE",
+      "TERM",
+      "TMPDIR",
+      "SHELL",
+      "USER",
+      "LOGNAME",
+      "XDG_CONFIG_HOME",
+      "XDG_DATA_HOME",
+      "XDG_STATE_HOME",
+      "XDG_RUNTIME_DIR",
+      "DBUS_SESSION_BUS_ADDRESS",
+      "SSL_CERT_FILE",
+      "SSL_CERT_DIR"
+    ],
+    "state_directory_variable": "CODEX_HOME",
+    "default_state_directory": ".codex",
+    "forbidden_prefixes": [
+      "OPENAI_"
+    ],
+    "forbidden_names": [
+      "CODEX_API_KEY"
+    ]
+  },
+  "platform": {
+    "architecture": "x86_64",
+    "kernel_release_contains": [
+      "microsoft",
+      "wsl2"
+    ]
+  },
+  "forbidden_workspace_entries": [
+    ".codex"
+  ],
+  "session_store": {
+    "directory": "sessions",
+    "file_suffix": ".jsonl",
+    "max_depth": 4,
+    "max_entries": 100000
+  },
+  "max_stdin_bytes": 65536,
+  "max_stdout_bytes": 1048576,
+  "max_stderr_bytes": 262144,
+  "max_line_bytes": 262144,
+  "timeout_ms": 90000,
+  "preflight_timeout_ms": 10000,
+  "signal_grace_ms": 1000,
+  "kill_grace_ms": 1000,
+  "pipe_grace_ms": 1000
+}
