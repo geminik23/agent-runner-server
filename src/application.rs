@@ -6,7 +6,7 @@ use std::{
     fmt,
     fs::{File, OpenOptions},
     future::poll_fn,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -29,14 +29,18 @@ use crate::{
         validate_resource_id,
     },
     core::{
-        BackendError, CancellationToken, CleanupState, EventSink, EventSinkError, ExecutionBackend,
-        ExecutionEvent, ExecutionEventKind, ExecutionMetadata, ExecutionOutcome, ExecutionRequest,
-        ExecutionResult, SessionDisposition, SessionRef, SessionRequest, WarningObservation,
+        BackendError, CancellationToken, CleanupState, DispatchStatus, EventSink, EventSinkError,
+        ExecutionBackend, ExecutionEvent, ExecutionEventKind, ExecutionMetadata, ExecutionOutcome,
+        ExecutionRequest, ExecutionResult, SessionDisposition, SessionRef, SessionRequest,
+        WarningObservation, WorkingDirectory,
     },
     storage::{
         AdmissionOutcome, EventSummary, Namespace, RunSummary, SqliteStore, StorageError,
         StoredResult, TerminalState,
         service::{Candidate, ClaimedJob, ServiceAdmission, ServiceClock, StopCause},
+    },
+    workspace::{
+        WorkspaceAccess, WorkspaceConfig, WorkspacePlan, WorkspaceRegistry, journal::JournalKey,
     },
 };
 
@@ -180,6 +184,10 @@ struct Manifest {
     policy_revision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     result_schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace: Option<WorkspacePlan>,
+    #[serde(default)]
+    independent_new_sessions: bool,
 }
 
 impl Manifest {
@@ -195,6 +203,8 @@ impl Manifest {
 type DbTask = Box<dyn FnOnce(&mut SqliteStore) + Send + 'static>;
 enum DbMessage {
     Task(DbTask),
+    JournalStart(JournalKey, oneshot::Sender<Result<bool, ServiceError>>),
+    JournalSettle(JournalKey, oneshot::Sender<Result<(), ServiceError>>),
     Stop,
 }
 #[derive(Clone)]
@@ -217,6 +227,24 @@ impl Database {
         receiver.await.map_err(|_| ServiceError::Unavailable)?
     }
 
+    async fn journal_start(&self, key: JournalKey) -> Result<bool, ServiceError> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(DbMessage::JournalStart(key, sender))
+            .await
+            .map_err(|_| ServiceError::Unavailable)?;
+        receiver.await.map_err(|_| ServiceError::Unavailable)?
+    }
+
+    async fn journal_settle(&self, key: JournalKey) -> Result<(), ServiceError> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(DbMessage::JournalSettle(key, sender))
+            .await
+            .map_err(|_| ServiceError::Unavailable)?;
+        receiver.await.map_err(|_| ServiceError::Unavailable)?
+    }
+
     async fn stop(&self) -> Result<(), ServiceError> {
         self.sender
             .send(DbMessage::Stop)
@@ -229,6 +257,7 @@ struct Shared {
     database: Database,
     access: Arc<ClientAccessControl>,
     profiles: Arc<HashMap<String, BackendProfile>>,
+    workspaces: Option<Arc<WorkspaceRegistry>>,
     limits: RunLimits,
     delivery: Option<crate::delivery::DeliveryConfig>,
     retention_ms: Option<i64>,
@@ -287,7 +316,24 @@ impl RunService {
         delivery: Option<crate::delivery::DeliveryConfig>,
         retention: Option<RetentionConfig>,
     ) -> Result<Self, ServiceError> {
+        Self::open_with_workspaces(path, access, profiles, limits, delivery, retention, None).await
+    }
+
+    /// Opens the service with an explicit trusted workspace registry.
+    pub async fn open_with_workspaces(
+        path: impl AsRef<Path>,
+        access: Arc<ClientAccessControl>,
+        profiles: Vec<BackendProfile>,
+        limits: RunLimits,
+        delivery: Option<crate::delivery::DeliveryConfig>,
+        retention: Option<RetentionConfig>,
+        workspaces: Option<WorkspaceConfig>,
+    ) -> Result<Self, ServiceError> {
         limits.validate()?;
+        let workspaces = workspaces
+            .map(|config| WorkspaceRegistry::prepare(config, Path::new(".")))
+            .transpose()?
+            .map(Arc::new);
         let retention_ms = retention
             .as_ref()
             .map(RetentionConfig::milliseconds)
@@ -316,6 +362,11 @@ impl RunService {
             if profile.profile_id.is_empty()
                 || profile.revision.is_empty()
                 || profile.state_realm.is_empty()
+                || limits.max_events_per_run < profile.backend.minimum_events()
+                || profile
+                    .backend
+                    .cleanup_budget()
+                    .is_some_and(|budget| budget >= limits.cleanup_grace)
                 || profile.state_realm != profile.backend.state_realm()
                 || profile_map
                     .insert(profile.profile_id.clone(), profile)
@@ -324,13 +375,50 @@ impl RunService {
                 return Err(ServiceError::InvalidConfiguration);
             }
         }
-        if profile_map.is_empty() {
+        if profile_map.is_empty()
+            || (workspaces.is_none()
+                && profile_map.values().any(|p| p.backend.requires_workspace()))
+        {
             return Err(ServiceError::InvalidConfiguration);
         }
+        let mut states = Vec::new();
+        for profile in profile_map.values() {
+            if let Some(path) = profile.backend.state_directory() {
+                let root = profile
+                    .backend
+                    .state_owner_root()
+                    .ok_or(ServiceError::InvalidConfiguration)?;
+                states.push((
+                    profile.state_realm.clone(),
+                    path.to_path_buf(),
+                    root.to_path_buf(),
+                ));
+            }
+        }
         let path = path.as_ref().to_path_buf();
-        let (store, guard) = tokio::task::spawn_blocking(move || open_guarded(&path))
-            .await
-            .map_err(|_| ServiceError::Unavailable)??;
+        let registry = workspaces.clone();
+        let (store, guard, workspace_guard) = tokio::task::spawn_blocking(move || {
+            let (guard, canonical) = lock_database(&path)?;
+            let readonly = SqliteStore::open_read_only(&canonical)?;
+            let mut owner = if let Some(registry) = &registry {
+                let owner = registry.acquire_owner(&canonical, &states, &readonly)?;
+                owner.verify(&readonly)?;
+                Some(owner)
+            } else {
+                if readonly.has_unsettled_workspace_jobs()? {
+                    return Err(ServiceError::InvalidConfiguration);
+                }
+                None
+            };
+            drop(readonly);
+            let mut store = open_locked_store(&canonical, &guard)?;
+            if let Some(owner) = &mut owner {
+                owner.reconcile(&mut store)?;
+            }
+            Ok::<_, ServiceError>((store, guard, owner))
+        })
+        .await
+        .map_err(|_| ServiceError::Unavailable)??;
         let (sender, mut receiver) = mpsc::channel(limits.database_queue);
         let database = Database { sender };
         let available = Arc::new(AtomicBool::new(true));
@@ -343,6 +431,7 @@ impl RunService {
         let actor_shutdown = shutdown.clone();
         let database_thread = thread::spawn(move || {
             let _guard = guard;
+            let mut workspace_guard = workspace_guard;
             let mut store = store;
             let mut poisoned = false;
             while let Some(message) = receiver.blocking_recv() {
@@ -360,6 +449,46 @@ impl RunService {
                         }
                     }
                     DbMessage::Task(_) => {}
+                    DbMessage::JournalStart(key, sender) => {
+                        let result = if poisoned {
+                            Err(ServiceError::Unavailable)
+                        } else {
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                workspace_guard
+                                    .as_mut()
+                                    .ok_or(ServiceError::InvalidConfiguration)?
+                                    .start(key, &mut store)
+                            }))
+                            .unwrap_or(Err(ServiceError::Unavailable))
+                        };
+                        if result.is_err() {
+                            poisoned = true;
+                            actor_available.store(false, Ordering::Release);
+                            actor_failed.store(true, Ordering::Release);
+                            actor_shutdown.cancel();
+                        }
+                        let _ = sender.send(result);
+                    }
+                    DbMessage::JournalSettle(key, sender) => {
+                        let result = if poisoned {
+                            Err(ServiceError::Unavailable)
+                        } else {
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                workspace_guard
+                                    .as_mut()
+                                    .ok_or(ServiceError::InvalidConfiguration)?
+                                    .settle(&key)
+                            }))
+                            .unwrap_or(Err(ServiceError::Unavailable))
+                        };
+                        if result.is_err() {
+                            poisoned = true;
+                            actor_available.store(false, Ordering::Release);
+                            actor_failed.store(true, Ordering::Release);
+                            actor_shutdown.cancel();
+                        }
+                        let _ = sender.send(result);
+                    }
                     DbMessage::Stop => break,
                 }
             }
@@ -382,6 +511,7 @@ impl RunService {
             database,
             access,
             profiles: Arc::new(profile_map),
+            workspaces,
             limits,
             delivery,
             retention_ms,
@@ -509,6 +639,7 @@ impl RunHandle {
             identifier: access.identifier_limit(),
         };
         let profiles = Arc::clone(&self.shared.profiles);
+        let workspaces = self.shared.workspaces.clone();
         let client = client.clone();
         let body = body.to_vec();
         let limits = self.shared.limits.clone();
@@ -559,6 +690,20 @@ impl RunHandle {
                             {
                                 return Err(AccessError::Forbidden);
                             }
+                            let workspace = workspaces
+                                .as_ref()
+                                .and_then(|registry| registry.get(approved.workspace_id()))
+                                .cloned();
+                            if (profile.backend.requires_workspace() && workspace.is_none())
+                                || workspace.as_ref().is_some_and(|value| {
+                                    value.access == WorkspaceAccess::SharedRead
+                                        && !profile.backend.supports_shared_read()
+                                })
+                            {
+                                return Err(AccessError::Forbidden);
+                            }
+                            let independent_new_sessions =
+                                profile.backend.independent_new_sessions();
                             let manifest = Manifest {
                                 version: 2,
                                 profile_revision: profile.revision.clone(),
@@ -575,6 +720,8 @@ impl RunHandle {
                                     crate::storage::skills::POLICY_REVISION.to_owned(),
                                 ),
                                 result_schema: request.result_schema.clone(),
+                                workspace: workspace.clone(),
+                                independent_new_sessions,
                             };
                             let manifest = serde_json::to_vec(&manifest)
                                 .map_err(|_| AccessError::InvalidRequest)?;
@@ -596,6 +743,8 @@ impl RunHandle {
                                     profile_revision: profile.revision.clone(),
                                     workspace_id: approved.workspace_id().to_owned(),
                                     state_realm: profile.state_realm.clone(),
+                                    workspace,
+                                    independent_new_sessions,
                                     resume_session_id: approved
                                         .resume_session_id()
                                         .map(str::to_owned),
@@ -1250,7 +1399,7 @@ impl Drop for RunService {
     }
 }
 
-fn open_guarded(path: &Path) -> Result<(SqliteStore, File), ServiceError> {
+fn lock_database(path: &Path) -> Result<(File, PathBuf), ServiceError> {
     let database_file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1275,7 +1424,7 @@ fn open_guarded(path: &Path) -> Result<(SqliteStore, File), ServiceError> {
         .map_err(|_| ServiceError::AlreadyRunning)?;
     let canonical = path.canonicalize().map_err(|_| ServiceError::Unavailable)?;
     #[cfg(unix)]
-    let identity = {
+    {
         use std::os::unix::fs::MetadataExt;
         let locked = database_file
             .metadata()
@@ -1284,18 +1433,31 @@ fn open_guarded(path: &Path) -> Result<(SqliteStore, File), ServiceError> {
         if (locked.dev(), locked.ino()) != (named.dev(), named.ino()) {
             return Err(ServiceError::InvalidConfiguration);
         }
+    }
+    Ok((database_file, canonical))
+}
+
+fn open_locked_store(path: &Path, guard: &File) -> Result<SqliteStore, ServiceError> {
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        let locked = guard.metadata().map_err(|_| ServiceError::Unavailable)?;
+        let named = std::fs::metadata(path).map_err(|_| ServiceError::Unavailable)?;
+        if (locked.dev(), locked.ino()) != (named.dev(), named.ino()) {
+            return Err(ServiceError::InvalidConfiguration);
+        }
         (locked.dev(), locked.ino())
     };
-    let store = SqliteStore::open(&canonical)?;
+    let store = SqliteStore::open(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let named = std::fs::metadata(&canonical).map_err(|_| ServiceError::Unavailable)?;
+        let named = std::fs::metadata(path).map_err(|_| ServiceError::Unavailable)?;
         if identity != (named.dev(), named.ino()) {
             return Err(ServiceError::InvalidConfiguration);
         }
     }
-    Ok((store, database_file))
+    Ok(store)
 }
 
 fn now_ms() -> Result<i64, ServiceError> {
@@ -1657,19 +1819,41 @@ async fn finish_prelaunch(
     job: &ClaimedJob,
     reason: &'static str,
 ) -> Result<(), ServiceError> {
+    finish_prelaunch_with_cleanup(shared, job, reason, CleanupState::Settled).await
+}
+
+async fn finish_prelaunch_with_cleanup(
+    shared: &Shared,
+    job: &ClaimedJob,
+    reason: &'static str,
+    cleanup: CleanupState,
+) -> Result<(), ServiceError> {
     let job = job.clone();
     let limit = shared.limits.max_result_bytes;
+    let shutdown = shared.shutdown.clone();
     shared
         .database
         .call(move |store| {
+            if shutdown.is_cancelled() {
+                store.service_stop(
+                    &job.namespace,
+                    &job.run_id,
+                    StopCause::Interrupted,
+                    ServiceClock::Wall,
+                )?;
+            }
             store
                 .service_finish(
                     &job,
                     &Candidate {
                         state: TerminalState::Failed,
                         details: json!({"error": reason}),
-                        cleanup: CleanupState::Settled,
-                        disposition: SessionDisposition::NotApplicable,
+                        cleanup,
+                        disposition: if cleanup == CleanupState::Settled {
+                            SessionDisposition::NotApplicable
+                        } else {
+                            SessionDisposition::Uncertain
+                        },
                     },
                     ServiceClock::Wall,
                     limit,
@@ -1677,6 +1861,51 @@ async fn finish_prelaunch(
                 .map_err(Into::into)
         })
         .await
+}
+
+async fn finish_journaled_prelaunch(
+    shared: &Shared,
+    job: &ClaimedJob,
+    reason: &'static str,
+    journal: &Option<JournalKey>,
+) -> Result<(), ServiceError> {
+    finish_prelaunch(shared, job, reason).await?;
+    if let Some(key) = journal {
+        shared.database.journal_settle(key.clone()).await?;
+    }
+    Ok(())
+}
+
+async fn job_stopped(shared: &Shared, job: &ClaimedJob) -> Result<bool, ServiceError> {
+    let job = job.clone();
+    shared
+        .database
+        .call(move |store| {
+            store
+                .service_status(&job, ServiceClock::Wall)
+                .map(|status| status.is_some())
+                .map_err(Into::into)
+        })
+        .await
+}
+
+async fn preflight_backend(
+    shared: &Shared,
+    job: &ClaimedJob,
+    backend: &dyn ExecutionBackend,
+) -> Result<bool, ServiceError> {
+    let cancellation = shared.shutdown.child_token();
+    let preflight = backend.preflight(cancellation.clone());
+    tokio::pin!(preflight);
+    loop {
+        tokio::select! {
+            result = &mut preflight => return Ok(result.is_ok()),
+            _ = shared.shutdown.cancelled() => { cancellation.cancel(); return Ok(false); },
+            _ = tokio::time::sleep(shared.limits.poll_interval) => {
+                if job_stopped(shared, job).await? { cancellation.cancel(); return Ok(false); }
+            }
+        }
+    }
 }
 
 async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), ServiceError> {
@@ -1706,6 +1935,15 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
         || manifest.state_realm != job.state_realm
         || profile.state_realm != job.state_realm
         || profile.backend.state_realm() != job.state_realm
+        || manifest.independent_new_sessions != profile.backend.independent_new_sessions()
+        || (profile.backend.requires_workspace() && manifest.workspace.is_none())
+        || manifest.workspace.as_ref().is_some_and(|workspace| {
+            shared
+                .workspaces
+                .as_ref()
+                .and_then(|registry| registry.get(&job.workspace_id))
+                != Some(workspace)
+        })
         || (manifest.resume != job.native_id.is_some())
     {
         return finish_prelaunch(shared, &job, "execution_snapshot_unavailable").await;
@@ -1728,6 +1966,158 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
             })
             .await?;
     }
+    if job_stopped(shared, &job).await?
+        || !preflight_backend(shared, &job, profile.backend.as_ref()).await?
+    {
+        return finish_prelaunch(shared, &job, "backend_compatibility_unavailable").await;
+    }
+    let journal_key = manifest.workspace.as_ref().map(|_| JournalKey {
+        owner_id: job.namespace.owner_id.clone(),
+        client_id: job.namespace.client_id.clone(),
+        run_id: job.run_id.clone(),
+        state_realm: job.state_realm.clone(),
+    });
+    if let Some(key) = &journal_key
+        && !shared.database.journal_start(key.clone()).await?
+    {
+        return finish_prelaunch(shared, &job, "workspace_journal_capacity").await;
+    }
+    let working_directory = if let Some(workspace) = &manifest.workspace {
+        let lookup_job = job.clone();
+        let lookup_plan = workspace.clone();
+        let (bound, materialization_intent) = shared
+            .database
+            .call(move |store| {
+                store
+                    .workspace_binding(&lookup_job, &lookup_plan)
+                    .map_err(Into::into)
+            })
+            .await?;
+        if bound.is_none() && materialization_intent {
+            return finish_journaled_prelaunch(
+                shared,
+                &job,
+                "workspace_binding_uncertain",
+                &journal_key,
+            )
+            .await;
+        }
+        if job_stopped(shared, &job).await? {
+            return finish_journaled_prelaunch(shared, &job, "workspace_not_started", &journal_key)
+                .await;
+        }
+        let creating_managed = bound.is_none() && workspace.managed_root().is_some();
+        if creating_managed {
+            let intent_job = job.clone();
+            shared
+                .database
+                .call(move |store| {
+                    store
+                        .workspace_mark_materialization(&intent_job)
+                        .map_err(Into::into)
+                })
+                .await?;
+        }
+        if job_stopped(shared, &job).await? {
+            if creating_managed {
+                let clear_job = job.clone();
+                shared
+                    .database
+                    .call(move |store| {
+                        store
+                            .workspace_clear_uncreated(&clear_job)
+                            .map_err(Into::into)
+                    })
+                    .await?;
+            }
+            return finish_journaled_prelaunch(shared, &job, "workspace_not_started", &journal_key)
+                .await;
+        }
+        let plan = workspace.clone();
+        let session_id = job.session_id.clone();
+        let mut materialization =
+            tokio::task::spawn_blocking(move || plan.materialize(&session_id, bound));
+        let materialized = loop {
+            tokio::select! {
+                result = &mut materialization => break result,
+                _ = shared.shutdown.cancelled() => {
+                    return finish_prelaunch_with_cleanup(shared, &job, "workspace_materialization_uncertain", CleanupState::Uncertain).await;
+                }
+                _ = tokio::time::sleep(shared.limits.poll_interval) => {
+                    if job_stopped(shared, &job).await? {
+                        return finish_prelaunch_with_cleanup(shared, &job, "workspace_materialization_uncertain", CleanupState::Uncertain).await;
+                    }
+                }
+            }
+        };
+        let directory = match materialized {
+            Ok(Ok(directory)) => directory,
+            Ok(Err(crate::workspace::MaterializeError::NotCreated)) if creating_managed => {
+                let clear_job = job.clone();
+                shared
+                    .database
+                    .call(move |store| {
+                        store
+                            .workspace_clear_uncreated(&clear_job)
+                            .map_err(Into::into)
+                    })
+                    .await?;
+                return finish_journaled_prelaunch(
+                    shared,
+                    &job,
+                    "workspace_unavailable",
+                    &journal_key,
+                )
+                .await;
+            }
+            Ok(Err(crate::workspace::MaterializeError::NotCreated)) => {
+                return finish_journaled_prelaunch(
+                    shared,
+                    &job,
+                    "workspace_unavailable",
+                    &journal_key,
+                )
+                .await;
+            }
+            Ok(Err(crate::workspace::MaterializeError::Uncertain)) | Err(_) => {
+                return finish_prelaunch_with_cleanup(
+                    shared,
+                    &job,
+                    "workspace_materialization_uncertain",
+                    CleanupState::Uncertain,
+                )
+                .await;
+            }
+        };
+        let save_job = job.clone();
+        let save_plan = workspace.clone();
+        let save_directory = directory.clone();
+        if shared
+            .database
+            .call(move |store| {
+                store
+                    .workspace_store_binding(&save_job, &save_plan, &save_directory)
+                    .map_err(Into::into)
+            })
+            .await
+            .is_err()
+        {
+            return finish_prelaunch_with_cleanup(
+                shared,
+                &job,
+                "workspace_binding_uncertain",
+                CleanupState::Uncertain,
+            )
+            .await;
+        }
+        Some(WorkingDirectory {
+            path: directory.path,
+            device: directory.device,
+            inode: directory.inode,
+        })
+    } else {
+        None
+    };
     let (prompt, requires_skill_read) = if manifest.version == 2 {
         let prepare_job = job.clone();
         let input = manifest.prompt.clone();
@@ -1759,7 +2149,13 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
                 | StorageError::InvalidInput(_)
                 | StorageError::Database(_),
             )) => {
-                return finish_prelaunch(shared, &job, "prompt_snapshot_unavailable").await;
+                return finish_journaled_prelaunch(
+                    shared,
+                    &job,
+                    "prompt_snapshot_unavailable",
+                    &journal_key,
+                )
+                .await;
             }
             Err(error) => return Err(error),
         }
@@ -1802,16 +2198,29 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
         })
         .await;
     match launch {
-        Ok(false) => return Ok(()),
+        Ok(false) => {
+            if let Some(key) = journal_key {
+                shared.database.journal_settle(key).await?;
+            }
+            return Ok(());
+        }
         Ok(true) => {}
         Err(ServiceError::Access(AccessError::Forbidden | AccessError::Unauthenticated)) => {
-            return finish_prelaunch(shared, &job, "launch_not_authorized").await;
+            finish_prelaunch(shared, &job, "launch_not_authorized").await?;
+            if let Some(key) = journal_key {
+                shared.database.journal_settle(key).await?;
+            }
+            return Ok(());
         }
         Err(
             ServiceError::Storage(StorageError::SkillUnavailable)
             | ServiceError::Access(AccessError::Storage(StorageError::SkillUnavailable)),
         ) => {
-            return finish_prelaunch(shared, &job, "skill_not_authorized").await;
+            finish_prelaunch(shared, &job, "skill_not_authorized").await?;
+            if let Some(key) = journal_key {
+                shared.database.journal_settle(key).await?;
+            }
+            return Ok(());
         }
         Err(error) => return Err(error),
     }
@@ -1825,6 +2234,9 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
                     .map_err(Into::into)
             })
             .await?;
+        if let Some(key) = journal_key {
+            shared.database.journal_settle(key).await?;
+        }
         return Ok(());
     }
     let session = match &job.native_id {
@@ -1839,6 +2251,7 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
         run_id: job.run_id.clone(),
         attempt_id: job.attempt_id.clone(),
         workspace_id: job.workspace_id.clone(),
+        working_directory,
         session,
         prompt,
     };
@@ -1868,6 +2281,9 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
                     .map_err(Into::into)
             })
             .await?;
+        if let Some(key) = journal_key {
+            shared.database.journal_settle(key).await?;
+        }
         return Ok(());
     }
     let _active = ActiveExecution {
@@ -1895,6 +2311,9 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
                     .map_err(Into::into)
             })
             .await?;
+        if let Some(key) = journal_key {
+            shared.database.journal_settle(key).await?;
+        }
         return Ok(());
     }
     let event_failed = Arc::new(AtomicBool::new(false));
@@ -2075,6 +2494,9 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
                     .map_err(Into::into)
             })
             .await?;
+        if let Some(key) = journal_key {
+            shared.database.journal_settle(key).await?;
+        }
         return Ok(());
     }
     let events_ok = events_ok && !event_failed.load(Ordering::Acquire);
@@ -2096,12 +2518,39 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
             })
             .await?;
     }
+    if events_ok
+        && let Some(result) = outcome.as_ref()
+        && let Some(candidate) =
+            proven_unstarted_candidate(result, &job, shared.limits.max_result_bytes)
+    {
+        let unstarted_job = job.clone();
+        let limit = shared.limits.max_result_bytes;
+        shared
+            .database
+            .call(move |store| {
+                store
+                    .service_finish_proven_unstarted(
+                        &unstarted_job,
+                        &candidate,
+                        ServiceClock::Wall,
+                        limit,
+                    )
+                    .map_err(Into::into)
+            })
+            .await?;
+        if let Some(key) = journal_key {
+            shared.database.journal_settle(key).await?;
+        }
+        shared.wake.notify_waiters();
+        signal_change(shared);
+        return Ok(());
+    }
     let backend_unsettled = outcome.is_none();
     if backend_unsettled {
         fail_service(shared);
     }
     let candidate = match outcome {
-        Some(result) if events_ok => {
+        Some(result) if events_ok && result.dispatch == DispatchStatus::StartedOrUnknown => {
             let session_matches =
                 if result.session.as_ref().is_some_and(|native| {
                     !session_within_limit(native, shared.limits.max_event_bytes)
@@ -2218,6 +2667,8 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
         }
         _ => uncertain_candidate("backend_or_event_failure"),
     };
+    let journal_safe = candidate.cleanup == CleanupState::Settled
+        && candidate.disposition == SessionDisposition::Reusable;
     let limit = shared.limits.max_result_bytes;
     shared
         .database
@@ -2227,6 +2678,9 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
                 .map_err(Into::into)
         })
         .await?;
+    if journal_safe && let Some(key) = journal_key {
+        shared.database.journal_settle(key).await?;
+    }
     shared.wake.notify_waiters();
     signal_change(shared);
     Ok(())
@@ -2289,6 +2743,50 @@ fn result_within_limit(result: &ExecutionResult, limit: usize) -> bool {
         }
     }
     size <= limit
+}
+
+fn proven_unstarted_candidate(
+    result: &ExecutionResult,
+    job: &ClaimedJob,
+    limit: usize,
+) -> Option<Candidate> {
+    if result.dispatch != DispatchStatus::ProvenUnstarted
+        || result.cleanup != CleanupState::Settled
+        || result.session_disposition != SessionDisposition::NotApplicable
+        || result.session.is_some()
+        || result.run.id != job.run_id
+        || result.attempt.id != job.attempt_id
+        || result.attempt.run_id != job.run_id
+        || result.metadata != job.metadata
+        || result.run.metadata != job.metadata
+        || result.attempt.metadata != job.metadata
+        || !result_within_limit(result, limit)
+    {
+        return None;
+    }
+    let (state, outcome) = match &result.outcome {
+        ExecutionOutcome::Failed(error) => {
+            (TerminalState::Failed, json!({"error":format!("{error:?}")}))
+        }
+        ExecutionOutcome::Cancelled => (TerminalState::Cancelled, Value::Null),
+        ExecutionOutcome::Succeeded { .. } => return None,
+    };
+    let warnings: Vec<_> = result
+        .warnings
+        .iter()
+        .map(|warning| json!({"code":warning.code,"message":warning.message}))
+        .collect();
+    let observation = match result.warning_observation {
+        WarningObservation::Complete => "complete",
+        WarningObservation::Partial => "partial",
+        WarningObservation::Unavailable => "unavailable",
+    };
+    Some(Candidate {
+        state,
+        details: json!({"outcome":outcome,"warnings":warnings,"warning_observation":observation}),
+        cleanup: CleanupState::Settled,
+        disposition: SessionDisposition::NotApplicable,
+    })
 }
 
 fn uncertain_candidate(reason: &'static str) -> Candidate {

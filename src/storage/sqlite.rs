@@ -1,6 +1,6 @@
 use std::{path::Path, time::Duration};
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 use crate::core::SessionRef;
 
@@ -11,7 +11,7 @@ use super::{
     },
 };
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const APPLICATION_ID: i64 = 0x41525353;
 const INITIAL_MIGRATION: &str = include_str!("../../migrations/0001_initial.sql");
 const RUN_SERVICE_MIGRATION: &str = include_str!("../../migrations/0002_run_service.sql");
@@ -19,6 +19,7 @@ const SKILL_REGISTRY_MIGRATION: &str = include_str!("../../migrations/0003_skill
 const COMPLETION_DELIVERY_MIGRATION: &str =
     include_str!("../../migrations/0004_completion_delivery.sql");
 const RUN_RETENTION_MIGRATION: &str = include_str!("../../migrations/0005_run_retention.sql");
+const WORKSPACE_MIGRATION: &str = include_str!("../../migrations/0006_workspace_coordination.sql");
 
 /// Owns a synchronous SQLite connection; async callers must avoid blocking their runtime.
 pub struct SqliteStore {
@@ -29,6 +30,12 @@ impl SqliteStore {
     /// Opens a file-backed store and applies supported migrations atomically.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         Self::initialize(Connection::open(path)?)
+    }
+
+    /// Opens a database without migration or writes for ownership-journal verification.
+    pub(crate) fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self { connection })
     }
 
     /// Opens an isolated in-memory store.
@@ -59,6 +66,7 @@ impl SqliteStore {
                 transaction.execute_batch(SKILL_REGISTRY_MIGRATION)?;
                 transaction.execute_batch(COMPLETION_DELIVERY_MIGRATION)?;
                 transaction.execute_batch(RUN_RETENTION_MIGRATION)?;
+                transaction.execute_batch(WORKSPACE_MIGRATION)?;
                 transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
@@ -67,21 +75,29 @@ impl SqliteStore {
                 transaction.execute_batch(SKILL_REGISTRY_MIGRATION)?;
                 transaction.execute_batch(COMPLETION_DELIVERY_MIGRATION)?;
                 transaction.execute_batch(RUN_RETENTION_MIGRATION)?;
+                transaction.execute_batch(WORKSPACE_MIGRATION)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             (APPLICATION_ID, 2) => {
                 transaction.execute_batch(SKILL_REGISTRY_MIGRATION)?;
                 transaction.execute_batch(COMPLETION_DELIVERY_MIGRATION)?;
                 transaction.execute_batch(RUN_RETENTION_MIGRATION)?;
+                transaction.execute_batch(WORKSPACE_MIGRATION)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             (APPLICATION_ID, 3) => {
                 transaction.execute_batch(COMPLETION_DELIVERY_MIGRATION)?;
                 transaction.execute_batch(RUN_RETENTION_MIGRATION)?;
+                transaction.execute_batch(WORKSPACE_MIGRATION)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             (APPLICATION_ID, 4) => {
                 transaction.execute_batch(RUN_RETENTION_MIGRATION)?;
+                transaction.execute_batch(WORKSPACE_MIGRATION)?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            }
+            (APPLICATION_ID, 5) => {
+                transaction.execute_batch(WORKSPACE_MIGRATION)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             (APPLICATION_ID, SCHEMA_VERSION) => {}
@@ -246,6 +262,82 @@ impl SqliteStore {
             }
         }
         transaction.commit()?;
+        Ok(())
+    }
+
+    /// Binds all independently launched, unidentified terminal sessions in one realm without releasing reservations.
+    /// The trusted caller must stop the service and independently verify every run-to-native-ID mapping and cleanup before using this method.
+    /// A missing or unverifiable mapping must remain quarantined; database state alone is not proof of external execution or cleanup.
+    pub fn bind_independent_sessions_for_settlement(
+        &mut self,
+        bindings: &[(Namespace, String, SessionRef)],
+    ) -> Result<(), StorageError> {
+        let (_, _, first) = bindings
+            .first()
+            .ok_or(StorageError::InvalidInput("session bindings"))?;
+        nonempty(&first.runtime, "runtime")?;
+        nonempty(&first.state_realm, "state_realm")?;
+        for (index, (namespace, session_id, native)) in bindings.iter().enumerate() {
+            validate_namespace(namespace)?;
+            nonempty(session_id, "session_id")?;
+            nonempty(&native.native_id, "native_id")?;
+            if native.runtime != first.runtime || native.state_realm != first.state_realm {
+                return Err(StorageError::InvalidInput("native session realm"));
+            }
+            if bindings[..index]
+                .iter()
+                .any(|(other_namespace, other_session, other_native)| {
+                    (other_namespace == namespace && other_session == session_id)
+                        || other_native.native_id == native.native_id
+                })
+            {
+                return Err(StorageError::InvalidInput("duplicate session binding"));
+            }
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM service_jobs j JOIN runs r USING(owner_id,client_id,run_id) WHERE r.runtime=?1 AND j.state_realm=?2 AND r.state IN ('preparing','running','validating'))",
+            params![first.runtime, first.state_realm],
+            |row| row.get(0),
+        )?;
+        if active {
+            return Err(StorageError::SessionBusy);
+        }
+        let unresolved: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM sessions s LEFT JOIN service_jobs j ON j.owner_id=s.owner_id AND j.client_id=s.client_id AND j.run_id=s.reserved_run_id LEFT JOIN attempts a ON a.owner_id=j.owner_id AND a.client_id=j.client_id AND a.run_id=j.run_id AND a.attempt_id=j.attempt_id LEFT JOIN runs r ON r.owner_id=s.owner_id AND r.client_id=s.client_id AND r.run_id=s.reserved_run_id WHERE s.runtime=?1 AND s.state_realm=?2 AND s.native_id IS NULL AND s.reserved_run_id IS NOT NULL AND (j.queue_id IS NULL OR j.claim_token IS NOT NULL OR a.spawn_intent=1 OR (s.cleanup='uncertain' AND r.state IN ('succeeded','failed','cancelled','timed_out','interrupted')))",
+            params![first.runtime, first.state_realm],
+            |row| row.get(0),
+        )?;
+        if usize::try_from(unresolved).ok() != Some(bindings.len()) {
+            return Err(StorageError::SessionBusy);
+        }
+        for (namespace, session_id, native) in bindings {
+            let eligible: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions s JOIN service_jobs j ON j.owner_id=s.owner_id AND j.client_id=s.client_id AND j.run_id=s.reserved_run_id JOIN attempts a ON a.owner_id=j.owner_id AND a.client_id=j.client_id AND a.run_id=j.run_id AND a.attempt_id=j.attempt_id JOIN runs r ON r.owner_id=s.owner_id AND r.client_id=s.client_id AND r.run_id=s.reserved_run_id WHERE s.owner_id=?1 AND s.client_id=?2 AND s.session_id=?3 AND s.runtime=?4 AND s.state_realm=?5 AND s.native_id IS NULL AND s.cleanup IN ('settled','uncertain') AND s.disposition='uncertain' AND j.independent_new_sessions=1 AND a.spawn_intent=1 AND r.state IN ('succeeded','failed','cancelled','timed_out','interrupted'))",
+                params![namespace.owner_id, namespace.client_id, session_id, native.runtime, native.state_realm],
+                |row| row.get(0),
+            )?;
+            if !eligible {
+                return Err(StorageError::InvalidState);
+            }
+            let duplicate: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE runtime=?1 AND state_realm=?2 AND native_id=?3)",
+                params![native.runtime, native.state_realm, native.native_id],
+                |row| row.get(0),
+            )?;
+            if duplicate {
+                return Err(StorageError::InvalidState);
+            }
+            if tx.execute(
+                "UPDATE sessions SET native_id=?1 WHERE owner_id=?2 AND client_id=?3 AND session_id=?4 AND native_id IS NULL AND reserved_run_id IS NOT NULL",
+                params![native.native_id, namespace.owner_id, namespace.client_id, session_id],
+            )? != 1 {
+                return Err(StorageError::InvalidState);
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 }

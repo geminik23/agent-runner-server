@@ -11,6 +11,7 @@ pub(crate) mod service;
 pub(crate) mod skills;
 mod sqlite;
 mod types;
+pub(crate) mod workspaces;
 
 #[cfg(test)]
 mod delivery_tests;

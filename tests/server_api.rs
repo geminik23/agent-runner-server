@@ -336,6 +336,27 @@ impl Fixture {
         assert_eq!(r.status(), 202);
         session
     }
+    async fn wait_native_binding(&self, session_id: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let db = rusqlite::Connection::open(&self.path).unwrap();
+                let native: Option<String> = db
+                    .query_row(
+                        "SELECT native_id FROM sessions WHERE session_id=?1",
+                        [session_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                if native.is_some() {
+                    break;
+                }
+                drop(db);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("native session binding was not recorded");
+    }
     async fn wait_terminal(&self, id: &str) -> Value {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -495,6 +516,8 @@ async fn skill_snapshot_is_pinned_before_ack_and_replay_ignores_changed_defaults
     })
     .await
     .unwrap();
+    f.wait_native_binding(blocker["session_id"].as_str().unwrap())
+        .await;
     let request = start("snapshot-queued");
     let receipt = payload(f.post("/v1/runs", &request, &admin).send().await.unwrap()).await;
     let id = receipt["run_id"].as_str().unwrap().to_owned();
@@ -653,14 +676,9 @@ async fn revoked_queued_skill_is_not_launched_but_existing_replay_survives() {
     );
     let mut blocker = start("revoke-blocker");
     blocker["skills"] = json!([]);
-    assert_eq!(
-        f.post("/v1/runs", &blocker, &admin)
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        202
-    );
+    let response = f.post("/v1/runs", &blocker, &admin).send().await.unwrap();
+    assert_eq!(response.status(), 202);
+    let blocker_receipt = payload(response).await;
     tokio::time::timeout(Duration::from_secs(2), async {
         while f.backend.captured_inputs().is_empty() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -668,6 +686,8 @@ async fn revoked_queued_skill_is_not_launched_but_existing_replay_survives() {
     })
     .await
     .unwrap();
+    f.wait_native_binding(blocker_receipt["session_id"].as_str().unwrap())
+        .await;
     let request = start("revoke-target");
     let receipt = payload(f.post("/v1/runs", &request, &admin).send().await.unwrap()).await;
     assert_eq!(
@@ -2406,7 +2426,8 @@ async fn revocation_before_dispatch_blocks_queued_backend_execution() {
         .send()
         .await
         .unwrap();
-    let first_id = payload(first).await["run_id"].as_str().unwrap().to_owned();
+    let first_receipt = payload(first).await;
+    let first_id = first_receipt["run_id"].as_str().unwrap().to_owned();
     tokio::time::timeout(Duration::from_secs(2), async {
         while f.backend.captured_inputs().is_empty() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2414,6 +2435,8 @@ async fn revocation_before_dispatch_blocks_queued_backend_execution() {
     })
     .await
     .unwrap();
+    f.wait_native_binding(first_receipt["session_id"].as_str().unwrap())
+        .await;
     let second = f
         .tool("agents_start", start("queued-before-revocation"), &full)
         .await;
@@ -2853,6 +2876,42 @@ async fn registered_native_session_resume_is_canonical_and_namespace_scoped() {
     assert_eq!(replay.status(), 200);
     assert_eq!(payload(replay).await["run_id"], resumed);
     assert_eq!(f.backend.captured_inputs().len(), 2);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn unregistered_session_references_fail_before_any_backend_execution() {
+    let f = Fixture::new(DummyScenario::Success).await;
+    let full = token("full", 7);
+    for (key, selection) in [
+        (
+            "missing-server-session",
+            json!({"mode":"resume","session_id":"missing-server-id"}),
+        ),
+        (
+            "missing-native-session",
+            json!({"mode":"resume_native","native_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}),
+        ),
+    ] {
+        let mut request = start(key);
+        request["session"] = selection;
+        let response = f.post("/v1/runs", &request, &full).send().await.unwrap();
+        assert_eq!(response.status(), 404);
+        assert_eq!(payload(response).await["error"]["code"], "not_found");
+        let response = f.tool("agents_start", request, &full).await;
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["structuredContent"]["error"]["code"],
+            "not_found"
+        );
+    }
+    assert!(f.backend.captured_inputs().is_empty());
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    let runs: i64 = db
+        .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(runs, 0);
+    drop(db);
     f.finish().await;
 }
 

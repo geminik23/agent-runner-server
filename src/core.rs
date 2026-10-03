@@ -42,6 +42,14 @@ pub enum SessionRequest {
     Resume(SessionRef),
 }
 
+/// Identifies the pinned directory that the backend must open and verify before execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkingDirectory {
+    pub path: std::path::PathBuf,
+    pub device: u64,
+    pub inode: u64,
+}
+
 /// Supplies one attempt's input to a backend.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionRequest {
@@ -49,6 +57,8 @@ pub struct ExecutionRequest {
     pub attempt_id: String,
     /// The approved workspace identifier, resolved by the trusted backend profile.
     pub workspace_id: String,
+    /// The pinned working directory, when the trusted profile requires one.
+    pub working_directory: Option<WorkingDirectory>,
     pub session: SessionRequest,
     pub prompt: String,
 }
@@ -123,6 +133,13 @@ pub enum ExecutionOutcome {
     Cancelled,
 }
 
+/// Reports whether a backend can prove that no target execution began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DispatchStatus {
+    ProvenUnstarted,
+    StartedOrUnknown,
+}
+
 /// Keeps provenance on the run, attempt, and outcome returned by a backend.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionResult {
@@ -132,6 +149,7 @@ pub struct ExecutionResult {
     pub session: Option<SessionRef>,
     pub warnings: Vec<ExecutionWarning>,
     pub warning_observation: WarningObservation,
+    pub dispatch: DispatchStatus,
     pub cleanup: CleanupState,
     pub session_disposition: SessionDisposition,
     pub outcome: ExecutionOutcome,
@@ -155,6 +173,49 @@ pub trait ExecutionBackend: Send + Sync {
 
     /// Identifies the actual native state namespace used by this backend instance.
     fn state_realm(&self) -> &str;
+
+    /// Identifies a native state directory that must be owned by one runner database.
+    fn state_directory(&self) -> Option<&std::path::Path> {
+        None
+    }
+
+    /// Returns the stable per-account root used to anchor native state ownership.
+    fn state_owner_root(&self) -> Option<&std::path::Path> {
+        None
+    }
+
+    /// Declares verified isolation for new native sessions in the same state realm.
+    fn independent_new_sessions(&self) -> bool {
+        false
+    }
+
+    /// Declares that this profile was verified to avoid workspace writes.
+    fn supports_shared_read(&self) -> bool {
+        false
+    }
+
+    /// Declares that this backend requires a pinned working directory.
+    fn requires_workspace(&self) -> bool {
+        false
+    }
+
+    /// Reports the minimum durable event capacity required for one invocation.
+    fn minimum_events(&self) -> usize {
+        3
+    }
+
+    /// Reports the time required for backend cleanup after cancellation.
+    fn cleanup_budget(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// Checks compatibility before launch intent without receiving the request prompt.
+    fn preflight<'a>(
+        &'a self,
+        _cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
 
     fn execute<'a>(
         &'a self,

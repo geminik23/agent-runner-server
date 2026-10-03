@@ -47,6 +47,8 @@ pub(crate) struct ServiceAdmission {
     pub profile_revision: String,
     pub workspace_id: String,
     pub state_realm: String,
+    pub workspace: Option<crate::workspace::WorkspacePlan>,
+    pub independent_new_sessions: bool,
     pub resume_session_id: Option<String>,
     pub resume_native_id: Option<String>,
     pub deadline_ms: i64,
@@ -231,8 +233,8 @@ impl SqliteStore {
             (None, None) => None,
         };
         let quarantined: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions s LEFT JOIN service_jobs j ON j.owner_id = s.owner_id AND j.client_id = s.client_id AND j.run_id = s.reserved_run_id LEFT JOIN attempts a ON a.owner_id = j.owner_id AND a.client_id = j.client_id AND a.run_id = j.run_id AND a.attempt_id = j.attempt_id LEFT JOIN runs r ON r.owner_id = s.owner_id AND r.client_id = s.client_id AND r.run_id = s.reserved_run_id WHERE s.runtime = ?1 AND s.state_realm = ?2 AND s.reserved_run_id IS NOT NULL AND ((s.native_id IS NULL AND (j.queue_id IS NULL OR a.spawn_intent = 1)) OR (?3 AND s.native_id IS NOT NULL AND r.state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted'))))",
-            params![admission.metadata.runtime, admission.state_realm, resume_session_id.is_none()],
+            "SELECT EXISTS(SELECT 1 FROM sessions s LEFT JOIN service_jobs j ON j.owner_id = s.owner_id AND j.client_id = s.client_id AND j.run_id = s.reserved_run_id LEFT JOIN attempts a ON a.owner_id = j.owner_id AND a.client_id = j.client_id AND a.run_id = j.run_id AND a.attempt_id = j.attempt_id LEFT JOIN runs r ON r.owner_id = s.owner_id AND r.client_id = s.client_id AND r.run_id = s.reserved_run_id WHERE s.runtime = ?1 AND s.state_realm = ?2 AND s.reserved_run_id IS NOT NULL AND ((s.native_id IS NULL AND (j.queue_id IS NULL OR a.spawn_intent = 1 OR (s.cleanup='uncertain' AND r.state IN ('succeeded','failed','cancelled','timed_out','interrupted'))) AND NOT (?4 AND COALESCE(j.independent_new_sessions,0)=1 AND r.state IN ('queued','preparing','running','validating') AND j.stop_cause IS NULL)) OR (?3 AND s.native_id IS NOT NULL AND r.state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted'))))",
+            params![admission.metadata.runtime, admission.state_realm, resume_session_id.is_none(), admission.independent_new_sessions],
             |row| row.get(0),
         )?;
         if quarantined {
@@ -291,6 +293,14 @@ impl SqliteStore {
             "INSERT INTO runs (owner_id, client_id, run_id, session_id, idempotency_key, normalized_request, manifest, runtime, synthetic, scenario, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'queued')",
             params![ns.owner_id, ns.client_id, run_id, session_id, admission.idempotency_key, admission.normalized_request, admission.manifest, admission.metadata.runtime, admission.metadata.synthetic, admission.metadata.scenario],
         )?;
+        super::workspaces::pin(
+            &tx,
+            ns,
+            &run_id,
+            &session_id,
+            resume_session_id.is_some(),
+            admission.workspace.as_ref(),
+        )?;
         if let Some(retention_ms) = admission.retention_ms {
             if retention_ms <= 0 {
                 return Err(StorageError::InvalidInput("retention"));
@@ -331,8 +341,8 @@ impl SqliteStore {
             return Err(StorageError::SessionBusy);
         }
         tx.execute(
-            "INSERT INTO service_jobs (owner_id, client_id, run_id, attempt_id, credential_id, credential_generation, profile_id, workspace_id, state_realm, deadline_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![ns.owner_id, ns.client_id, run_id, attempt_id, admission.credential_id, admission.credential_generation, admission.profile_id, admission.workspace_id, admission.state_realm, admission.deadline_ms],
+            "INSERT INTO service_jobs (owner_id, client_id, run_id, attempt_id, credential_id, credential_generation, profile_id, workspace_id, state_realm, deadline_ms, independent_new_sessions) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![ns.owner_id, ns.client_id, run_id, attempt_id, admission.credential_id, admission.credential_generation, admission.profile_id, admission.workspace_id, admission.state_realm, admission.deadline_ms, admission.independent_new_sessions],
         )?;
         tx.execute(
             "INSERT INTO events (owner_id, client_id, run_id, event_id, sequence, kind, payload) VALUES (?1, ?2, ?3, ?4, 0, 'run.queued', ?5)",
@@ -368,10 +378,48 @@ impl SqliteStore {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        expire_waiting(&tx, now.into().read()?)?;
+        let now_ms = now.into().read()?;
+        expire_waiting(&tx, now_ms)?;
         let candidate = tx.query_row(
-            "SELECT j.owner_id, j.client_id, j.run_id, j.attempt_id, r.session_id, j.credential_id, j.profile_id, j.workspace_id, j.state_realm, j.deadline_ms, r.manifest, r.runtime, r.synthetic, r.scenario, s.native_id, j.credential_generation FROM service_jobs j JOIN runs r USING (owner_id, client_id, run_id) JOIN sessions s ON s.owner_id = r.owner_id AND s.client_id = r.client_id AND s.session_id = r.session_id WHERE r.state = 'queued' AND j.claim_token IS NULL AND j.stop_cause IS NULL AND NOT EXISTS (SELECT 1 FROM sessions other LEFT JOIN service_jobs oj ON oj.owner_id = other.owner_id AND oj.client_id = other.client_id AND oj.run_id = other.reserved_run_id LEFT JOIN attempts oa ON oa.owner_id = oj.owner_id AND oa.client_id = oj.client_id AND oa.run_id = oj.run_id AND oa.attempt_id = oj.attempt_id WHERE other.runtime = r.runtime AND other.state_realm = j.state_realm AND other.reserved_run_id IS NOT NULL AND NOT (other.owner_id = j.owner_id AND other.client_id = j.client_id AND other.reserved_run_id = j.run_id) AND ((other.native_id IS NULL AND (oj.queue_id IS NULL OR oj.claim_token IS NOT NULL OR oa.spawn_intent = 1)) OR (s.native_id IS NULL AND other.native_id IS NOT NULL))) AND NOT EXISTS (SELECT 1 FROM service_jobs blocked JOIN runs br USING (owner_id, client_id, run_id) JOIN sessions bs ON bs.owner_id = br.owner_id AND bs.client_id = br.client_id AND bs.session_id = br.session_id WHERE blocked.workspace_id = j.workspace_id AND bs.reserved_run_id = br.run_id AND bs.cleanup = 'uncertain' AND br.state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted')) ORDER BY j.queue_id LIMIT 1",
-            [],
+            "SELECT j.owner_id, j.client_id, j.run_id, j.attempt_id, r.session_id, j.credential_id, j.profile_id, j.workspace_id, j.state_realm, j.deadline_ms, r.manifest, r.runtime, r.synthetic, r.scenario, s.native_id, j.credential_generation
+             FROM service_jobs j JOIN runs r USING (owner_id, client_id, run_id)
+             JOIN sessions s ON s.owner_id=r.owner_id AND s.client_id=r.client_id AND s.session_id=r.session_id
+             LEFT JOIN run_workspaces wanted ON wanted.owner_id=j.owner_id AND wanted.client_id=j.client_id AND wanted.run_id=j.run_id
+             WHERE r.state='queued' AND j.claim_token IS NULL AND j.stop_cause IS NULL
+             AND NOT EXISTS (
+                 SELECT 1 FROM sessions other
+                 LEFT JOIN service_jobs oj ON oj.owner_id=other.owner_id AND oj.client_id=other.client_id AND oj.run_id=other.reserved_run_id
+                 LEFT JOIN attempts oa ON oa.owner_id=oj.owner_id AND oa.client_id=oj.client_id AND oa.run_id=oj.run_id AND oa.attempt_id=oj.attempt_id
+                 LEFT JOIN runs other_run ON other_run.owner_id=oj.owner_id AND other_run.client_id=oj.client_id AND other_run.run_id=oj.run_id
+                 WHERE other.runtime=r.runtime AND other.state_realm=j.state_realm AND other.reserved_run_id IS NOT NULL
+                 AND NOT (other.owner_id=j.owner_id AND other.client_id=j.client_id AND other.reserved_run_id=j.run_id)
+                 AND ((other.native_id IS NULL AND (oj.queue_id IS NULL OR oj.claim_token IS NOT NULL OR oa.spawn_intent=1 OR (other.cleanup='uncertain' AND other_run.state IN ('succeeded','failed','cancelled','timed_out','interrupted')))) OR (s.native_id IS NULL AND other.native_id IS NOT NULL))
+                 AND NOT (j.independent_new_sessions=1 AND COALESCE(oj.independent_new_sessions,0)=1 AND other_run.state IN ('queued','preparing','running','validating') AND oj.stop_cause IS NULL)
+             )
+             AND NOT EXISTS (
+                 SELECT 1 FROM service_jobs blocked JOIN runs br USING (owner_id,client_id,run_id)
+                 JOIN sessions bs ON bs.owner_id=br.owner_id AND bs.client_id=br.client_id AND bs.session_id=br.session_id
+                 WHERE blocked.workspace_id=j.workspace_id AND bs.reserved_run_id=br.run_id AND bs.cleanup='uncertain'
+                 AND br.state IN ('succeeded','failed','cancelled','timed_out','interrupted')
+                 AND (wanted.resource_path IS NULL OR NOT EXISTS(SELECT 1 FROM run_workspaces bw WHERE bw.owner_id=blocked.owner_id AND bw.client_id=blocked.client_id AND bw.run_id=blocked.run_id))
+             )
+             AND NOT EXISTS (
+                 SELECT 1 FROM run_workspaces held
+                 WHERE wanted.resource_path IS NOT NULL AND held.held=1
+                 AND (held.resource_path=wanted.resource_path OR substr(held.resource_path,1,length(wanted.resource_path)+1)=wanted.resource_path||'/' OR substr(wanted.resource_path,1,length(held.resource_path)+1)=held.resource_path||'/'
+                   OR EXISTS(SELECT 1 FROM workspace_ancestors ha JOIN workspace_ancestors wa ON ha.device=wa.device AND ha.inode=wa.inode WHERE ha.owner_id=held.owner_id AND ha.client_id=held.client_id AND ha.run_id=held.run_id AND wa.owner_id=wanted.owner_id AND wa.client_id=wanted.client_id AND wa.run_id=wanted.run_id AND (ha.is_target=1 OR wa.is_target=1)))
+                 AND (held.uncertain=1 OR held.access='exclusive' OR wanted.access='exclusive')
+             )
+             AND NOT EXISTS (
+                 SELECT 1 FROM run_workspaces waiting
+                 JOIN service_jobs older ON older.owner_id=waiting.owner_id AND older.client_id=waiting.client_id AND older.run_id=waiting.run_id
+                 JOIN runs older_run ON older_run.owner_id=older.owner_id AND older_run.client_id=older.client_id AND older_run.run_id=older.run_id
+                 WHERE wanted.resource_path IS NOT NULL AND older.queue_id<j.queue_id AND older.claim_token IS NULL AND older.stop_cause IS NULL AND older.deadline_ms>?1 AND older_run.state='queued'
+                 AND (waiting.resource_path=wanted.resource_path OR substr(waiting.resource_path,1,length(wanted.resource_path)+1)=wanted.resource_path||'/' OR substr(wanted.resource_path,1,length(waiting.resource_path)+1)=waiting.resource_path||'/'
+                   OR EXISTS(SELECT 1 FROM workspace_ancestors ha JOIN workspace_ancestors wa ON ha.device=wa.device AND ha.inode=wa.inode WHERE ha.owner_id=waiting.owner_id AND ha.client_id=waiting.client_id AND ha.run_id=waiting.run_id AND wa.owner_id=wanted.owner_id AND wa.client_id=wanted.client_id AND wa.run_id=wanted.run_id AND (ha.is_target=1 OR wa.is_target=1)))
+                 AND (waiting.access='exclusive' OR wanted.access='exclusive')
+             ) ORDER BY j.queue_id LIMIT 1",
+            [now_ms],
             |row| Ok(ClaimedJob {
                 namespace: Namespace { owner_id: row.get(0)?, client_id: row.get(1)? },
                 run_id: row.get(2)?, attempt_id: row.get(3)?, session_id: row.get(4)?,
@@ -392,6 +440,7 @@ impl SqliteStore {
         )? != 1 {
             return Err(StorageError::InvalidState);
         }
+        tx.execute("UPDATE run_workspaces SET held=1 WHERE owner_id=?1 AND client_id=?2 AND run_id=?3 AND held=0", params![job.namespace.owner_id, job.namespace.client_id, job.run_id])?;
         tx.execute("UPDATE runs SET state = 'preparing' WHERE owner_id = ?1 AND client_id = ?2 AND run_id = ?3 AND state = 'queued'", params![job.namespace.owner_id, job.namespace.client_id, job.run_id])?;
         tx.execute("UPDATE attempts SET state = 'preparing' WHERE owner_id = ?1 AND client_id = ?2 AND run_id = ?3 AND attempt_id = ?4 AND state = 'queued'", params![job.namespace.owner_id, job.namespace.client_id, job.run_id, job.attempt_id])?;
         tx.commit()?;
@@ -544,6 +593,55 @@ impl SqliteStore {
             FinishContext {
                 stop: Some(cause),
                 max_result_bytes: 4096,
+                now_ms,
+            },
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn service_finish_proven_unstarted(
+        &mut self,
+        job: &ClaimedJob,
+        candidate: &Candidate,
+        now: impl Into<ServiceClock>,
+        max_result_bytes: usize,
+    ) -> Result<(), StorageError> {
+        if candidate.state == TerminalState::Succeeded
+            || candidate.cleanup != CleanupState::Settled
+            || candidate.disposition != SessionDisposition::NotApplicable
+        {
+            return Err(StorageError::InvalidState);
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now_ms = now.into().read()?;
+        let (mut stop, deadline, spawn) = job_status(&tx, job)?;
+        if !spawn {
+            return Err(StorageError::InvalidState);
+        }
+        let observations: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE owner_id=?1 AND client_id=?2 AND run_id=?3 AND kind<>'run.queued')",
+            params![job.namespace.owner_id,job.namespace.client_id,job.run_id], |row| row.get(0),
+        )?;
+        if observations {
+            return Err(StorageError::InvalidState);
+        }
+        if tx.execute("UPDATE attempts SET spawn_intent=0 WHERE owner_id=?1 AND client_id=?2 AND run_id=?3 AND attempt_id=?4 AND spawn_intent=1", params![job.namespace.owner_id,job.namespace.client_id,job.run_id,job.attempt_id])? != 1 { return Err(StorageError::InvalidState); }
+        if stop.is_none() && now_ms >= deadline {
+            set_stop(&tx, &job.namespace, &job.run_id, StopCause::TimedOut)?;
+            stop = Some(StopCause::TimedOut);
+        }
+        finish_tx(
+            &tx,
+            &job.namespace,
+            &job.run_id,
+            &job.attempt_id,
+            candidate,
+            FinishContext {
+                stop,
+                max_result_bytes,
                 now_ms,
             },
         )?;
@@ -895,6 +993,50 @@ impl SqliteStore {
         Ok(result)
     }
 
+    pub(crate) fn workspace_quarantine_journal(
+        &mut self,
+        key: &crate::workspace::journal::JournalKey,
+    ) -> Result<(), StorageError> {
+        if !matches!(
+            self.workspace_journal_status(key)?,
+            super::workspaces::JournalStatus::NeedsQuarantine
+        ) {
+            return Err(StorageError::InvalidState);
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let namespace = Namespace {
+            owner_id: key.owner_id.clone(),
+            client_id: key.client_id.clone(),
+        };
+        let attempt_id: String = tx.query_row(
+            "SELECT a.attempt_id FROM service_jobs j JOIN runs r USING(owner_id,client_id,run_id) JOIN attempts a ON a.owner_id=j.owner_id AND a.client_id=j.client_id AND a.run_id=j.run_id AND a.attempt_id=j.attempt_id WHERE j.owner_id=?1 AND j.client_id=?2 AND j.run_id=?3 AND j.state_realm=?4 AND a.spawn_intent=0 AND r.state IN ('queued','preparing')",
+            params![key.owner_id,key.client_id,key.run_id,key.state_realm], |row| row.get(0),
+        ).optional()?.ok_or(StorageError::InvalidState)?;
+        set_stop(&tx, &namespace, &key.run_id, StopCause::Interrupted)?;
+        let cause = load_stop(&tx, &namespace, &key.run_id)?.ok_or(StorageError::InvalidState)?;
+        finish_tx(
+            &tx,
+            &namespace,
+            &key.run_id,
+            &attempt_id,
+            &Candidate {
+                state: TerminalState::Interrupted,
+                details: json!({"error":"workspace_recovery_uncertain"}),
+                cleanup: CleanupState::Uncertain,
+                disposition: SessionDisposition::Uncertain,
+            },
+            FinishContext {
+                stop: Some(cause),
+                max_result_bytes: 4096,
+                now_ms: wall_clock_ms()?,
+            },
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn service_recover(
         &mut self,
         now: impl Into<ServiceClock>,
@@ -962,6 +1104,7 @@ impl SqliteStore {
                         },
                     )?;
                 } else {
+                    tx.execute("UPDATE run_workspaces SET held=0, uncertain=0 WHERE owner_id=?1 AND client_id=?2 AND run_id=?3", params![namespace.owner_id, namespace.client_id, run_id])?;
                     tx.execute("UPDATE service_jobs SET claim_token = NULL WHERE owner_id = ?1 AND client_id = ?2 AND run_id = ?3", params![namespace.owner_id, namespace.client_id, run_id])?;
                     tx.execute("UPDATE runs SET state = 'queued' WHERE owner_id = ?1 AND client_id = ?2 AND run_id = ?3", params![namespace.owner_id, namespace.client_id, run_id])?;
                     tx.execute("UPDATE attempts SET state = 'queued' WHERE owner_id = ?1 AND client_id = ?2 AND run_id = ?3 AND attempt_id = ?4", params![namespace.owner_id, namespace.client_id, run_id, attempt_id])?;
@@ -1168,6 +1311,24 @@ fn finish_tx(
         if updated != 1 {
             return Err(StorageError::InvalidState);
         }
+    }
+    if !spawn && candidate.cleanup == CleanupState::Settled {
+        tx.execute(
+            "DELETE FROM session_workspaces WHERE owner_id=?1 AND client_id=?2 AND session_id=?3 AND directory IS NULL AND materialization_intent=0 AND NOT EXISTS(SELECT 1 FROM sessions WHERE owner_id=?1 AND client_id=?2 AND session_id=?3 AND native_id IS NOT NULL)",
+            params![namespace.owner_id, namespace.client_id, session_id],
+        )?;
+    }
+    let workspace_uncertain = candidate.cleanup == CleanupState::Uncertain
+        || (spawn && candidate.disposition != SessionDisposition::Reusable);
+    tx.execute(
+        "UPDATE run_workspaces SET held=?1, uncertain=?1 WHERE owner_id=?2 AND client_id=?3 AND run_id=?4",
+        params![workspace_uncertain, namespace.owner_id, namespace.client_id, run_id],
+    )?;
+    if !workspace_uncertain {
+        tx.execute(
+            "INSERT INTO workspace_settlements(owner_id,client_id,run_id) SELECT owner_id,client_id,run_id FROM run_workspaces WHERE owner_id=?1 AND client_id=?2 AND run_id=?3 ON CONFLICT(owner_id,client_id,run_id) DO NOTHING",
+            params![namespace.owner_id, namespace.client_id, run_id],
+        )?;
     }
     super::completion::enqueue_terminal(tx, namespace, run_id, terminal.as_str(), cleanup, now_ms)?;
     let retention: Option<i64> = tx

@@ -9,3 +9,4 @@ pub mod runtimes;
 pub mod server;
 pub mod storage;
 mod validation;
+pub mod workspace;

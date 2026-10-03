@@ -3,10 +3,10 @@
 use std::{collections::VecDeque, future::Future, pin::Pin, sync::Mutex, time::Duration};
 
 use crate::core::{
-    Attempt, BackendError, CancellationToken, CleanupState, EventSink, ExecutionBackend,
-    ExecutionEvent, ExecutionEventKind, ExecutionMetadata, ExecutionOutcome, ExecutionRequest,
-    ExecutionResult, ExecutionWarning, Run, SessionDisposition, SessionRef, SessionRequest,
-    WarningObservation,
+    Attempt, BackendError, CancellationToken, CleanupState, DispatchStatus, EventSink,
+    ExecutionBackend, ExecutionEvent, ExecutionEventKind, ExecutionMetadata, ExecutionOutcome,
+    ExecutionRequest, ExecutionResult, ExecutionWarning, Run, SessionDisposition, SessionRef,
+    SessionRequest, WarningObservation,
 };
 
 /// The deterministic delay used by the delayed scenario.
@@ -145,6 +145,7 @@ impl DummyBackend {
             } else {
                 WarningObservation::Complete
             },
+            dispatch: DispatchStatus::StartedOrUnknown,
             cleanup: CleanupState::Settled,
             outcome,
         };

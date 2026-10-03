@@ -83,6 +83,8 @@ fn fixture_in_with_retention(
         profile_revision: "v1".into(),
         workspace_id: "workspace".into(),
         state_realm: "dummy".into(),
+        workspace: None,
+        independent_new_sessions: false,
         resume_session_id: None,
         resume_native_id: None,
         deadline_ms: 10000,

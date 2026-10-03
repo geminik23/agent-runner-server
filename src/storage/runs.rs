@@ -270,7 +270,48 @@ impl SqliteStore {
             "UPDATE sessions SET cleanup = 'settled', disposition = 'not_started', reserved_run_id = NULL WHERE owner_id = ?1 AND client_id = ?2 AND session_id = ?3 AND reserved_run_id = ?4 AND native_id IS NULL",
             params![namespace.owner_id, namespace.client_id, session_id, run_id],
         )?;
+        if updated == 1 {
+            transaction.execute("UPDATE run_workspaces SET held=0, uncertain=0 WHERE owner_id=?1 AND client_id=?2 AND run_id=?3", params![namespace.owner_id, namespace.client_id, run_id])?;
+            transaction.execute("INSERT INTO workspace_settlements(owner_id,client_id,run_id) SELECT owner_id,client_id,run_id FROM run_workspaces WHERE owner_id=?1 AND client_id=?2 AND run_id=?3 ON CONFLICT(owner_id,client_id,run_id) DO NOTHING", params![namespace.owner_id, namespace.client_id, run_id])?;
+        }
         transaction.commit()?;
+        Ok(updated == 1)
+    }
+
+    /// Releases an unbound prelaunch workspace after the operator verifies that no work remains.
+    /// The caller must verify filesystem activity and any possible external execution independently.
+    pub fn settle_unstarted_workspace(
+        &mut self,
+        namespace: &Namespace,
+        run_id: &str,
+    ) -> Result<bool, StorageError> {
+        validate_namespace(namespace)?;
+        nonempty(run_id, "run_id")?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run = load_run(&tx, namespace, run_id)?.ok_or(StorageError::NotFound)?;
+        if !is_terminal(&run.state) {
+            return Err(StorageError::InvalidState);
+        }
+        let session_id = run.session_id.ok_or(StorageError::InvalidState)?;
+        let safe_shape: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attempts WHERE owner_id=?1 AND client_id=?2 AND run_id=?3) AND NOT EXISTS(SELECT 1 FROM attempts WHERE owner_id=?1 AND client_id=?2 AND run_id=?3 AND spawn_intent=1) AND EXISTS(SELECT 1 FROM run_workspaces WHERE owner_id=?1 AND client_id=?2 AND run_id=?3 AND held=1 AND uncertain=1)",
+            params![namespace.owner_id,namespace.client_id,run_id], |row| row.get(0),
+        )?;
+        if !safe_shape {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let updated = tx.execute(
+            "UPDATE sessions SET cleanup='settled', disposition='not_started', reserved_run_id=NULL WHERE owner_id=?1 AND client_id=?2 AND session_id=?3 AND reserved_run_id=?4 AND native_id IS NULL",
+            params![namespace.owner_id,namespace.client_id,session_id,run_id],
+        )?;
+        if updated == 1 {
+            tx.execute("UPDATE run_workspaces SET held=0,uncertain=0 WHERE owner_id=?1 AND client_id=?2 AND run_id=?3",params![namespace.owner_id,namespace.client_id,run_id])?;
+            tx.execute("INSERT INTO workspace_settlements(owner_id,client_id,run_id) SELECT owner_id,client_id,run_id FROM run_workspaces WHERE owner_id=?1 AND client_id=?2 AND run_id=?3 ON CONFLICT(owner_id,client_id,run_id) DO NOTHING",params![namespace.owner_id,namespace.client_id,run_id])?;
+        }
+        tx.commit()?;
         Ok(updated == 1)
     }
 
@@ -300,6 +341,10 @@ impl SqliteStore {
             "UPDATE sessions SET cleanup = 'settled', disposition = 'reusable', reserved_run_id = NULL WHERE owner_id = ?1 AND client_id = ?2 AND session_id = ?3 AND reserved_run_id = ?4 AND native_id IS NOT NULL",
             params![namespace.owner_id, namespace.client_id, session_id, run_id],
         )?;
+        if updated == 1 {
+            transaction.execute("UPDATE run_workspaces SET held=0, uncertain=0 WHERE owner_id=?1 AND client_id=?2 AND run_id=?3", params![namespace.owner_id, namespace.client_id, run_id])?;
+            transaction.execute("INSERT INTO workspace_settlements(owner_id,client_id,run_id) SELECT owner_id,client_id,run_id FROM run_workspaces WHERE owner_id=?1 AND client_id=?2 AND run_id=?3 ON CONFLICT(owner_id,client_id,run_id) DO NOTHING", params![namespace.owner_id, namespace.client_id, run_id])?;
+        }
         transaction.commit()?;
         Ok(updated == 1)
     }

@@ -15,8 +15,8 @@ use agent_runner_server::{
     },
     application::{BackendProfile, CancelOutcome, RunLimits, RunService, ServiceError},
     core::{
-        CancellationToken, EventSink, ExecutionBackend, ExecutionMetadata, ExecutionRequest,
-        ExecutionResult,
+        BackendError, CancellationToken, DispatchStatus, EventSink, ExecutionBackend,
+        ExecutionMetadata, ExecutionOutcome, ExecutionRequest, ExecutionResult,
     },
     runtimes::dummy::{DummyBackend, DummyScenario},
     storage::{Namespace, StorageError},
@@ -163,6 +163,68 @@ impl ExecutionBackend for GateBackend {
             self.inner.execute(request, events, cancellation).await
         })
     }
+}
+
+struct ProvenUnstartedBackend {
+    inner: DummyBackend,
+}
+impl ExecutionBackend for ProvenUnstartedBackend {
+    fn metadata(&self) -> ExecutionMetadata {
+        self.inner.metadata()
+    }
+    fn state_realm(&self) -> &str {
+        self.inner.state_realm()
+    }
+    fn execute<'a>(
+        &'a self,
+        request: ExecutionRequest,
+        events: EventSink,
+        _cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = ExecutionResult> + Send + 'a>> {
+        Box::pin(async move {
+            let stopped = CancellationToken::new();
+            stopped.cancel();
+            let mut result = self.inner.execute(request, events, stopped).await;
+            result.dispatch = DispatchStatus::ProvenUnstarted;
+            result.outcome = ExecutionOutcome::Failed(BackendError::InvalidRequest);
+            result
+        })
+    }
+}
+
+#[tokio::test]
+async fn proven_unstarted_backend_failure_does_not_quarantine_the_realm() {
+    let temp = tempdir().unwrap();
+    let access = access();
+    let client = access.authenticate("credential", &[7; 32]).unwrap();
+    let backend = Arc::new(ProvenUnstartedBackend {
+        inner: DummyBackend::new(DummyScenario::Success, 0),
+    });
+    let service = RunService::open(
+        temp.path().join("runs.sqlite"),
+        access,
+        vec![profile(backend)],
+        limits(),
+    )
+    .await
+    .unwrap();
+    let first = service
+        .start(&client, &body("first-unstarted", "fixture"))
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_terminal(&service, &client, &first.run_id).await,
+        "failed"
+    );
+    let second = service
+        .start(&client, &body("second-unstarted", "fixture"))
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_terminal(&service, &client, &second.run_id).await,
+        "failed"
+    );
+    service.shutdown().await.unwrap();
 }
 
 struct WarningThenCancelBackend {
