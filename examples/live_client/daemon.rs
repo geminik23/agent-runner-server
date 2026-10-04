@@ -239,11 +239,13 @@ fn cli_profile(kind: &str, options: &LaunchOptions) -> Result<Value, String> {
     if !output.status.success() {
         return Err(format!("{kind}: version check failed"));
     }
+    // A profile that accepts any version needs no override; the daemon reports the observed version per run.
+    let accept_any = profile["version"]["accept_any"].as_bool() == Some(true);
     let expected = profile["version"]["expected_stdout"]
         .as_str()
         .unwrap_or_default()
         .to_owned();
-    if installed != expected {
+    if !accept_any && installed != expected {
         if !options.accept_installed_version {
             return Err(format!(
                 "{kind}: installed `{installed}` differs from the profile `{expected}`; pass --accept-installed-version to use the installed CLI for this run"

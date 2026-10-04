@@ -115,10 +115,12 @@ fn accept_installed_version(
         output.status.success(),
         "installed CLI version probe failed"
     );
-    version.expected_stdout = String::from_utf8(output.stdout)
-        .expect("UTF-8 CLI version")
-        .trim()
-        .to_owned();
+    version.expected_stdout = Some(
+        String::from_utf8(output.stdout)
+            .expect("UTF-8 CLI version")
+            .trim()
+            .to_owned(),
+    );
 }
 fn make_dir(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -533,7 +535,11 @@ async fn live_missing_native_uuid_does_not_start_a_new_turn() {
             .output()
             .expect("CLI version");
         let settings = example_settings(kind, executable.clone(), 30000);
-        let expected = settings.version.expected_stdout.as_str();
+        let expected = settings
+            .version
+            .expected_stdout
+            .as_deref()
+            .expect("pinned example profile");
         assert!(
             version.status.success()
                 && std::str::from_utf8(&version.stdout).ok().map(str::trim) == Some(expected),

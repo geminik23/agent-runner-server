@@ -33,6 +33,8 @@ const MAX_SPEC_BYTES: usize = 64 * 1024;
 
 /// Exact `--version` output of the helper built from this crate.
 const HELPER_VERSION: &str = concat!("agent-runner-cli-helper ", env!("CARGO_PKG_VERSION"));
+/// Bounds the observed version copied into a run warning when the profile accepts any version.
+const MAX_UNPINNED_VERSION_BYTES: usize = 128;
 
 /// Selects the output protocol adapter; commands, versions and environment come from settings.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -89,12 +91,18 @@ pub struct CliSettings {
     pub pipe_grace_ms: u64,
 }
 
-/// Command and exact trimmed stdout that identify a reviewed CLI build.
+/// Command and trimmed stdout that identify a reviewed CLI build.
+/// Exactly one of `expected_stdout` and `accept_any` must be set.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CliVersionProbe {
     pub args: Vec<String>,
-    pub expected_stdout: String,
+    /// Exact trimmed stdout of the reviewed build; every run is refused when the installed CLI differs.
+    #[serde(default)]
+    pub expected_stdout: Option<String>,
+    /// Runs any build whose probe exits successfully and reports the observed version as a run warning.
+    #[serde(default)]
+    pub accept_any: bool,
 }
 
 /// Environment inheritance and native state selection for one CLI.
@@ -153,7 +161,8 @@ pub struct CliBackend {
     new_args: Vec<OsString>,
     resume_args: Vec<OsString>,
     version_args: Vec<OsString>,
-    expected_version: String,
+    /// `None` only when the validated profile set `accept_any`.
+    expected_version: Option<String>,
     forbidden_workspace_entries: Vec<OsString>,
     session_store: Option<CliSessionStore>,
     preflight_timeout: Duration,
@@ -419,6 +428,74 @@ impl CliBackend {
         }
     }
 
+    /// Checks the pinned state, programs and version before any launch.
+    /// Returns the observed version only when the profile accepts any version.
+    async fn probe(&self, cancellation: CancellationToken) -> Result<Option<String>, BackendError> {
+        if let Some(state) = self.state_directory.clone() {
+            let unchanged = tokio::select! {
+                _ = cancellation.cancelled() => false,
+                result = tokio::task::spawn_blocking(move || state.unchanged()) => result.unwrap_or(false),
+            };
+            if !unchanged {
+                return Err(BackendError::InvalidRequest);
+            }
+        }
+        if !self.program_unchanged(cancellation.clone()).await {
+            return Err(BackendError::InvalidRequest);
+        }
+        if let Some(helper) = &self.helper_program {
+            let mut spec = self.spec(Vec::new(), None, vec![], self.limits);
+            spec.program = helper.clone();
+            spec.args = vec!["--version".into()];
+            let report = ProcessSupervisor::run(spec, cancellation.clone())
+                .await
+                .map_err(|_| BackendError::InvalidRequest)?;
+            if report.reason != StopReason::Exited
+                || !report.direct_io_settled()
+                || report.input != InputCompletion::Complete
+                || !report.exit.is_some_and(|exit| exit.code == Some(0))
+                || std::str::from_utf8(&report.stdout.bytes)
+                    .ok()
+                    .map(str::trim)
+                    != Some(HELPER_VERSION)
+            {
+                return Err(BackendError::InvalidRequest);
+            }
+        }
+        let report = ProcessSupervisor::run(
+            self.spec(self.version_args.clone(), None, vec![], self.limits),
+            cancellation.clone(),
+        )
+        .await
+        .map_err(|_| BackendError::InvalidRequest)?;
+        let observed = std::str::from_utf8(&report.stdout.bytes)
+            .ok()
+            .map(str::trim)
+            .filter(|version| !version.is_empty());
+        let accepted = match (&self.expected_version, observed) {
+            (Some(expected), Some(observed)) => observed == expected,
+            (None, Some(observed)) => {
+                observed.len() <= MAX_UNPINNED_VERSION_BYTES
+                    && observed
+                        .bytes()
+                        .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+            }
+            (_, None) => false,
+        };
+        if !self.program_unchanged(cancellation).await
+            || report.reason != StopReason::Exited
+            || !report.direct_io_settled()
+            || report.input != InputCompletion::Complete
+            || !report.exit.is_some_and(|exit| exit.code == Some(0))
+            || !accepted
+        {
+            return Err(BackendError::InvalidRequest);
+        }
+        Ok(observed
+            .filter(|_| self.expected_version.is_none())
+            .map(str::to_owned))
+    }
+
     async fn run(
         &self,
         request: ExecutionRequest,
@@ -481,8 +558,9 @@ impl CliBackend {
                 None,
             );
         }
-        if self.preflight(cancellation.clone()).await.is_err() {
-            if cancellation.is_cancelled() {
+        let unpinned_version = match self.probe(cancellation.clone()).await {
+            Ok(observed) => observed,
+            Err(_) if cancellation.is_cancelled() => {
                 return self.result(
                     &request,
                     ExecutionOutcome::Cancelled,
@@ -492,13 +570,15 @@ impl CliBackend {
                     SessionDisposition::NotApplicable,
                 );
             }
-            return fail(
-                "backend_compatibility_unavailable",
-                CleanupState::Settled,
-                SessionDisposition::NotApplicable,
-                None,
-            );
-        }
+            Err(_) => {
+                return fail(
+                    "backend_compatibility_unavailable",
+                    CleanupState::Settled,
+                    SessionDisposition::NotApplicable,
+                    None,
+                );
+            }
+        };
         let directory_path = directory.path.clone();
         let opened = tokio::select! {
             _ = cancellation.cancelled() => None,
@@ -771,7 +851,16 @@ impl CliBackend {
                 );
             }
         };
-        let observed_warnings = observed_warnings(self.kind, &report.stdout.bytes);
+        let with_version = |mut warnings: Vec<ExecutionWarning>| {
+            if let Some(version) = &unpinned_version {
+                warnings.push(ExecutionWarning {
+                    code: "cli_version_unpinned".into(),
+                    message: format!("The profile accepts any CLI version; observed `{version}`"),
+                });
+            }
+            warnings
+        };
+        let observed_warnings = with_version(observed_warnings(self.kind, &report.stdout.bytes));
         let fail_observed = |code: &str, session| {
             self.result(
                 &request,
@@ -835,7 +924,7 @@ impl CliBackend {
                 output: decoded.output,
             },
             session,
-            decoded.warnings,
+            with_version(decoded.warnings),
             CleanupState::Settled,
             SessionDisposition::Reusable,
         )
@@ -877,59 +966,7 @@ impl ExecutionBackend for CliBackend {
         &'a self,
         cancellation: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + 'a>> {
-        Box::pin(async move {
-            if let Some(state) = self.state_directory.clone() {
-                let unchanged = tokio::select! {
-                    _ = cancellation.cancelled() => false,
-                    result = tokio::task::spawn_blocking(move || state.unchanged()) => result.unwrap_or(false),
-                };
-                if !unchanged {
-                    return Err(BackendError::InvalidRequest);
-                }
-            }
-            if !self.program_unchanged(cancellation.clone()).await {
-                return Err(BackendError::InvalidRequest);
-            }
-            if let Some(helper) = &self.helper_program {
-                let mut spec = self.spec(Vec::new(), None, vec![], self.limits);
-                spec.program = helper.clone();
-                spec.args = vec!["--version".into()];
-                let report = ProcessSupervisor::run(spec, cancellation.clone())
-                    .await
-                    .map_err(|_| BackendError::InvalidRequest)?;
-                if report.reason != StopReason::Exited
-                    || !report.direct_io_settled()
-                    || report.input != InputCompletion::Complete
-                    || !report.exit.is_some_and(|exit| exit.code == Some(0))
-                    || std::str::from_utf8(&report.stdout.bytes)
-                        .ok()
-                        .map(str::trim)
-                        != Some(HELPER_VERSION)
-                {
-                    return Err(BackendError::InvalidRequest);
-                }
-            }
-            let report = ProcessSupervisor::run(
-                self.spec(self.version_args.clone(), None, vec![], self.limits),
-                cancellation.clone(),
-            )
-            .await
-            .map_err(|_| BackendError::InvalidRequest)?;
-            let expected = self.expected_version.as_str();
-            if !self.program_unchanged(cancellation).await
-                || report.reason != StopReason::Exited
-                || !report.direct_io_settled()
-                || report.input != InputCompletion::Complete
-                || !report.exit.is_some_and(|exit| exit.code == Some(0))
-                || std::str::from_utf8(&report.stdout.bytes)
-                    .ok()
-                    .map(str::trim)
-                    != Some(expected)
-            {
-                return Err(BackendError::InvalidRequest);
-            }
-            Ok(())
-        })
+        Box::pin(async move { self.probe(cancellation).await.map(|_| ()) })
     }
     fn execute<'a>(
         &'a self,
@@ -1076,7 +1113,14 @@ fn validate_invocation(settings: &CliSettings) -> Result<(), &'static str> {
         || label.len() > 128
         || !label.bytes().all(|byte| byte.is_ascii_graphic())
         || settings.version.args.is_empty()
-        || settings.version.expected_stdout.trim().is_empty()
+        || match (
+            &settings.version.expected_stdout,
+            settings.version.accept_any,
+        ) {
+            (Some(expected), false) => expected.trim().is_empty(),
+            (None, true) => false,
+            _ => true,
+        }
         || !settings.version.args.iter().all(valid_arg)
         || !settings.new_args.iter().all(valid_arg)
         || !settings.resume_args.iter().all(valid_arg)
@@ -1411,7 +1455,7 @@ mod tests {
         validate_invocation(&settings).unwrap();
         let program = temp.path().join("fixture");
         let version = if version_ok {
-            settings.version.expected_stdout.clone()
+            settings.version.expected_stdout.clone().unwrap()
         } else {
             "unverified-version".into()
         };
@@ -1608,6 +1652,68 @@ mod tests {
             assert!(matches!(result.outcome, ExecutionOutcome::Failed(_)));
             assert!(!temp.path().join("input").exists());
         }
+    }
+
+    #[tokio::test]
+    async fn accept_any_runs_another_version_and_reports_it_as_a_warning() {
+        for kind in [CliKind::Codex, CliKind::Claude] {
+            let (temp, mut backend) = fixture(kind, false);
+            backend.expected_version = None;
+            let sink: EventSink = Arc::new(|_| Ok(()));
+            let result = backend
+                .execute(
+                    request(temp.path().to_path_buf()),
+                    sink,
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(
+                matches!(result.outcome, ExecutionOutcome::Succeeded { .. }),
+                "{kind:?}: {:?}",
+                result.outcome
+            );
+            assert!(
+                result
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.code == "cli_version_unpinned"
+                        && warning.message.contains("unverified-version"))
+            );
+            assert!(temp.path().join("input").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_version_reports_no_version_warning() {
+        let (temp, backend) = fixture(CliKind::Codex, true);
+        let sink: EventSink = Arc::new(|_| Ok(()));
+        let result = backend
+            .execute(
+                request(temp.path().to_path_buf()),
+                sink,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result.outcome, ExecutionOutcome::Succeeded { .. }));
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "cli_version_unpinned")
+        );
+    }
+
+    #[test]
+    fn version_policy_requires_exactly_one_of_a_pinned_version_and_accept_any() {
+        let mut settings = example(CliKind::Codex);
+        settings.version.accept_any = true;
+        assert!(validate_invocation(&settings).is_err());
+        settings.version.expected_stdout = None;
+        assert!(validate_invocation(&settings).is_ok());
+        settings.version.accept_any = false;
+        assert!(validate_invocation(&settings).is_err());
+        settings.version.expected_stdout = Some(" ".into());
+        assert!(validate_invocation(&settings).is_err());
     }
 
     #[tokio::test]
