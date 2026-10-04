@@ -138,6 +138,8 @@ pub struct LaunchOptions {
     pub overlay: PathBuf,
     pub programs: BTreeMap<String, PathBuf>,
     pub accept_installed_version: bool,
+    /// Writes `version.accept_any` into the temporary copy so the daemon itself skips the comparison and reports the version.
+    pub accept_any_version: bool,
 }
 
 /// A private configuration copy and log in the live directory; the copy is removed on drop.
@@ -238,6 +240,11 @@ fn cli_profile(kind: &str, options: &LaunchOptions) -> Result<Value, String> {
         .to_owned();
     if !output.status.success() {
         return Err(format!("{kind}: version check failed"));
+    }
+    if options.accept_any_version {
+        // Only the temporary copy opts out of pinning; the reviewed profile file stays unchanged.
+        let args = profile["version"]["args"].clone();
+        profile["version"] = json!({"args": args, "accept_any": true});
     }
     // A profile that accepts any version needs no override; the daemon reports the observed version per run.
     let accept_any = profile["version"]["accept_any"].as_bool() == Some(true);
@@ -445,6 +452,19 @@ impl Daemon {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+}
+
+impl Daemon {
+    /// Kills the daemon with SIGKILL to simulate a crash; launched CLIs may keep running on their own.
+    pub fn kill(mut self) -> Result<(), String> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        child
+            .kill()
+            .and_then(|()| child.wait().map(|_| ()))
+            .map_err(|error| format!("kill daemon: {error}"))
     }
 }
 

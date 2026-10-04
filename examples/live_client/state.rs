@@ -74,8 +74,9 @@ pub fn health(database: &Path) -> Result<Health, String> {
     Ok(Health {
         runs_by_state,
         active_runs: count(ACTIVE_RUNS)?,
+        // An abandoned session keeps an uncertain disposition without a reservation, so only reserved ones still block work.
         uncertain_sessions: count(
-            "SELECT COUNT(*) FROM sessions WHERE cleanup='uncertain' OR disposition='uncertain'",
+            "SELECT COUNT(*) FROM sessions WHERE reserved_run_id IS NOT NULL AND (cleanup='uncertain' OR disposition='uncertain')",
         )?,
         held_workspaces: count("SELECT COUNT(*) FROM run_workspaces WHERE held=1 OR uncertain=1")?,
     })

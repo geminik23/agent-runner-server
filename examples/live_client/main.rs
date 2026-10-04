@@ -63,17 +63,20 @@ usage: live_client <command> [options] [arguments]
 commands:
   plan  [--cli LIST] SCENARIO...        show steps and the provider request upper bound; starts nothing
   doctor [--root DIR]                   read-only database check
-  run   [--root DIR] [--cli LIST] [--yes] [launch options] SCENARIO...
+  run   [--root DIR] [--cli LIST] [--yes] [--allow-interruption] [launch options] SCENARIO...
                                         start the daemon, run scenarios, stop it once no run is active
   serve [--root DIR] [launch options]   start the daemon in the foreground for manual calls until Ctrl-C
   call  [--root DIR] [--via rest|mcp] [--allow-running-cancel] TOOL [ARGS_JSON]
                                         call one tool on the daemon started by `serve`
 
 SCENARIO is a shipped name (see examples/live_client/scenarios), a path, or `all`.
+`all` excludes the recovery scenarios under scenarios/recovery, which interrupt launched CLIs and release the
+resulting quarantine with the server's offline maintenance command; they need --allow-interruption.
 --root defaults to AGENT_RUNNER_LIVE_EXISTING_DIR. --cli is a comma list of CLI kinds (default: every CLI profile).
 
 launch options:
   --accept-installed-version   use the installed CLI version in the temporary configuration copy only
+  --accept-any-version         set version.accept_any in the temporary configuration copy only
   --program KIND=PATH          CLI executable instead of the PATH lookup
   --server PATH, --helper PATH binaries (default: next to this example in the target directory)
   --profiles DIR               reviewed CLI profiles (default: examples/cli-profiles)
@@ -87,7 +90,9 @@ launch options:
         cli: Option<Vec<String>>,
         yes: bool,
         accept_installed_version: bool,
+        accept_any_version: bool,
         allow_running_cancel: bool,
+        allow_interruption: bool,
         programs: BTreeMap<String, PathBuf>,
         server: Option<PathBuf>,
         helper: Option<PathBuf>,
@@ -119,6 +124,8 @@ launch options:
                 }
                 "--yes" => options.yes = true,
                 "--accept-installed-version" => options.accept_installed_version = true,
+                "--accept-any-version" => options.accept_any_version = true,
+                "--allow-interruption" => options.allow_interruption = true,
                 "--allow-running-cancel" => options.allow_running_cancel = true,
                 "--program" => {
                     let pair = value("--program")?;
@@ -194,6 +201,7 @@ launch options:
                 .unwrap_or_else(|| manifest().join("examples/live_client/overlay.json")),
             programs: options.programs.clone(),
             accept_installed_version: options.accept_installed_version,
+            accept_any_version: options.accept_any_version,
         })
     }
 
@@ -308,6 +316,17 @@ launch options:
         };
         let names: Vec<String> = targets.iter().map(|target| target.cli.clone()).collect();
         let total = print_plan(&scenarios, &names);
+        let interrupting: Vec<&str> = scenarios
+            .iter()
+            .filter(|scenario| scenario.interrupts())
+            .map(|scenario| scenario.name.as_str())
+            .collect();
+        if !interrupting.is_empty() && !options.allow_interruption {
+            return Err(format!(
+                "{} interrupt launched CLIs and release the quarantine offline; pass --allow-interruption",
+                interrupting.join(", ")
+            ));
+        }
         if !options.yes {
             println!("nothing was started; pass --yes to send up to {total} provider request(s)");
             return Ok(0);

@@ -1,0 +1,24 @@
+{
+  "name": "cancel_and_crash_resume",
+  "description": "a resumed turn is cancelled, then another is cut by a daemon crash; each release keeps the session resumable and it still recalls the token",
+  "steps": [
+    {"op": "start", "id": "first", "via": "rest", "request": {
+      "profile_id": "${profile}", "workspace_id": "${workspace}", "session": {"mode": "new"},
+      "input": {"request": "Remember the token ${token}. Reply with OK only. Do not use tools."}}},
+    {"op": "wait", "run": "first"},
+    {"op": "start", "id": "cancelled", "via": "rest", "request": {
+      "profile_id": "${profile}", "workspace_id": "${workspace}", "session": {"mode": "resume", "session_id": "${first.session_id}"},
+      "input": {"request": "Write about 600 words on the history of lighthouses. Do not use tools."}}},
+    {"op": "cancel_running", "run": "cancelled", "delay_ms": 2000},
+    {"op": "release", "runs": ["cancelled"], "kinds": ["bound_session"]},
+    {"op": "start", "id": "crashed", "via": "mcp", "request": {
+      "profile_id": "${profile}", "workspace_id": "${workspace}", "session": {"mode": "resume", "session_id": "${first.session_id}"},
+      "input": {"request": "Write about 600 words on the history of bridges. Do not use tools."}}},
+    {"op": "crash", "run": "crashed", "delay_ms": 2000},
+    {"op": "release", "runs": ["crashed"], "kinds": ["bound_session"]},
+    {"op": "start", "id": "recall", "via": "rest", "request": {
+      "profile_id": "${profile}", "workspace_id": "${workspace}", "session": {"mode": "resume", "session_id": "${first.session_id}"},
+      "input": {"request": "Reply with only the token I asked you to remember. Do not use tools."}}},
+    {"op": "wait", "run": "recall", "expect": {"output_contains": "${token}"}}
+  ]
+}

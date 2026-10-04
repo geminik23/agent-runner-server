@@ -1,0 +1,11 @@
+{
+  "name": "cancel_new_session",
+  "description": "a new session cancelled while its CLI runs is quarantined and released offline; the kind shows whether the native ID was recorded",
+  "steps": [
+    {"op": "start", "id": "long", "via": "rest", "request": {
+      "profile_id": "${profile}", "workspace_id": "${workspace}", "session": {"mode": "new"},
+      "input": {"request": "Write about 600 words on the history of lighthouses. Do not use tools."}}},
+    {"op": "cancel_running", "run": "long", "delay_ms": 2000},
+    {"op": "release", "runs": ["long"]}
+  ]
+}

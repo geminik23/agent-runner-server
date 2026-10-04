@@ -81,6 +81,29 @@ pub enum Step {
     },
     /// Stops the idle daemon and starts it again from the same configuration.
     Restart {},
+    /// Cancels `run` after it has been running for `delay_ms`; the CLI is interrupted and its session is quarantined.
+    /// The scenario must release the run later, and running it needs `--allow-interruption`.
+    CancelRunning {
+        run: String,
+        #[serde(default)]
+        delay_ms: u64,
+        #[serde(default)]
+        expect: Box<Expect>,
+    },
+    /// Kills the daemon with SIGKILL after `run` has been running for `delay_ms`; launched CLIs may outlive it.
+    /// The daemon stays down until the next `release` or `restart` step.
+    Crash {
+        run: String,
+        #[serde(default)]
+        delay_ms: u64,
+    },
+    /// Stops the daemon once idle, lists and releases `runs` with the server's offline quarantine command, then restarts it.
+    /// A release refused because processes still work in the workspace is retried until they exit.
+    /// `kinds`, when present, lists the expected quarantine kind per run.
+    Release {
+        runs: Vec<String>,
+        kinds: Option<Vec<String>>,
+    },
 }
 
 /// Soft expectations: a mismatch is reported and the scenario continues.
@@ -98,6 +121,8 @@ pub struct Expect {
     /// Expected result schema validation status: `passed` or `failed`.
     pub validation: Option<String>,
     pub synthetic: Option<bool>,
+    /// A warning code that the run result must report.
+    pub warning: Option<String>,
 }
 
 impl Scenario {
@@ -120,15 +145,42 @@ impl Scenario {
             ));
         }
         let mut ids = Vec::new();
+        let mut unreleased: Vec<&String> = Vec::new();
         for step in &self.steps {
-            if let Step::Start { id, .. } = step {
-                if !plain(id) || ids.contains(id) {
-                    return Err(format!("start id `{id}` must be a unique plain identifier"));
+            match step {
+                Step::Start { id, .. } => {
+                    if !plain(id) || ids.contains(id) {
+                        return Err(format!("start id `{id}` must be a unique plain identifier"));
+                    }
+                    ids.push(id.clone());
                 }
-                ids.push(id.clone());
+                Step::CancelRunning { run, .. } | Step::Crash { run, .. } => unreleased.push(run),
+                Step::Release { runs, kinds } => {
+                    if kinds
+                        .as_ref()
+                        .is_some_and(|kinds| kinds.len() != runs.len())
+                    {
+                        return Err("release kinds must list one kind per run".into());
+                    }
+                    unreleased.retain(|run| !runs.contains(run));
+                }
+                _ => {}
             }
         }
+        // An interrupted run left quarantined would block later live work in the retained database.
+        if let Some(run) = unreleased.first() {
+            return Err(format!(
+                "interrupted run `{run}` must be released by a later release step"
+            ));
+        }
         Ok(())
+    }
+
+    /// Whether the scenario interrupts a launched CLI and therefore needs explicit permission.
+    pub fn interrupts(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|step| matches!(step, Step::CancelRunning { .. } | Step::Crash { .. }))
     }
 
     /// Upper bound of provider requests per target: every start expected to admit a new run.
@@ -164,10 +216,13 @@ pub fn resolve_paths(arguments: &[String], directory: &Path) -> Result<Vec<PathB
                 .collect();
             shipped.sort();
             paths.extend(shipped);
-        } else if argument.contains('/') || argument.ends_with(".json") {
+        } else if Path::new(argument).is_file() {
             paths.push(PathBuf::from(argument));
-        } else {
+        } else if !argument.ends_with(".json") && !argument.starts_with('/') {
+            // Shipped names may include a subdirectory, such as `recovery/cancel_new_session`.
             paths.push(directory.join(format!("{argument}.json")));
+        } else {
+            paths.push(PathBuf::from(argument));
         }
     }
     if paths.is_empty() {
@@ -440,6 +495,13 @@ impl Runner<'_> {
                         problems.push(format!("output lacks `{needle}`"));
                     }
                 }
+                if let Some(code) = &expect.warning
+                    && !view["warnings"]
+                        .as_array()
+                        .is_some_and(|codes| codes.iter().any(|item| item == code.as_str()))
+                {
+                    problems.push(format!("warning {code} was not reported"));
+                }
                 if let Some(validation) = &expect.validation
                     && view["validation"].as_str() != Some(validation.as_str())
                 {
@@ -455,6 +517,13 @@ impl Runner<'_> {
                 }
                 if let Some(validation) = view["validation"].as_str() {
                     summary.push_str(&format!(", validation {validation}"));
+                }
+                if let Some(codes) = view["warnings"]
+                    .as_array()
+                    .filter(|codes| !codes.is_empty())
+                {
+                    let codes: Vec<&str> = codes.iter().filter_map(Value::as_str).collect();
+                    summary.push_str(&format!(", warnings {}", codes.join(",")));
                 }
                 if let Some(output) = view["output"].as_str() {
                     summary.push_str(&format!(", output \"{}\"", excerpt(output)));
@@ -598,8 +667,9 @@ impl Runner<'_> {
             }
             Step::Restart {} => {
                 let database = self.root.database();
-                let daemon = self.daemon.take().ok_or("no daemon to restart")?;
-                daemon.stop(&database).await?;
+                if let Some(daemon) = self.daemon.take() {
+                    daemon.stop(&database).await?;
+                }
                 let (daemon, api) =
                     Daemon::start(self.server, self.prepared, &self.root.bearer()).await?;
                 let url = daemon.url.clone();
@@ -610,6 +680,173 @@ impl Runner<'_> {
                     format!("daemon stopped while idle and restarted at {url}"),
                 ))
             }
+            Step::CancelRunning {
+                run,
+                delay_ms,
+                expect,
+            } => {
+                let run_id = vars.resolve_string(&format!("${{{run}.run_id}}"))?;
+                if let Some(state) = self.running_for(&run_id, *delay_ms).await? {
+                    let view = self.wait_terminal(&run_id, DEFAULT_WAIT_MS).await?;
+                    return Ok((
+                        Outcome::Skip,
+                        format!("not cancelled: run was {state} and ended {}", view["state"]),
+                    ));
+                }
+                let reply = self
+                    .api
+                    .call(Via::Rest, "runs_cancel", &json!({"run_id":run_id}))
+                    .await?;
+                if let Some(code) = reply.error {
+                    return Ok((Outcome::Fail, format!("cancel rejected: {code}")));
+                }
+                let view = self.wait_terminal(&run_id, DEFAULT_WAIT_MS).await?;
+                let mut problems = Vec::new();
+                let expected = expect.state.as_deref().unwrap_or("cancelled");
+                if view["state"] != expected {
+                    problems.push(format!("state {}, expected {expected}", view["state"]));
+                }
+                let session = vars.resolve_string(&format!("${{{run}.session_id}}"))?;
+                Ok(verdict(
+                    problems,
+                    format!(
+                        "{} after {}ms, run {}, {}",
+                        reply.body["outcome"].as_str().unwrap_or_default(),
+                        delay_ms,
+                        view["state"],
+                        self.describe_session(&session)?
+                    ),
+                ))
+            }
+            Step::Crash { run, delay_ms } => {
+                let run_id = vars.resolve_string(&format!("${{{run}.run_id}}"))?;
+                if let Some(state) = self.running_for(&run_id, *delay_ms).await? {
+                    let view = self.wait_terminal(&run_id, DEFAULT_WAIT_MS).await?;
+                    return Ok((
+                        Outcome::Skip,
+                        format!("not crashed: run was {state} and ended {}", view["state"]),
+                    ));
+                }
+                let daemon = self.daemon.take().ok_or("no daemon to crash")?;
+                daemon.kill()?;
+                Ok((
+                    Outcome::Ok,
+                    format!("daemon killed after {delay_ms}ms of running"),
+                ))
+            }
+            Step::Release { runs, kinds } => {
+                let database = self.root.database();
+                if let Some(daemon) = self.daemon.take() {
+                    daemon.stop(&database).await?;
+                }
+                let listed = self.quarantine(&["list"])?;
+                let mut problems = Vec::new();
+                let mut details = Vec::new();
+                for (index, run) in runs.iter().enumerate() {
+                    let run_id = vars.resolve_string(&format!("${{{run}.run_id}}"))?;
+                    let Some(line) = listed.lines().find(|line| line.starts_with(&run_id)) else {
+                        problems.push(format!("{run} is not quarantined"));
+                        continue;
+                    };
+                    let fields: Vec<&str> = line.split_whitespace().collect();
+                    let kind = fields.last().copied().unwrap_or_default();
+                    let state = fields.get(2).copied().unwrap_or_default();
+                    if let Some(expected) = kinds.as_ref().map(|kinds| kinds[index].as_str())
+                        && kind != expected
+                    {
+                        problems.push(format!("{run} was {kind}, expected {expected}"));
+                    }
+                    let started = Instant::now();
+                    let deadline = started + Duration::from_millis(DEFAULT_WAIT_MS);
+                    let mut refusals = 0;
+                    let result = loop {
+                        match self.quarantine(&["release", &run_id, "--confirm-no-cli-process"]) {
+                            Err(error)
+                                if error.contains("processes still work")
+                                    && Instant::now() < deadline =>
+                            {
+                                // A CLI that outlived a crashed daemon still works in the workspace; wait for it to exit.
+                                refusals += 1;
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            }
+                            other => break other,
+                        }
+                    };
+                    let waited = if refusals == 0 {
+                        String::new()
+                    } else {
+                        format!(
+                            " (refused {refusals} time(s) while processes remained, released after {}s)",
+                            started.elapsed().as_secs()
+                        )
+                    };
+                    match result {
+                        Ok(message) => details.push(format!(
+                            "{run} {state} {kind}: {}{waited}",
+                            message
+                                .trim()
+                                .split_once(": ")
+                                .map_or(message.trim(), |(_, text)| text)
+                        )),
+                        Err(error) => problems.push(format!("{run} release failed: {error}")),
+                    }
+                }
+                let (daemon, api) =
+                    Daemon::start(self.server, self.prepared, &self.root.bearer()).await?;
+                self.daemon = Some(daemon);
+                self.api = api;
+                Ok(verdict(problems, details.join("; ")))
+            }
+        }
+    }
+
+    /// Waits until the run is running and `delay_ms` has passed; returns its state instead when it is no longer running.
+    async fn running_for(&self, run_id: &str, delay_ms: u64) -> Result<Option<String>, String> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let state = self.state_of(run_id).await?;
+            if state == "running" {
+                break;
+            }
+            if TERMINAL.contains(&state.as_str()) || Instant::now() > deadline {
+                return Ok(Some(state));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        let state = self.state_of(run_id).await?;
+        Ok((state != "running").then_some(state))
+    }
+
+    fn describe_session(&self, session: &str) -> Result<String, String> {
+        let database = self.root.database();
+        let native = state::native_id(&database, session)?.is_some();
+        Ok(match state::session_state(&database, session)? {
+            Some(stored) => format!(
+                "session cleanup {}, disposition {}, reserved {}, native ID {}",
+                stored.cleanup,
+                stored.disposition,
+                stored.reserved,
+                if native { "recorded" } else { "absent" }
+            ),
+            None => "session record not found".into(),
+        })
+    }
+
+    /// Runs the server's offline quarantine command against the private configuration copy.
+    fn quarantine(&self, args: &[&str]) -> Result<String, String> {
+        let output = std::process::Command::new(self.server)
+            .arg("--config")
+            .arg(&self.prepared.config_path)
+            .arg("quarantine")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|error| format!("quarantine {}: {error}", args.join(" ")))?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
         }
     }
 
@@ -659,6 +896,10 @@ impl Runner<'_> {
             "output": outcome["output"],
             "error": outcome["error"].as_str().map(str::to_owned).or_else(|| data["details"]["error"].as_str().map(str::to_owned)),
             "validation": data["details"]["validation"]["status"],
+            "warnings": data["details"]["warnings"]
+                .as_array()
+                .map(|items| items.iter().map(|item| item["code"].clone()).collect::<Vec<_>>())
+                .unwrap_or_default(),
         }))
     }
 
@@ -732,6 +973,9 @@ fn step_label(step: &Step) -> String {
         Step::NativeId { save, .. } => format!("native_id {save}"),
         Step::Inbox { .. } => "inbox".into(),
         Step::Restart {} => "restart".into(),
+        Step::CancelRunning { run, .. } => format!("cancel_running {run}"),
+        Step::Crash { run, .. } => format!("crash {run}"),
+        Step::Release { .. } => "release".into(),
     }
 }
 
@@ -837,6 +1081,45 @@ mod tests {
             total <= 11,
             "one pass must stay within the approved provider request budget per CLI, got {total}"
         );
+    }
+
+    #[test]
+    fn recovery_scenarios_release_every_interruption_within_their_budget() {
+        let directory = shipped();
+        let paths = resolve_paths(
+            &[
+                "recovery/cancel_new_session".into(),
+                "recovery/cancel_and_crash_resume".into(),
+            ],
+            &directory,
+        )
+        .unwrap();
+        let mut total = 0;
+        for path in &paths {
+            let scenario = Scenario::load(path).unwrap();
+            assert!(scenario.interrupts(), "{}", path.display());
+            total += scenario.provider_requests();
+        }
+        assert!(total <= 5, "recovery pass per CLI, got {total}");
+        let all = resolve_paths(&["all".into()], &directory).unwrap();
+        assert!(
+            all.iter()
+                .all(|path| !path.starts_with(directory.join("recovery")))
+        );
+    }
+
+    #[test]
+    fn an_interruption_without_a_later_release_is_rejected() {
+        let text = r#"{"name":"x","description":"x","steps":[
+            {"op":"start","id":"a","request":{}},
+            {"op":"cancel_running","run":"a"}]}"#;
+        let scenario: Scenario = serde_json::from_str(text).unwrap();
+        assert!(scenario.validate().is_err());
+        let text = r#"{"name":"x","description":"x","steps":[
+            {"op":"start","id":"a","request":{}},
+            {"op":"release","runs":["a"],"kinds":["bound_session","extra"]}]}"#;
+        let scenario: Scenario = serde_json::from_str(text).unwrap();
+        assert!(scenario.validate().is_err());
     }
 
     #[test]
