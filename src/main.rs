@@ -4,7 +4,7 @@ use agent_runner_server::{
     application::ServiceError,
     maintenance::{Maintenance, Release},
     server::{ServerError, config::PreparedServer},
-    storage::{Namespace, QuarantineKind, QuarantinedRun, StorageError},
+    storage::{Namespace, QuarantineKind, QuarantinedRun},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -98,7 +98,7 @@ fn quarantine(path: OsString, args: &[&str]) -> Result<ExitCode, String> {
                 println!("no quarantined runs");
             }
             for entry in &entries {
-                print_entry(entry);
+                print_entry(entry, maintenance.workspace_directory(entry));
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -139,18 +139,10 @@ fn quarantine(path: OsString, args: &[&str]) -> Result<ExitCode, String> {
                     ));
                 }
             };
-            if let Some(workspace) = &entry.workspace_path {
-                refuse_live_processes(workspace)?;
-            }
             let namespace: Namespace = entry.namespace.clone();
             let release = maintenance
                 .release(&namespace, run_id)
-                .map_err(|error| match error {
-                    ServiceError::Storage(StorageError::InvalidState) => format!(
-                        "{run_id} has a shape that maintenance does not release; it stays quarantined"
-                    ),
-                    other => other.to_string(),
-                })?;
+                .map_err(|error| format!("{run_id}: {error}"))?;
             println!(
                 "{run_id}: {}",
                 match release {
@@ -173,29 +165,7 @@ fn open(path: OsString) -> Result<Maintenance, String> {
         .map_err(|error| describe(&error))
 }
 
-#[cfg(target_os = "linux")]
-fn refuse_live_processes(workspace: &str) -> Result<(), String> {
-    let found = agent_runner_server::maintenance::processes_in(std::path::Path::new(workspace))
-        .map_err(|error| format!("cannot scan processes: {error}"))?;
-    if found.is_empty() {
-        return Ok(());
-    }
-    let list: Vec<String> = found
-        .iter()
-        .map(|(pid, name)| format!("{pid} ({name})"))
-        .collect();
-    Err(format!(
-        "processes still work in {workspace}: {}; stop them or leave the directory, then retry",
-        list.join(", ")
-    ))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn refuse_live_processes(_workspace: &str) -> Result<(), String> {
-    Ok(())
-}
-
-fn print_entry(entry: &QuarantinedRun) {
+fn print_entry(entry: &QuarantinedRun, directory: Option<std::path::PathBuf>) {
     let (blocks, release) = match entry.kind {
         QuarantineKind::UnboundSession => (
             "every new run and resume in this state realm",
@@ -233,7 +203,11 @@ fn print_entry(entry: &QuarantinedRun) {
     );
     println!(
         "  workspace {}",
-        entry.workspace_path.as_deref().unwrap_or("-")
+        match (&entry.workspace_key, directory) {
+            (None, _) => "-".to_owned(),
+            (Some(_), Some(directory)) => directory.display().to_string(),
+            (Some(key), None) => format!("{key} (not in the current configuration)"),
+        }
     );
     println!("  blocks: {blocks}");
     println!("  release: {release}");

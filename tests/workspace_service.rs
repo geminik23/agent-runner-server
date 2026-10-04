@@ -18,7 +18,7 @@ use agent_runner_server::{
         BackendError, CancellationToken, CleanupState, EventSink, ExecutionBackend,
         ExecutionMetadata, ExecutionRequest, ExecutionResult, SessionDisposition, SessionRef,
     },
-    maintenance::{Maintenance, Release},
+    maintenance::{Maintenance, Release, ReleaseError},
     runtimes::dummy::{DummyBackend, DummyScenario},
     storage::{Namespace, QuarantineKind, SqliteStore},
     workspace::{WorkspaceAccess, WorkspaceConfig, WorkspaceEntry, WorkspaceLocation},
@@ -1114,6 +1114,22 @@ async fn maintenance_abandons_an_unbound_session_and_unblocks_the_realm() {
     assert_eq!(entries[0].kind, QuarantineKind::UnboundSession);
     assert!(entries[0].native_id.is_none());
     let namespace = entries[0].namespace.clone();
+    assert_eq!(
+        tool.workspace_directory(&entries[0]),
+        Some(temp.path().join("a").canonicalize().unwrap())
+    );
+    // A process still working in the workspace keeps the run quarantined until it exits.
+    let mut lingering = std::process::Command::new("sleep")
+        .arg("30")
+        .current_dir(temp.path().join("a"))
+        .spawn()
+        .unwrap();
+    assert!(matches!(
+        tool.release(&namespace, &first.run_id),
+        Err(ReleaseError::ProcessesRemain(_, found)) if found.iter().any(|(pid, _)| *pid == lingering.id())
+    ));
+    lingering.kill().unwrap();
+    lingering.wait().unwrap();
     assert_eq!(
         tool.release(&namespace, &first.run_id).unwrap(),
         Release::Abandoned
