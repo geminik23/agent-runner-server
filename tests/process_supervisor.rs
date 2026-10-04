@@ -3,15 +3,15 @@
 use std::{
     ffi::OsString,
     future::Future,
-    io::{BufRead, Read, Write},
+    io::{Read, Write},
     pin::Pin,
     sync::Arc,
     time::Duration,
 };
 
 use agent_runner_server::process::{
-    ControlledInput, InputCompletion, ObserverError, OutputCompletion, OutputStream, ProcessError,
-    ProcessLimits, ProcessObserver, ProcessSpec, ProcessSupervisor, StopReason, StopSignal,
+    InputCompletion, ObserverError, OutputCompletion, OutputStream, ProcessError, ProcessLimits,
+    ProcessObserver, ProcessSpec, ProcessSupervisor, StopReason, StopSignal,
 };
 use agent_runner_server::{
     access::{
@@ -93,46 +93,6 @@ fn fake_process_fixture() {
             );
             println!("FAKE_ENV_CLEAR={}", std::env::var_os("PATH").is_none());
             println!("FAKE_INPUT={}", String::from_utf8(input).unwrap());
-        }
-        "interactive_ready" => {
-            let input = std::io::stdin();
-            let mut input = std::io::BufReader::new(input.lock());
-            let mut first = String::new();
-            input.read_line(&mut first).unwrap();
-            assert_eq!(first, "INIT\n");
-            println!("FAKE_INTERACTIVE_READY");
-            std::io::stdout().flush().unwrap();
-            let mut second = String::new();
-            input.read_line(&mut second).unwrap();
-            assert_eq!(second, "PROMPT\n");
-            println!("FAKE_INTERACTIVE_ACCEPTED");
-        }
-        "interactive_stdout_eof" => {
-            let input = std::io::stdin();
-            let mut input = std::io::BufReader::new(input.lock());
-            let mut first = String::new();
-            input.read_line(&mut first).unwrap();
-            assert_eq!(first, "INIT\n");
-            // SAFETY: This isolated fixture deliberately closes its own stdout.
-            unsafe {
-                libc::close(1);
-            }
-            std::thread::sleep(Duration::from_secs(3));
-        }
-        "interactive_reject" => {
-            let input = std::io::stdin();
-            let mut input = std::io::BufReader::new(input.lock());
-            let mut first = String::new();
-            input.read_line(&mut first).unwrap();
-            assert_eq!(first, "INIT\n");
-            println!("FAKE_INTERACTIVE_REJECTED");
-            std::io::stdout().flush().unwrap();
-            let mut rest = String::new();
-            input.read_to_string(&mut rest).unwrap();
-            if !rest.is_empty() {
-                std::fs::write(std::env::var_os(READY).unwrap(), b"unexpected input").unwrap();
-            }
-            std::process::exit(7);
         }
         "supervisor_closed_stdio" => {
             let output = std::env::var_os(READY).unwrap();
@@ -407,204 +367,6 @@ async fn passes_exact_argv_stdin_eof_and_explicit_environment() {
     assert!(output.contains("FAKE_ARG=true"));
     assert!(output.contains("FAKE_ENV_CLEAR=true"));
     assert!(output.contains("FAKE_INPUT=hello 한글"));
-}
-
-#[tokio::test]
-async fn interactive_process_receives_prompt_only_after_the_ready_signal() {
-    let mut input = spec("interactive_ready");
-    input.stdin = b"INIT\n".to_vec();
-    input.limits.max_stdin_bytes = 64;
-    let (sender, receiver) = tokio::sync::mpsc::channel(2);
-    let state = std::sync::Mutex::new((Vec::<u8>::new(), false));
-    let observer: ProcessObserver = Arc::new(move |stream, chunk| {
-        if stream == OutputStream::Stdout {
-            let mut state = state.lock().map_err(|_| ObserverError)?;
-            state.0.extend_from_slice(chunk);
-            if !state.1
-                && state
-                    .0
-                    .windows(b"FAKE_INTERACTIVE_READY".len())
-                    .any(|window| window == b"FAKE_INTERACTIVE_READY")
-            {
-                sender
-                    .try_send(ControlledInput::Bytes(b"PROMPT\n".to_vec()))
-                    .map_err(|_| ObserverError)?;
-                sender
-                    .try_send(ControlledInput::Finish)
-                    .map_err(|_| ObserverError)?;
-                state.1 = true;
-            }
-        }
-        Ok(())
-    });
-    let report = ProcessSupervisor::run_interactive(
-        input,
-        CancellationToken::new(),
-        Some(observer),
-        receiver,
-    )
-    .await
-    .unwrap();
-    assert_eq!(report.reason, StopReason::Exited);
-    assert_eq!(report.exit.unwrap().code, Some(0));
-    assert_eq!(report.input, InputCompletion::Complete);
-    assert!(String::from_utf8_lossy(&report.stdout.bytes).contains("FAKE_INTERACTIVE_ACCEPTED"));
-}
-
-#[tokio::test]
-async fn rejected_interactive_handshake_closes_stdin_without_sending_prompt() {
-    let dir = tempfile::tempdir().unwrap();
-    let unexpected = dir.path().join("unexpected-input");
-    let mut input = spec("interactive_reject");
-    ready_env(&mut input, &unexpected);
-    input.stdin = b"INIT\n".to_vec();
-    input.limits.max_stdin_bytes = 64;
-    let (sender, receiver) = tokio::sync::mpsc::channel(2);
-    let state = std::sync::Mutex::new((Vec::<u8>::new(), false));
-    let observer: ProcessObserver = Arc::new(move |stream, chunk| {
-        if stream == OutputStream::Stdout {
-            let mut state = state.lock().map_err(|_| ObserverError)?;
-            state.0.extend_from_slice(chunk);
-            if !state.1
-                && state
-                    .0
-                    .windows(b"FAKE_INTERACTIVE_REJECTED".len())
-                    .any(|window| window == b"FAKE_INTERACTIVE_REJECTED")
-            {
-                sender
-                    .try_send(ControlledInput::Finish)
-                    .map_err(|_| ObserverError)?;
-                state.1 = true;
-            }
-        }
-        Ok(())
-    });
-    let report = ProcessSupervisor::run_interactive(
-        input,
-        CancellationToken::new(),
-        Some(observer),
-        receiver,
-    )
-    .await
-    .unwrap();
-    assert_eq!(report.reason, StopReason::Exited);
-    assert_eq!(report.exit.unwrap().code, Some(7));
-    assert_eq!(report.input, InputCompletion::Complete);
-    assert!(!unexpected.exists());
-}
-
-#[tokio::test]
-async fn cancellation_while_interactive_input_is_pending_never_sends_a_prompt() {
-    let dir = tempfile::tempdir().unwrap();
-    let unexpected = dir.path().join("unexpected-input");
-    let mut input = spec("interactive_reject");
-    ready_env(&mut input, &unexpected);
-    input.stdin = b"INIT\n".to_vec();
-    let (_sender, receiver) = tokio::sync::mpsc::channel(2);
-    let (ready, ready_rx) = tokio::sync::oneshot::channel();
-    let state = std::sync::Mutex::new((Vec::<u8>::new(), Some(ready)));
-    let observer: ProcessObserver = Arc::new(move |stream, chunk| {
-        if stream == OutputStream::Stdout {
-            let mut state = state.lock().map_err(|_| ObserverError)?;
-            state.0.extend_from_slice(chunk);
-            if state
-                .0
-                .windows(b"FAKE_INTERACTIVE_REJECTED".len())
-                .any(|window| window == b"FAKE_INTERACTIVE_REJECTED")
-                && let Some(ready) = state.1.take()
-            {
-                let _ = ready.send(());
-            }
-        }
-        Ok(())
-    });
-    let cancellation = CancellationToken::new();
-    let task = tokio::spawn(ProcessSupervisor::run_interactive(
-        input,
-        cancellation.clone(),
-        Some(observer),
-        receiver,
-    ));
-    tokio::time::timeout(Duration::from_secs(2), ready_rx)
-        .await
-        .unwrap()
-        .unwrap();
-    cancellation.cancel();
-    let report = task.await.unwrap().unwrap();
-    assert_eq!(report.reason, StopReason::Cancelled);
-    assert_ne!(report.input, InputCompletion::Complete);
-    assert!(!unexpected.exists());
-}
-
-#[tokio::test]
-async fn dropped_interactive_input_channel_stops_child_without_waiting_for_deadline() {
-    let dir = tempfile::tempdir().unwrap();
-    let unexpected = dir.path().join("unexpected-input");
-    let mut input = spec("interactive_reject");
-    ready_env(&mut input, &unexpected);
-    input.stdin = b"INIT\n".to_vec();
-    let (sender, receiver) = tokio::sync::mpsc::channel(2);
-    drop(sender);
-    let report = tokio::time::timeout(
-        Duration::from_secs(2),
-        ProcessSupervisor::run_interactive(input, CancellationToken::new(), None, receiver),
-    )
-    .await
-    .expect("closed input channel must stop the child")
-    .unwrap();
-    assert_eq!(report.reason, StopReason::InputFailure);
-    assert_eq!(report.input, InputCompletion::Interrupted);
-    assert!(!unexpected.exists());
-}
-
-#[tokio::test]
-async fn interactive_stdout_eof_stops_input_without_waiting_for_deadline() {
-    let mut input = spec("interactive_stdout_eof");
-    input.stdin = b"INIT\n".to_vec();
-    let (sender, receiver) = tokio::sync::mpsc::channel(2);
-    let report = tokio::time::timeout(
-        Duration::from_secs(2),
-        ProcessSupervisor::run_interactive(input, CancellationToken::new(), None, receiver),
-    )
-    .await
-    .expect("early stdout EOF must stop the child")
-    .unwrap();
-    assert_eq!(
-        report.reason,
-        StopReason::OutputFailure(OutputStream::Stdout)
-    );
-    assert_ne!(report.input, InputCompletion::Complete);
-    assert!(
-        sender
-            .try_send(ControlledInput::Bytes(b"later prompt".to_vec()))
-            .is_err()
-    );
-}
-
-#[tokio::test]
-async fn exited_child_closes_interactive_channel_before_later_input() {
-    let dir = tempfile::tempdir().unwrap();
-    let ready = dir.path().join("ready");
-    let mut input = spec("stdin_parent");
-    ready_env(&mut input, &ready);
-    let (sender, receiver) = tokio::sync::mpsc::channel(2);
-    let task = tokio::spawn(ProcessSupervisor::run_interactive(
-        input,
-        CancellationToken::new(),
-        None,
-        receiver,
-    ));
-    tokio::time::timeout(Duration::from_secs(3), sender.closed())
-        .await
-        .expect("interactive input must close after child exit");
-    assert!(
-        sender
-            .try_send(ControlledInput::Bytes(b"later prompt".to_vec()))
-            .is_err()
-    );
-    let report = task.await.unwrap().unwrap();
-    assert_ne!(report.reason, StopReason::Exited);
-    assert_ne!(report.input, InputCompletion::Complete);
 }
 
 #[tokio::test]
