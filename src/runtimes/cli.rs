@@ -1,6 +1,7 @@
 //! Restricted, version-gated adapters for trusted local CLI installations.
 
 use std::{
+    collections::BTreeMap,
     ffi::OsString,
     future::Future,
     path::PathBuf,
@@ -25,7 +26,7 @@ use crate::{
     },
 };
 
-/// Argument token replaced by the registered native session ID in `resume_args`.
+/// Argument token replaced by the native session ID in `resume_args`, a pre-assigning `new_args` and a session probe.
 pub const NATIVE_SESSION_TOKEN: &str = "{native_session_id}";
 
 /// Upper bound for the combined program, argument, cwd and environment bytes of one spec.
@@ -44,6 +45,9 @@ pub enum CliKind {
     Codex,
     /// Claude Code `--output-format json` single result object with `session_id`.
     Claude,
+    /// OpenCode v2 `run --format json` NDJSON events that each carry `sessionID`.
+    #[serde(rename = "opencode")]
+    OpenCode,
 }
 
 impl CliKind {
@@ -52,6 +56,15 @@ impl CliKind {
         match self {
             CliKind::Codex => "codex",
             CliKind::Claude => "claude",
+            CliKind::OpenCode => "opencode",
+        }
+    }
+
+    /// The native session ID shape is part of each CLI's output protocol, like its event names.
+    fn valid_native_id(self, id: &str) -> bool {
+        match self {
+            CliKind::Codex | CliKind::Claude => valid_uuid(id),
+            CliKind::OpenCode => valid_opencode_id(id),
         }
     }
 }
@@ -80,6 +93,10 @@ pub struct CliSettings {
     /// Native transcript location used to reject a missing session before launch.
     #[serde(default)]
     pub session_store: Option<CliSessionStore>,
+    /// Pre-launch command that decides session presence when the CLI keeps no transcript file per session.
+    /// At most one of `session_store` and `session_probe` may be set.
+    #[serde(default)]
+    pub session_probe: Option<CliSessionProbe>,
     pub max_stdin_bytes: usize,
     pub max_stdout_bytes: usize,
     pub max_stderr_bytes: usize,
@@ -120,6 +137,10 @@ pub struct CliEnvironment {
     pub forbidden_prefixes: Vec<String>,
     #[serde(default)]
     pub forbidden_names: Vec<String>,
+    /// Fixed variables passed to the CLI, such as switches that disable workspace configuration.
+    /// They cannot name `HOME`, `PATH`, the state variable or an inherited variable.
+    #[serde(default)]
+    pub set: BTreeMap<String, String>,
 }
 
 /// Optional host requirements for the reviewed compatibility record.
@@ -147,6 +168,21 @@ pub struct CliSessionStore {
     pub max_entries: usize,
 }
 
+/// Asks the CLI itself whether a native session exists, without reading its private database.
+/// Only the two declared outcomes decide presence; every other result makes the session unverifiable.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CliSessionProbe {
+    /// Arguments containing `NATIVE_SESSION_TOKEN` exactly once, possibly inside a larger argument.
+    pub args: Vec<String>,
+    /// JSON pointer into stdout whose string must equal the session ID when the probe exits with 0.
+    pub present_id_pointer: String,
+    /// Exit code that, together with `missing_stderr_line`, reports a missing session.
+    pub missing_exit_code: i32,
+    /// Exact stderr line printed for a missing session.
+    pub missing_stderr_line: String,
+}
+
 /// Executes one managed CLI invocation without exposing credentials to callers.
 pub struct CliBackend {
     kind: CliKind,
@@ -165,6 +201,7 @@ pub struct CliBackend {
     expected_version: Option<String>,
     forbidden_workspace_entries: Vec<OsString>,
     session_store: Option<CliSessionStore>,
+    session_probe: Option<CliSessionProbe>,
     preflight_timeout: Duration,
     limits: ProcessLimits,
 }
@@ -267,6 +304,12 @@ impl CliBackend {
         } else {
             environment.push((state_key.into(), state.clone().into_os_string()));
         }
+        environment.extend(
+            env_settings
+                .set
+                .iter()
+                .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+        );
         let state_realm = native_realm(settings.kind, &state_directory);
         let os_args = |args: &[String]| args.iter().map(OsString::from).collect::<Vec<_>>();
         // The helper wrapper adds a separator and the CLI program before the configured arguments.
@@ -274,7 +317,13 @@ impl CliBackend {
             .new_args
             .len()
             .max(settings.resume_args.len())
-            .max(settings.version.args.len());
+            .max(settings.version.args.len())
+            .max(
+                settings
+                    .session_probe
+                    .as_ref()
+                    .map_or(0, |probe| probe.args.len()),
+            );
         let max_env = environment.len();
         Ok(Self {
             kind: settings.kind,
@@ -296,6 +345,7 @@ impl CliBackend {
                 .map(OsString::from)
                 .collect(),
             session_store: settings.session_store,
+            session_probe: settings.session_probe,
             preflight_timeout: Duration::from_millis(settings.preflight_timeout_ms),
             limits: ProcessLimits {
                 max_args,
@@ -370,7 +420,7 @@ impl CliBackend {
             SessionRequest::Resume(session)
                 if session.runtime == self.metadata().runtime
                     && session.state_realm == self.state_realm
-                    && valid_uuid(&session.native_id) =>
+                    && self.kind.valid_native_id(&session.native_id) =>
             {
                 Ok(self
                     .resume_args
@@ -496,6 +546,89 @@ impl CliBackend {
             .map(str::to_owned))
     }
 
+    /// Decides whether a native session exists before launch through the transcript store or the probe command.
+    /// `None` means the run was cancelled; `Err` means presence could not be decided.
+    async fn session_exists(
+        &self,
+        native_id: &str,
+        workspace: &crate::core::WorkingDirectory,
+        cancellation: &CancellationToken,
+    ) -> Option<Result<bool, ()>> {
+        if let (Some(store), Some(state)) = (
+            self.session_store.clone(),
+            self.state_directory
+                .as_ref()
+                .map(|state| state.path.clone()),
+        ) {
+            let id = native_id.to_owned();
+            return tokio::select! {
+                _ = cancellation.cancelled() => None,
+                result = tokio::task::spawn_blocking(move || native_session_present(&store, &state, &id)) => Some(result.unwrap_or(Err(()))),
+            };
+        }
+        let Some(probe) = self.session_probe.as_ref() else {
+            return Some(Err(()));
+        };
+        let directory = workspace.clone();
+        let opened = tokio::select! {
+            _ = cancellation.cancelled() => return None,
+            result = tokio::task::spawn_blocking(move || open_pinned_directory(&directory)) => result.ok().and_then(Result::ok),
+        };
+        let Some(opened) = opened else {
+            return Some(Err(()));
+        };
+        let args = probe
+            .args
+            .iter()
+            .map(|arg| OsString::from(arg.replace(NATIVE_SESSION_TOKEN, native_id)))
+            .collect();
+        let mut limits = self.limits;
+        limits.timeout = limits.timeout.min(self.preflight_timeout);
+        let report = ProcessSupervisor::run_with_start_observer(
+            self.spec(args, Some(workspace.path.clone()), vec![], limits),
+            cancellation.clone(),
+            None,
+            None,
+            Some(opened),
+        )
+        .await;
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let Ok(report) = report else {
+            return Some(Err(()));
+        };
+        if report.reason != StopReason::Exited
+            || !report.direct_io_settled()
+            || report.input != InputCompletion::Complete
+        {
+            return Some(Err(()));
+        }
+        let code = report.exit.as_ref().and_then(|exit| exit.code);
+        if code == Some(0) {
+            let reported = crate::validation::parse_unique_json(&report.stdout.bytes)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .pointer(&probe.present_id_pointer)
+                        .and_then(Value::as_str)
+                        .map(|found| found == native_id)
+                });
+            return Some(if reported == Some(true) {
+                Ok(true)
+            } else {
+                Err(())
+            });
+        }
+        let missing = code == Some(probe.missing_exit_code)
+            && report
+                .stderr
+                .bytes
+                .split(|byte| *byte == b'\n')
+                .any(|line| line == probe.missing_stderr_line.as_bytes());
+        Some(if missing { Ok(false) } else { Err(()) })
+    }
+
     async fn run(
         &self,
         request: ExecutionRequest,
@@ -580,6 +713,7 @@ impl CliBackend {
             }
         };
         let directory_path = directory.path.clone();
+        let workspace = directory.clone();
         let opened = tokio::select! {
             _ = cancellation.cancelled() => None,
             result = tokio::task::spawn_blocking(move || open_pinned_directory(&directory)) => result.ok().and_then(Result::ok),
@@ -620,20 +754,14 @@ impl CliBackend {
                 None,
             );
         }
-        // A resume never becomes a new conversation: a missing transcript is rejected before launch.
-        if let (SessionRequest::Resume(session), Some(store), Some(state)) = (
-            &request.session,
-            self.session_store.clone(),
-            self.state_directory
-                .as_ref()
-                .map(|state| state.path.clone()),
-        ) {
-            let id = session.native_id.clone();
-            let found = tokio::select! {
-                _ = cancellation.cancelled() => None,
-                result = tokio::task::spawn_blocking(move || native_session_present(&store, &state, &id)) => Some(result.unwrap_or(Err(()))),
-            };
-            match found {
+        // A resume never becomes a new conversation: a missing session is rejected before launch.
+        if let SessionRequest::Resume(session) = &request.session
+            && (self.session_store.is_some() || self.session_probe.is_some())
+        {
+            match self
+                .session_exists(&session.native_id, &workspace, &cancellation)
+                .await
+            {
                 None => {
                     return self.result(
                         &request,
@@ -669,28 +797,41 @@ impl CliBackend {
         let preassigned = if matches!(request.session, SessionRequest::New)
             && self.new_args.iter().any(|arg| arg == NATIVE_SESSION_TOKEN)
         {
-            let store = self.session_store.clone();
-            let state = self
-                .state_directory
-                .as_ref()
-                .map(|state| state.path.clone());
-            let fresh = tokio::select! {
-                _ = cancellation.cancelled() => None,
-                result = tokio::task::spawn_blocking(move || fresh_native_id(store.as_ref(), state.as_deref())) => Some(result.unwrap_or(Err(()))),
-            };
-            match fresh {
-                None => {
-                    return self.result(
-                        &request,
-                        ExecutionOutcome::Cancelled,
-                        None,
-                        vec![],
-                        CleanupState::Settled,
-                        SessionDisposition::NotApplicable,
-                    );
+            // An existing session with this ID would make the new run continue someone else's conversation.
+            // Profile validation requires a store or probe with the token; a backend built without one keeps the ID unchecked.
+            let verifiable = self.session_store.is_some() || self.session_probe.is_some();
+            let mut chosen = None;
+            for _ in 0..3 {
+                let Ok(id) = fresh_native_id(self.kind) else {
+                    break;
+                };
+                let exists = if verifiable {
+                    self.session_exists(&id, &workspace, &cancellation).await
+                } else {
+                    Some(Ok(false))
+                };
+                match exists {
+                    None => {
+                        return self.result(
+                            &request,
+                            ExecutionOutcome::Cancelled,
+                            None,
+                            vec![],
+                            CleanupState::Settled,
+                            SessionDisposition::NotApplicable,
+                        );
+                    }
+                    Some(Ok(false)) => {
+                        chosen = Some(id);
+                        break;
+                    }
+                    Some(Ok(true)) => {}
+                    Some(Err(())) => break,
                 }
-                Some(Ok(id)) => Some(id),
-                Some(Err(())) => {
+            }
+            match chosen {
+                Some(id) => Some(id),
+                None => {
                     return fail(
                         "native_session_unverifiable",
                         CleanupState::Settled,
@@ -849,7 +990,7 @@ impl CliBackend {
                         let id = event
                             .get("thread_id")
                             .and_then(Value::as_str)
-                            .filter(|id| valid_uuid(id))
+                            .filter(|id| CliKind::Codex.valid_native_id(id))
                             .ok_or(ObserverError)?;
                         if state
                             .session
@@ -973,6 +1114,7 @@ impl CliBackend {
         let decoded = match self.kind {
             CliKind::Codex => decode_codex(&report.stdout.bytes),
             CliKind::Claude => decode_claude(&report.stdout.bytes),
+            CliKind::OpenCode => decode_opencode(&report.stdout.bytes),
         };
         let decoded = match decoded {
             Ok(decoded) => decoded,
@@ -1206,7 +1348,9 @@ fn validate_invocation(settings: &CliSettings) -> Result<(), &'static str> {
         || !settings.new_args.iter().all(valid_arg)
         || !settings.resume_args.iter().all(valid_arg)
         || token_count(&settings.new_args) > 1
-        || (token_count(&settings.new_args) == 1 && settings.session_store.is_none())
+        || (token_count(&settings.new_args) == 1
+            && settings.session_store.is_none()
+            && settings.session_probe.is_none())
         || token_count(&settings.version.args) != 0
         || token_count(&settings.resume_args) != 1
     {
@@ -1220,6 +1364,14 @@ fn validate_invocation(settings: &CliSettings) -> Result<(), &'static str> {
         || !relative_without_parent(&env.default_state_directory)
         || !env.forbidden_prefixes.iter().all(valid_name)
         || !env.forbidden_names.iter().all(valid_name)
+        || !env.set.iter().all(|(name, value)| {
+            valid_name(name)
+                && !value.contains('\0')
+                && name != "HOME"
+                && name != "PATH"
+                && *name != env.state_directory_variable
+                && !env.inherit.contains(name)
+        })
     {
         return Err("invalid CLI environment");
     }
@@ -1238,6 +1390,23 @@ fn validate_invocation(settings: &CliSettings) -> Result<(), &'static str> {
             || store.max_entries == 0)
     {
         return Err("invalid CLI session store");
+    }
+    if let Some(probe) = &settings.session_probe
+        && (settings.session_store.is_some()
+            || probe.args.is_empty()
+            || !probe.args.iter().all(valid_arg)
+            || probe
+                .args
+                .iter()
+                .map(|arg| arg.matches(NATIVE_SESSION_TOKEN).count())
+                .sum::<usize>()
+                != 1
+            || !probe.present_id_pointer.starts_with('/')
+            || !(1..=255).contains(&probe.missing_exit_code)
+            || probe.missing_stderr_line.is_empty()
+            || probe.missing_stderr_line.contains(['\n', '\0']))
+    {
+        return Err("invalid CLI session probe");
     }
     Ok(())
 }
@@ -1359,35 +1528,61 @@ fn open_pinned_directory(directory: &crate::core::WorkingDirectory) -> Result<st
     }
 }
 
-/// Generates a random version 4 UUID that names no existing transcript in the state directory.
-fn fresh_native_id(
-    store: Option<&CliSessionStore>,
-    state: Option<&std::path::Path>,
-) -> Result<String, ()> {
+/// Base62 alphabet of the random part of an OpenCode session ID.
+const OPENCODE_ID_ALPHABET: &[u8] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/// Generates a random native session ID in the shape `kind` reports; the caller checks that it names no session.
+fn fresh_native_id(kind: CliKind) -> Result<String, ()> {
     use std::io::Read;
-    for _ in 0..3 {
-        let mut bytes = [0_u8; 16];
-        std::fs::File::open("/dev/urandom")
-            .and_then(|mut file| file.read_exact(&mut bytes))
-            .map_err(|_| ())?;
-        bytes[6] = (bytes[6] & 0x0f) | 0x40;
-        bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-        let id = format!(
-            "{}-{}-{}-{}-{}",
-            &hex[0..8],
-            &hex[8..12],
-            &hex[12..16],
-            &hex[16..20],
-            &hex[20..32]
-        );
-        // An existing transcript with this ID would make the new run continue someone else's conversation.
-        match (store, state) {
-            (Some(store), Some(state)) if native_session_present(store, state, &id)? => continue,
-            _ => return Ok(id),
+    let mut bytes = [0_u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .map_err(|_| ())?;
+    let id = match kind {
+        CliKind::Codex | CliKind::Claude => {
+            bytes[6] = (bytes[6] & 0x0f) | 0x40;
+            bytes[8] = (bytes[8] & 0x3f) | 0x80;
+            let hex: String = bytes[..16]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            format!(
+                "{}-{}-{}-{}-{}",
+                &hex[0..8],
+                &hex[8..12],
+                &hex[12..16],
+                &hex[16..20],
+                &hex[20..32]
+            )
         }
+        // OpenCode IDs are `ses_`, 12 hex digits and 14 base62 characters.
+        CliKind::OpenCode => {
+            let hex: String = bytes[..6]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let tail: String = bytes[6..20]
+                .iter()
+                .map(|byte| {
+                    OPENCODE_ID_ALPHABET[usize::from(*byte) % OPENCODE_ID_ALPHABET.len()] as char
+                })
+                .collect();
+            format!("ses_{hex}{tail}")
+        }
+    };
+    if kind.valid_native_id(&id) {
+        Ok(id)
+    } else {
+        Err(())
     }
-    Err(())
+}
+
+fn valid_opencode_id(id: &str) -> bool {
+    id.len() == 30
+        && id
+            .strip_prefix("ses_")
+            .is_some_and(|rest| rest.bytes().all(|byte| byte.is_ascii_alphanumeric()))
 }
 
 fn valid_uuid(id: &str) -> bool {
@@ -1432,10 +1627,15 @@ fn observed_warnings(kind: CliKind, bytes: &[u8]) -> Vec<ExecutionWarning> {
                     .map(|denials| !denials.is_empty())
             })
             .unwrap_or(false),
+        CliKind::OpenCode => bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .filter(|line| line.ends_with(b"\n"))
+            .filter_map(|line| crate::validation::parse_unique_json(line).ok())
+            .any(|event| opencode_tool_failed(&event)),
     };
     if has_warning {
         vec![warning(match kind {
-            CliKind::Codex => "tool_error",
+            CliKind::Codex | CliKind::OpenCode => "tool_error",
             CliKind::Claude => "permission_denied",
         })]
     } else {
@@ -1546,6 +1746,76 @@ fn decode_claude(bytes: &[u8]) -> Result<Decoded, &'static str> {
     })
 }
 
+fn opencode_tool_failed(event: &Value) -> bool {
+    event.get("type").and_then(Value::as_str) == Some("tool_use")
+        && event.pointer("/part/state/status").and_then(Value::as_str) == Some("error")
+}
+
+/// OpenCode reports no single terminal event: success is a zero exit (checked by the caller), no `error` event,
+/// one session ID on every event and at least one text part. The output is the text of the last assistant message.
+fn decode_opencode(bytes: &[u8]) -> Result<Decoded, &'static str> {
+    let mut native: Option<String> = None;
+    let mut output: Option<(String, String)> = None;
+    let mut tool_error = false;
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+    {
+        let event = crate::validation::parse_unique_json(line).map_err(|_| "invalid_cli_output")?;
+        let kind = event
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or("invalid_cli_output")?;
+        if kind == "error" {
+            return Err("cli_reported_error");
+        }
+        let id = event
+            .get("sessionID")
+            .and_then(Value::as_str)
+            .filter(|id| valid_opencode_id(id))
+            .ok_or("invalid_cli_output")?;
+        if native.as_deref().is_some_and(|known| known != id)
+            || event.pointer("/part/sessionID").and_then(Value::as_str) != Some(id)
+        {
+            return Err("invalid_cli_output");
+        }
+        native = Some(id.to_owned());
+        match kind {
+            "step_start" | "step_finish" | "reasoning" => {}
+            "text" => {
+                let message = event
+                    .pointer("/part/messageID")
+                    .and_then(Value::as_str)
+                    .ok_or("invalid_cli_output")?;
+                let text = event
+                    .pointer("/part/text")
+                    .and_then(Value::as_str)
+                    .ok_or("invalid_cli_output")?;
+                match &mut output {
+                    // Late text of one message is reported as a suffix of what was already printed.
+                    Some((current, collected)) if current == message => collected.push_str(text),
+                    _ => output = Some((message.to_owned(), text.to_owned())),
+                }
+            }
+            "tool_use" => match event.pointer("/part/state/status").and_then(Value::as_str) {
+                Some("completed") => {}
+                Some("error") => tool_error = true,
+                _ => return Err("invalid_cli_output"),
+            },
+            _ => return Err("invalid_cli_output"),
+        }
+    }
+    Ok(Decoded {
+        native_id: native.ok_or("incomplete_result")?,
+        output: output.ok_or("incomplete_result")?.1,
+        warnings: if tool_error {
+            vec![warning("tool_error")]
+        } else {
+            vec![]
+        },
+    })
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
@@ -1558,6 +1828,7 @@ mod tests {
         let text = match kind {
             CliKind::Codex => include_str!("../../examples/cli-profiles/codex.json"),
             CliKind::Claude => include_str!("../../examples/cli-profiles/claude.json"),
+            CliKind::OpenCode => include_str!("../../examples/cli-profiles/opencode.json"),
         };
         serde_json::from_str(text).unwrap()
     }
@@ -1578,9 +1849,11 @@ mod tests {
             ),
             // The Claude fixture reports the session ID it was given, like the real CLI does for --session-id and --resume.
             CliKind::Claude => "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"${sid}\",\"result\":\"done\",\"permission_denials\":[]}".to_owned(),
+            // OpenCode reports the session it was given on every event and has no terminal event.
+            CliKind::OpenCode => "{\"type\":\"step_start\",\"sessionID\":\"${sid}\",\"part\":{\"sessionID\":\"${sid}\",\"messageID\":\"msg_1\",\"type\":\"step-start\"}}\n{\"type\":\"text\",\"sessionID\":\"${sid}\",\"part\":{\"sessionID\":\"${sid}\",\"messageID\":\"msg_1\",\"type\":\"text\",\"text\":\"done\"}}".to_owned(),
         };
         let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' '{version}'; exit 0; fi\nif [ -f '{0}/missing_session' ]; then printf x >> '{0}/missing_invocations'; cat > '{0}/missing_input'; printf '%s\\n' 'session not found' >&2; exit 1; fi\nsid={ID}; prev=; for arg in \"$@\"; do if [ \"$prev\" = --session-id ] || [ \"$prev\" = --resume ]; then sid=\"$arg\"; fi; prev=\"$arg\"; done\nif [ -f '{0}/report_session' ]; then sid=$(cat '{0}/report_session'); fi\ncat > '{0}/input'\npwd > '{0}/cwd'\nprintf '%s\\n' \"$@\" > '{0}/args'\nif [ -f '{0}/exit_code' ]; then code=$(cat '{0}/exit_code'); else code=0; fi\ncat <<RESULT\n{output}\nRESULT\nexit $code\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' '{version}'; exit 0; fi\nif [ \"$1\" = api ]; then printf x >> '{0}/probes'; id=${{4#sessionID=}}; if [ -f '{0}/probe_broken' ]; then printf '%s\\n' 'HTTP 500 Internal Server Error' >&2; exit 1; fi; if [ -f '{0}/sessions/'\"$id\" ]; then printf '{{\"data\":{{\"id\":\"%s\"}}}}\\n' \"$id\"; exit 0; fi; printf '%s\\n' 'HTTP 404 Not Found' >&2; exit 1; fi\nif [ -f '{0}/missing_session' ]; then printf x >> '{0}/missing_invocations'; cat > '{0}/missing_input'; printf '%s\\n' 'session not found' >&2; exit 1; fi\nsid={ID}; prev=; for arg in \"$@\"; do if [ \"$prev\" = --session-id ] || [ \"$prev\" = --resume ] || [ \"$prev\" = --session ]; then sid=\"$arg\"; fi; prev=\"$arg\"; done\nif [ -f '{0}/report_session' ]; then sid=$(cat '{0}/report_session'); fi\ncat > '{0}/input'\npwd > '{0}/cwd'\nmkdir -p '{0}/sessions'; : > '{0}/sessions/'\"$sid\"\nprintf '%s\\n' \"$@\" > '{0}/args'\nif [ -f '{0}/exit_code' ]; then code=$(cat '{0}/exit_code'); else code=0; fi\ncat <<RESULT\n{output}\nRESULT\nexit $code\n",
             temp.path().display()
         );
         std::fs::write(&program, script).unwrap();
@@ -1605,6 +1878,7 @@ mod tests {
             expected_version: settings.version.expected_stdout,
             forbidden_workspace_entries: vec![],
             session_store: None,
+            session_probe: settings.session_probe,
             preflight_timeout: Duration::from_secs(5),
             limits: ProcessLimits {
                 max_args: 32,
@@ -1643,7 +1917,7 @@ mod tests {
 
     #[tokio::test]
     async fn cli_fixtures_preserve_input_cwd_identity_and_restricted_arguments() {
-        for kind in [CliKind::Codex, CliKind::Claude] {
+        for kind in [CliKind::Codex, CliKind::Claude, CliKind::OpenCode] {
             let (temp, backend) = fixture(kind, true);
             let observed = Arc::new(Mutex::new(Vec::new()));
             let recorded = Arc::clone(&observed);
@@ -1666,6 +1940,16 @@ mod tests {
                     assert!(valid_uuid(&native) && native != ID);
                     let args = std::fs::read_to_string(temp.path().join("args")).unwrap();
                     assert!(args.contains(&format!("--session-id\n{native}\n")));
+                }
+                // OpenCode's profile pre-assigns a fresh `ses_` ID after its probe reports it missing.
+                CliKind::OpenCode => {
+                    assert!(valid_opencode_id(&native));
+                    let args = std::fs::read_to_string(temp.path().join("args")).unwrap();
+                    assert!(args.contains(&format!("--session\n{native}\n")));
+                    assert_eq!(
+                        std::fs::read_to_string(temp.path().join("probes")).unwrap(),
+                        "x"
+                    );
                 }
             }
             assert_eq!(
@@ -1691,12 +1975,18 @@ mod tests {
                         && args.contains("--restricted\n")
                         && !args.contains("--bare\n")
                 ),
+                CliKind::OpenCode => {
+                    assert!(args.contains("--standalone\n") && !args.contains("--auto\n"))
+                }
             }
             input.session = SessionRequest::Resume(first.session.unwrap());
             let second = backend.execute(input, sink, CancellationToken::new()).await;
             assert!(matches!(second.outcome, ExecutionOutcome::Succeeded { .. }));
             let args = std::fs::read_to_string(temp.path().join("args")).unwrap();
-            assert!(args.contains("resume\n") || args.contains("--resume\n"));
+            match kind {
+                CliKind::OpenCode => assert!(args.contains(&format!("--session\n{native}\n"))),
+                _ => assert!(args.contains("resume\n") || args.contains("--resume\n")),
+            }
             assert!(observed.lock().unwrap().iter().any(|kind| matches!(kind, ExecutionEventKind::SessionObserved(session) if session.native_id == native)));
         }
     }
@@ -1920,12 +2210,19 @@ mod tests {
     }
 
     #[test]
-    fn fresh_native_ids_are_version_four_uuids() {
-        let id = fresh_native_id(None, None).unwrap();
+    fn fresh_native_ids_follow_the_shape_of_each_cli() {
+        let id = fresh_native_id(CliKind::Claude).unwrap();
         assert!(valid_uuid(&id));
         assert_eq!(&id[14..15], "4");
         assert!(matches!(&id[19..20], "8" | "9" | "a" | "b"));
-        assert_ne!(id, fresh_native_id(None, None).unwrap());
+        assert_ne!(id, fresh_native_id(CliKind::Claude).unwrap());
+        let opencode = fresh_native_id(CliKind::OpenCode).unwrap();
+        assert!(valid_opencode_id(&opencode) && opencode.starts_with("ses_"));
+        assert_ne!(opencode, fresh_native_id(CliKind::OpenCode).unwrap());
+        assert!(!valid_opencode_id("ses_short") && !valid_opencode_id(ID));
+        assert!(
+            !CliKind::OpenCode.valid_native_id(ID) && !CliKind::Claude.valid_native_id(&opencode)
+        );
     }
 
     #[tokio::test]
@@ -2320,6 +2617,96 @@ mod tests {
     }
 
     #[test]
+    fn opencode_decoder_takes_the_last_message_and_rejects_errors_and_foreign_sessions() {
+        const SES: &str = "ses_e45070eccffepPl0E3gOma8YhS";
+        let event = |kind: &str, part: &str| {
+            format!(
+                "{{\"type\":\"{kind}\",\"timestamp\":1,\"sessionID\":\"{SES}\",\"part\":{{\"sessionID\":\"{SES}\",{part}}}}}\n"
+            )
+        };
+        let text = |message: &str, text: &str| {
+            event(
+                "text",
+                &format!("\"messageID\":\"{message}\",\"type\":\"text\",\"text\":\"{text}\""),
+            )
+        };
+        let failed_tool = event(
+            "tool_use",
+            "\"messageID\":\"msg_1\",\"type\":\"tool\",\"state\":{\"status\":\"error\",\"error\":\"denied\"}",
+        );
+        let output = [
+            event(
+                "step_start",
+                "\"messageID\":\"msg_1\",\"type\":\"step-start\"",
+            ),
+            text("msg_1", "I will look."),
+            failed_tool.clone(),
+            event(
+                "step_finish",
+                "\"messageID\":\"msg_1\",\"type\":\"step-finish\"",
+            ),
+            event(
+                "step_start",
+                "\"messageID\":\"msg_2\",\"type\":\"step-start\"",
+            ),
+            text("msg_2", "final "),
+            text("msg_2", "answer"),
+        ]
+        .concat();
+        let decoded = decode_opencode(output.as_bytes()).unwrap();
+        assert_eq!(decoded.native_id, SES);
+        assert_eq!(decoded.output, "final answer");
+        assert_eq!(decoded.warnings[0].code, "tool_error");
+        assert_eq!(
+            observed_warnings(CliKind::OpenCode, output.as_bytes())[0].code,
+            "tool_error"
+        );
+        let error = format!(
+            "{}{{\"type\":\"error\",\"timestamp\":1,\"sessionID\":\"{SES}\",\"error\":{{\"type\":\"provider.free-limit\",\"message\":\"limit\"}}}}\n",
+            text("msg_1", "partial")
+        );
+        assert!(matches!(
+            decode_opencode(error.as_bytes()),
+            Err("cli_reported_error")
+        ));
+        assert!(matches!(
+            decode_opencode(
+                event(
+                    "step_start",
+                    "\"messageID\":\"msg_1\",\"type\":\"step-start\""
+                )
+                .as_bytes()
+            ),
+            Err("incomplete_result")
+        ));
+        assert!(matches!(decode_opencode(b""), Err("incomplete_result")));
+        let foreign = format!(
+            "{}{}",
+            text("msg_1", "a"),
+            text("msg_1", "b").replace(SES, "ses_000000000000AAAAAAAAAAAAAA")
+        );
+        assert!(matches!(
+            decode_opencode(foreign.as_bytes()),
+            Err("invalid_cli_output")
+        ));
+        let unknown = event("session_status", "\"type\":\"status\"");
+        assert!(matches!(
+            decode_opencode(unknown.as_bytes()),
+            Err("invalid_cli_output")
+        ));
+        let unknown_tool_state =
+            failed_tool.replace("\"error\",\"error\"", "\"running\",\"error\"");
+        assert!(matches!(
+            decode_opencode(unknown_tool_state.as_bytes()),
+            Err("invalid_cli_output")
+        ));
+        assert!(matches!(
+            decode_opencode(b"plain text\n"),
+            Err("invalid_cli_output")
+        ));
+    }
+
+    #[test]
     fn native_session_store_matches_whole_ids_within_bounds_without_following_links() {
         let temp = tempfile::tempdir().unwrap();
         let codex = example(CliKind::Codex).session_store.unwrap();
@@ -2408,6 +2795,7 @@ mod tests {
 
     #[test]
     fn invocation_settings_reject_ambiguous_session_tokens_and_unsafe_paths() {
+        assert!(validate_invocation(&example(CliKind::OpenCode)).is_ok());
         for kind in [CliKind::Codex, CliKind::Claude] {
             assert!(validate_invocation(&example(kind)).is_ok());
             let mut settings = example(kind);
@@ -2446,5 +2834,87 @@ mod tests {
             settings.compatibility = String::new();
             assert!(validate_invocation(&settings).is_err());
         }
+    }
+
+    #[test]
+    fn session_probes_and_fixed_variables_are_validated() {
+        let base = example(CliKind::OpenCode);
+        // The probe substitutes the token inside a larger argument; it alone can back a pre-assigned new session.
+        assert!(base.session_store.is_none());
+        assert!(
+            base.session_probe
+                .as_ref()
+                .unwrap()
+                .args
+                .iter()
+                .any(|arg| arg != NATIVE_SESSION_TOKEN && arg.contains(NATIVE_SESSION_TOKEN))
+        );
+        let mut settings = base.clone();
+        settings.session_probe = None;
+        assert!(validate_invocation(&settings).is_err());
+        let mut settings = base.clone();
+        settings.session_store = example(CliKind::Claude).session_store;
+        assert!(validate_invocation(&settings).is_err());
+        for edit in [
+            |probe: &mut CliSessionProbe| {
+                probe.args.retain(|arg| !arg.contains(NATIVE_SESSION_TOKEN))
+            },
+            |probe: &mut CliSessionProbe| probe.args.push(NATIVE_SESSION_TOKEN.into()),
+            |probe: &mut CliSessionProbe| probe.present_id_pointer = "data/id".into(),
+            |probe: &mut CliSessionProbe| probe.missing_exit_code = 0,
+            |probe: &mut CliSessionProbe| probe.missing_stderr_line = String::new(),
+            |probe: &mut CliSessionProbe| probe.missing_stderr_line = "a\nb".into(),
+        ] {
+            let mut settings = base.clone();
+            edit(settings.session_probe.as_mut().unwrap());
+            assert!(validate_invocation(&settings).is_err());
+        }
+        for name in ["HOME", "PATH", "XDG_DATA_HOME", "LANG", "BAD=NAME"] {
+            let mut settings = base.clone();
+            settings.environment.set.insert(name.into(), "1".into());
+            assert!(validate_invocation(&settings).is_err(), "{name}");
+        }
+        let mut settings = base.clone();
+        settings
+            .environment
+            .set
+            .insert("OPENCODE_EXTRA".into(), "a\0b".into());
+        assert!(validate_invocation(&settings).is_err());
+    }
+
+    #[tokio::test]
+    async fn opencode_resume_is_refused_before_launch_unless_the_probe_finds_the_session() {
+        let (temp, backend) = fixture(CliKind::OpenCode, true);
+        let sink: EventSink = Arc::new(|_| Ok(()));
+        let missing = SessionRef {
+            runtime: backend.metadata().runtime,
+            state_realm: backend.state_realm().to_owned(),
+            native_id: "ses_000000000000AAAAAAAAAAAAAA".into(),
+        };
+        let mut input = request(temp.path().to_path_buf());
+        input.session = SessionRequest::Resume(missing.clone());
+        let result = backend
+            .execute(input.clone(), sink.clone(), CancellationToken::new())
+            .await;
+        assert!(
+            matches!(&result.outcome, ExecutionOutcome::Failed(BackendError::ExecutionFailed { code, .. }) if code == "native_session_missing")
+        );
+        assert_eq!(result.dispatch, DispatchStatus::ProvenUnstarted);
+        assert!(!temp.path().join("input").exists());
+        // A probe failure other than the declared missing report never counts as absence or presence.
+        std::fs::write(temp.path().join("probe_broken"), "").unwrap();
+        let result = backend
+            .execute(input.clone(), sink.clone(), CancellationToken::new())
+            .await;
+        assert!(
+            matches!(&result.outcome, ExecutionOutcome::Failed(BackendError::ExecutionFailed { code, .. }) if code == "native_session_unverifiable")
+        );
+        input.session = SessionRequest::New;
+        let result = backend.execute(input, sink, CancellationToken::new()).await;
+        assert!(
+            matches!(&result.outcome, ExecutionOutcome::Failed(BackendError::ExecutionFailed { code, .. }) if code == "native_session_unverifiable")
+        );
+        assert_eq!(result.dispatch, DispatchStatus::ProvenUnstarted);
+        assert!(!temp.path().join("input").exists());
     }
 }

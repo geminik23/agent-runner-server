@@ -1,0 +1,88 @@
+{
+  "kind": "opencode",
+  "program": "/usr/local/bin/opencode",
+  "helper_program": "/usr/local/bin/agent-runner-cli-helper",
+  "compatibility": "opencode-2.2.0-wsl2-x86_64-subreaper-v1",
+  "version": {
+    "args": [
+      "--version"
+    ],
+    "expected_stdout": "opencode v2.2.0"
+  },
+  "new_args": [
+    "run",
+    "--format",
+    "json",
+    "--standalone",
+    "--session",
+    "{native_session_id}"
+  ],
+  "resume_args": [
+    "run",
+    "--format",
+    "json",
+    "--standalone",
+    "--session",
+    "{native_session_id}"
+  ],
+  "environment": {
+    "inherit": [
+      "HOME",
+      "PATH",
+      "LANG",
+      "LC_ALL",
+      "LC_CTYPE",
+      "TERM",
+      "TMPDIR",
+      "SHELL",
+      "USER",
+      "LOGNAME",
+      "XDG_CONFIG_HOME",
+      "XDG_STATE_HOME",
+      "XDG_CACHE_HOME",
+      "XDG_RUNTIME_DIR",
+      "DBUS_SESSION_BUS_ADDRESS",
+      "SSL_CERT_FILE",
+      "SSL_CERT_DIR"
+    ],
+    "state_directory_variable": "XDG_DATA_HOME",
+    "default_state_directory": ".local/share",
+    "forbidden_prefixes": [
+      "OPENCODE_"
+    ],
+    "forbidden_names": [],
+    "set": {
+      "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+      "OPENCODE_CONFIG_CONTENT": "{\"permissions\":[{\"action\":\"*\",\"resource\":\"*\",\"effect\":\"deny\"},{\"action\":\"read\",\"resource\":\"*\",\"effect\":\"allow\"},{\"action\":\"glob\",\"resource\":\"*\",\"effect\":\"allow\"},{\"action\":\"grep\",\"resource\":\"*\",\"effect\":\"allow\"},{\"action\":\"read\",\"resource\":\"*.env\",\"effect\":\"deny\"},{\"action\":\"read\",\"resource\":\"*.env.*\",\"effect\":\"deny\"},{\"action\":\"external_directory\",\"resource\":\"*\",\"effect\":\"deny\"}]}"
+    }
+  },
+  "platform": {
+    "architecture": "x86_64",
+    "kernel_release_contains": [
+      "microsoft",
+      "wsl2"
+    ]
+  },
+  "forbidden_workspace_entries": [],
+  "session_probe": {
+    "args": [
+      "api",
+      "session.get",
+      "--param",
+      "sessionID={native_session_id}",
+      "--standalone"
+    ],
+    "present_id_pointer": "/data/id",
+    "missing_exit_code": 1,
+    "missing_stderr_line": "HTTP 404 Not Found"
+  },
+  "max_stdin_bytes": 65536,
+  "max_stdout_bytes": 1048576,
+  "max_stderr_bytes": 262144,
+  "max_line_bytes": 262144,
+  "timeout_ms": 90000,
+  "preflight_timeout_ms": 10000,
+  "signal_grace_ms": 1000,
+  "kill_grace_ms": 1000,
+  "pipe_grace_ms": 1000
+}

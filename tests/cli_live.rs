@@ -90,6 +90,7 @@ fn example_settings(kind: CliKind, executable: PathBuf, timeout_ms: u64) -> CliS
     let text = match kind {
         CliKind::Codex => include_str!("../examples/cli-profiles/codex.json"),
         CliKind::Claude => include_str!("../examples/cli-profiles/claude.json"),
+        CliKind::OpenCode => include_str!("../examples/cli-profiles/opencode.json"),
     };
     let mut settings: CliSettings = serde_json::from_str(text).expect("example CLI profile");
     settings.program = executable;
@@ -134,6 +135,7 @@ fn kind_name(kind: CliKind) -> &'static str {
     match kind {
         CliKind::Codex => "codex",
         CliKind::Claude => "claude",
+        CliKind::OpenCode => "opencode",
     }
 }
 fn live_limits() -> RunLimits {
@@ -263,6 +265,7 @@ async fn run_live(kind: CliKind) {
     let (name, token) = match kind {
         CliKind::Codex => ("codex", "ORBIT642"),
         CliKind::Claude => ("claude", "MEADOW317"),
+        CliKind::OpenCode => ("opencode", "HARBOR528"),
     };
     let temp = tempfile::tempdir().unwrap();
     let timings: Timings = Arc::new(Mutex::new(HashMap::new()));
@@ -524,11 +527,9 @@ async fn live_missing_native_uuid_does_not_start_a_new_turn() {
         random[14],
         random[15]
     );
+    // OpenCode creates a session for an unknown ID by design, so its adapter probes before launch instead.
     for kind in [CliKind::Codex, CliKind::Claude] {
-        let name = match kind {
-            CliKind::Codex => "codex",
-            CliKind::Claude => "claude",
-        };
+        let name = kind_name(kind);
         let executable = program(name).canonicalize().unwrap();
         let version = std::process::Command::new(&executable)
             .arg("--version")
@@ -692,6 +693,12 @@ async fn live_claude_workspace_parallel_and_resume() {
     run_live(CliKind::Claude).await;
 }
 
+#[tokio::test]
+#[ignore = "performs approved real provider requests and creates native CLI sessions"]
+async fn live_opencode_workspace_parallel_and_resume() {
+    run_live(CliKind::OpenCode).await;
+}
+
 /// Reads the error code recorded in a terminal Run result, if any.
 async fn result_error(
     service: &RunService,
@@ -834,4 +841,10 @@ async fn live_codex_approval_result_limit_and_timeout() {
 #[ignore = "performs approved real provider requests and creates native CLI sessions"]
 async fn live_claude_approval_result_limit_and_timeout() {
     run_live_boundaries(CliKind::Claude).await;
+}
+
+#[tokio::test]
+#[ignore = "performs approved real provider requests and creates native CLI sessions"]
+async fn live_opencode_approval_result_limit_and_timeout() {
+    run_live_boundaries(CliKind::OpenCode).await;
 }
