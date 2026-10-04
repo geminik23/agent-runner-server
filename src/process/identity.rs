@@ -7,7 +7,7 @@ use std::{
         fd::{AsFd, AsRawFd, OwnedFd},
         unix::{net::UnixStream as StdUnixStream, process::CommandExt},
     },
-    sync::{Arc, Mutex, mpsc as std_mpsc},
+    sync::{Arc, Mutex, OnceLock, mpsc as std_mpsc},
     time::Duration,
 };
 
@@ -306,6 +306,73 @@ fn abandon(parent: &StdUnixStream, actor: &UnixStream, task: JoinHandle<io::Resu
     });
 }
 
+/// Identifies one parent descriptor that the forked child should close before the handshake.
+#[derive(Clone, Copy)]
+struct InheritedDescriptor {
+    fd: libc::c_int,
+    device: u64,
+    inode: u64,
+}
+
+/// Lists the parent's open descriptors above stdio except the handshake socket.
+/// A forked child holds copies of all of them until exec, which can keep other runs' pipes open while the handshake waits.
+/// An unreadable descriptor table yields an empty list, which leaves exec to close the copies as before.
+fn inherited_descriptors(keep: libc::c_int) -> Box<[InheritedDescriptor]> {
+    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+        return Box::new([]);
+    };
+    entries
+        .filter_map(|entry| {
+            entry
+                .ok()?
+                .file_name()
+                .to_str()?
+                .parse::<libc::c_int>()
+                .ok()
+        })
+        .filter(|fd| *fd > 2 && *fd != keep)
+        .filter_map(|fd| {
+            let mut status = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: fstat writes only into the provided buffer and reports closed descriptors as errors.
+            if unsafe { libc::fstat(fd, status.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            // SAFETY: A successful fstat initialized the buffer.
+            let status = unsafe { status.assume_init() };
+            Some(InheritedDescriptor {
+                fd,
+                device: status.st_dev,
+                inode: status.st_ino,
+            })
+        })
+        .collect()
+}
+
+/// Closes the recorded descriptors in the forked child before the handshake.
+/// Only descriptors that still refer to the recorded file and are close-on-exec are closed, so exec would have closed them anyway.
+/// Descriptors opened after the list was taken, and descriptors deliberately inherited across exec, stay open.
+/// This runs between fork and exec and therefore uses only async-signal-safe calls without allocation.
+fn close_inherited_copies(descriptors: &[InheritedDescriptor]) {
+    for descriptor in descriptors {
+        // SAFETY: fcntl only reads descriptor flags of this process.
+        let flags = unsafe { libc::fcntl(descriptor.fd, libc::F_GETFD) };
+        if flags < 0 || flags & libc::FD_CLOEXEC == 0 {
+            continue;
+        }
+        let mut status = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: fstat writes only into the stack buffer.
+        if unsafe { libc::fstat(descriptor.fd, status.as_mut_ptr()) } != 0 {
+            continue;
+        }
+        // SAFETY: A successful fstat initialized the buffer.
+        let status = unsafe { status.assume_init() };
+        if status.st_dev == descriptor.device && status.st_ino == descriptor.inode {
+            // SAFETY: The descriptor is a close-on-exec copy owned by this forked child.
+            unsafe { libc::close(descriptor.fd) };
+        }
+    }
+}
+
 fn outside_stdio(stream: StdUnixStream) -> Result<StdUnixStream, ProcessError> {
     if stream.as_raw_fd() > 2 {
         return Ok(stream);
@@ -411,7 +478,11 @@ async fn spawn_checked(
     let keep_parent = Arc::clone(&parent);
     let keep_actor = Arc::clone(&actor);
     let keep_peer = Arc::clone(&peer);
+    let peer_fd = peer.as_raw_fd();
+    let inherited = Arc::new(OnceLock::<Box<[InheritedDescriptor]>>::new());
+    let close_inherited = Arc::clone(&inherited);
     // SAFETY: The child callback uses only async-signal-safe syscalls and stack data before exec.
+    // It is registered after the caller's callbacks, so the pinned directory change has already happened.
     unsafe {
         command.as_std_mut().pre_exec(move || {
             let parent_fd = keep_parent.as_raw_fd();
@@ -419,6 +490,9 @@ async fn spawn_checked(
             let child_fd = keep_peer.as_raw_fd();
             libc::close(parent_fd);
             libc::close(actor_fd);
+            if let Some(descriptors) = close_inherited.get() {
+                close_inherited_copies(descriptors);
+            }
             let pid = libc::getpid().to_ne_bytes();
             child_write(child_fd, &pid)?;
             child_write(child_fd, &secret)?;
@@ -438,6 +512,8 @@ async fn spawn_checked(
         let Some((mut command, _permit)) = job else {
             return Err(io::Error::from(io::ErrorKind::Interrupted));
         };
+        // Recording on the spawning thread keeps descriptors that the standard library opens for this spawn out of the list.
+        let _ = inherited.set(inherited_descriptors(peer_fd));
         (policy.spawn)(&mut command)
     });
     let mut initial = [0_u8; 36];
@@ -581,6 +657,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     static PROBE_PID: AtomicU32 = AtomicU32::new(0);
+    static HANDSHAKE_DESCRIPTORS: std::sync::Mutex<Option<Vec<i32>>> = std::sync::Mutex::new(None);
     static FAILURE_PID: AtomicU32 = AtomicU32::new(0);
     static SLOT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -628,6 +705,76 @@ mod tests {
         assert!(
             matches!(result,Err(error) if matches!(error.kind(),io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut))
         );
+    }
+
+    #[tokio::test]
+    async fn preexec_child_drops_inherited_close_on_exec_copies_before_the_handshake() {
+        use std::os::fd::AsRawFd;
+        // The probe runs while the child still waits for GO, so it sees the descriptor table the handshake keeps.
+        fn observe(group: &OwnedGroup) -> Result<(), io::ErrorKind> {
+            let descriptors = std::fs::read_dir(format!("/proc/{}/fd", group.pid))
+                .unwrap()
+                .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+                .collect();
+            *HANDSHAKE_DESCRIPTORS.lock().unwrap() = Some(descriptors);
+            Err(io::ErrorKind::Unsupported)
+        }
+        let (held_read, held_write) = std::os::unix::net::UnixStream::pair().unwrap();
+        let held = [held_read.as_raw_fd(), held_write.as_raw_fd()];
+        // SAFETY: open receives a valid NUL-terminated path; omitting O_CLOEXEC makes the descriptor inheritable across exec.
+        let inheritable = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+        assert!(inheritable > 2);
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "process::identity::tests::marker_fixture",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("AGENT_RUNNER_IDENTITY_MARKER", dir.path().join("marker"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.as_std_mut().process_group(0);
+        let token = CancellationToken::new();
+        let result = spawn_checked(
+            command,
+            &token,
+            &token,
+            Instant::now() + Duration::from_secs(3),
+            Duration::from_secs(3),
+            Duration::from_secs(1),
+            LaunchPolicy {
+                probe: observe,
+                spawn: Command::spawn,
+            },
+        )
+        .await;
+        // SAFETY: The descriptor was opened above and is closed exactly once.
+        unsafe { libc::close(inheritable) };
+        assert!(matches!(
+            result,
+            Err(ProcessError::IdentityUnavailable(
+                io::ErrorKind::Unsupported
+            ))
+        ));
+        let observed = HANDSHAKE_DESCRIPTORS.lock().unwrap().take().unwrap();
+        for fd in [0, 1, 2] {
+            assert!(observed.contains(&fd), "stdio {fd} must stay open");
+        }
+        for fd in held {
+            assert!(
+                !observed.contains(&fd),
+                "close-on-exec descriptor {fd} was still held during the handshake: {observed:?}"
+            );
+        }
+        assert!(
+            observed.contains(&inheritable),
+            "a descriptor inherited across exec must stay open"
+        );
+        drop((held_read, held_write));
     }
 
     #[tokio::test]
