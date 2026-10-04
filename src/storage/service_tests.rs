@@ -2247,3 +2247,69 @@ fn rolled_back_queued_launch_quarantines_the_entire_unknown_native_realm() {
         ));
     }
 }
+
+/// Finishes one launched run whose native session was observed with the given cleanup and an unproven disposition.
+fn finish_bound_with(
+    store: &mut SqliteStore,
+    key: &str,
+    native: &str,
+    cleanup: CleanupState,
+) -> String {
+    store.service_admit(&admission(key)).unwrap();
+    let job = store.service_claim(1_000).unwrap().unwrap();
+    store.service_launch(&job, 1_001).unwrap();
+    let session = SessionRef {
+        runtime: "dummy".into(),
+        state_realm: "dummy".into(),
+        native_id: native.into(),
+    };
+    store
+        .service_event(&job, "run.session", b"{}", Some(&session), 8)
+        .unwrap();
+    let candidate = Candidate {
+        state: TerminalState::Failed,
+        details: json!({"error": "cli_execution_failed"}),
+        cleanup,
+        disposition: SessionDisposition::Uncertain,
+    };
+    store.service_finish(&job, &candidate, 1_002, 1024).unwrap();
+    job.session_id
+}
+
+#[test]
+fn settled_cleanup_keeps_only_the_failed_session_reserved() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let session = finish_bound_with(&mut store, "failed", "native-failed", CleanupState::Settled);
+    // No process from the run remains, so other new sessions in the realm are admitted and launched.
+    assert!(matches!(
+        store.service_admit(&admission("other")),
+        Ok(AdmissionOutcome::Accepted(_))
+    ));
+    let other = store.service_claim(1_003).unwrap().unwrap();
+    store.service_launch(&other, 1_004).unwrap();
+    store
+        .service_finish(&other, &success(), 1_005, 1024)
+        .unwrap();
+    // The failed session itself stays reserved until its reuse is proven or an operator releases it.
+    let mut resume = admission("resume-failed");
+    resume.resume_session_id = Some(session);
+    assert!(matches!(
+        store.service_admit(&resume),
+        Err(StorageError::SessionBusy)
+    ));
+}
+
+#[test]
+fn uncertain_cleanup_still_blocks_new_sessions_in_the_realm() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    finish_bound_with(
+        &mut store,
+        "interrupted",
+        "native-interrupted",
+        CleanupState::Uncertain,
+    );
+    assert!(matches!(
+        store.service_admit(&admission("other")),
+        Err(StorageError::SessionBusy)
+    ));
+}

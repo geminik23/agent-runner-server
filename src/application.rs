@@ -2686,8 +2686,8 @@ async fn process_job(shared: &Arc<Shared>, job: ClaimedJob) -> Result<(), Servic
         }
         _ => uncertain_candidate("backend_or_event_failure"),
     };
-    let journal_safe = candidate.cleanup == CleanupState::Settled
-        && candidate.disposition == SessionDisposition::Reusable;
+    // Matches the workspace release in the finish transaction: settled cleanup ends the launch even when the session stays reserved.
+    let journal_safe = candidate.cleanup == CleanupState::Settled;
     let limit = shared.limits.max_result_bytes;
     shared
         .database

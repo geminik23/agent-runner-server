@@ -415,7 +415,7 @@ async fn verified_parallel_settlement_reconciles_workspace_journal_on_restart() 
     };
     let bindings = vec![
         (namespace.clone(), session_a, native("fixture-a")),
-        (namespace.clone(), session_b, native("fixture-b")),
+        (namespace.clone(), session_b.clone(), native("fixture-b")),
     ];
     store
         .bind_independent_sessions_for_settlement(&bindings)
@@ -432,10 +432,18 @@ async fn verified_parallel_settlement_reconciles_workspace_journal_on_restart() 
     );
     drop(store);
 
+    // The bound but unsettled session stays reserved; its cleanup is settled, so only its own resume is refused.
     let blocked = service(temp.path(), make_backend(false), Arc::clone(&access)).await;
     assert!(
         blocked
-            .start(&client, &body("a", "still-blocked", json!({"mode":"new"})))
+            .start(
+                &client,
+                &body(
+                    "b",
+                    "still-blocked",
+                    json!({"mode":"resume","session_id":session_b})
+                )
+            )
             .await
             .is_err()
     );

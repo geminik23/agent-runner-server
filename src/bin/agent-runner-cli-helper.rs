@@ -151,6 +151,11 @@ fn main() {
         }
         break;
     }
+    // Written only after waitpid reported no remaining child, so every descendant that stayed in this subreaper's tree has exited.
+    // The backend treats it as cleanup evidence only together with this helper's own normal exit.
+    if started_marker && exited_marker && !framed_stdin {
+        let _ = io::stderr().write_all(b"\x1eagent-runner:descendants-reaped\n");
+    }
     if !started_marker || !exited_marker || !input_complete {
         std::process::exit(2);
     }

@@ -44,6 +44,8 @@ pub struct QuarantinedRun {
     pub stop_cause: Option<String>,
     pub native_id: Option<String>,
     pub launched: bool,
+    /// Recorded session cleanup; `settled` means no process from the run remains and only this session stays reserved.
+    pub cleanup: Option<String>,
     /// Configured workspace ID pinned at admission; maintenance resolves it to the visible directory.
     pub workspace_id: Option<String>,
     /// Stored workspace resource key (`<device>:<path below the mount root>`), not a path to open.
@@ -60,7 +62,7 @@ impl SqliteStore {
         let sql = format!(
             "SELECT r.owner_id, r.client_id, r.run_id, r.session_id, r.runtime, r.state, j.stop_cause, \
              EXISTS(SELECT 1 FROM attempts a WHERE a.owner_id=r.owner_id AND a.client_id=r.client_id AND a.run_id=r.run_id AND a.spawn_intent=1), \
-             s.state_realm, s.native_id, s.reserved_run_id=r.run_id, w.resource_path, COALESCE(w.held,0), COALESCE(w.uncertain,0), j.workspace_id \
+             s.state_realm, s.native_id, s.reserved_run_id=r.run_id, w.resource_path, COALESCE(w.held,0), COALESCE(w.uncertain,0), j.workspace_id, s.cleanup \
              FROM runs r \
              LEFT JOIN service_jobs j USING (owner_id, client_id, run_id) \
              LEFT JOIN sessions s ON s.owner_id=r.owner_id AND s.client_id=r.client_id AND s.session_id=r.session_id \
@@ -96,6 +98,7 @@ impl SqliteStore {
                 state_realm: row.get(8)?,
                 native_id,
                 workspace_id: row.get(14)?,
+                cleanup: row.get(15)?,
                 workspace_key: row.get(11)?,
                 kind,
             })

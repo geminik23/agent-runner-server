@@ -664,6 +664,57 @@ impl CliBackend {
             }
         }
         let metadata = self.metadata();
+        // A profile that names a new session up front lets the service bind it before the CLI starts,
+        // so an interrupted new session never becomes an unidentified one.
+        let preassigned = if matches!(request.session, SessionRequest::New)
+            && self.new_args.iter().any(|arg| arg == NATIVE_SESSION_TOKEN)
+        {
+            let store = self.session_store.clone();
+            let state = self
+                .state_directory
+                .as_ref()
+                .map(|state| state.path.clone());
+            let fresh = tokio::select! {
+                _ = cancellation.cancelled() => None,
+                result = tokio::task::spawn_blocking(move || fresh_native_id(store.as_ref(), state.as_deref())) => Some(result.unwrap_or(Err(()))),
+            };
+            match fresh {
+                None => {
+                    return self.result(
+                        &request,
+                        ExecutionOutcome::Cancelled,
+                        None,
+                        vec![],
+                        CleanupState::Settled,
+                        SessionDisposition::NotApplicable,
+                    );
+                }
+                Some(Ok(id)) => Some(id),
+                Some(Err(())) => {
+                    return fail(
+                        "native_session_unverifiable",
+                        CleanupState::Settled,
+                        SessionDisposition::NotApplicable,
+                        None,
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        let args: Vec<OsString> = match &preassigned {
+            Some(id) => args
+                .into_iter()
+                .map(|arg| {
+                    if arg == NATIVE_SESSION_TOKEN {
+                        OsString::from(id)
+                    } else {
+                        arg
+                    }
+                })
+                .collect(),
+            None => args,
+        };
         let emit = |kind| {
             events(ExecutionEvent {
                 run_id: request.run_id.clone(),
@@ -673,7 +724,11 @@ impl CliBackend {
             })
         };
         let known = match &request.session {
-            SessionRequest::New => None,
+            SessionRequest::New => preassigned.map(|native_id| SessionRef {
+                runtime: metadata.runtime.clone(),
+                state_realm: self.state_realm.clone(),
+                native_id,
+            }),
             SessionRequest::Resume(session) => Some(session.clone()),
         };
         let start_observer: ProcessStartObserver = {
@@ -706,6 +761,7 @@ impl CliBackend {
             stderr_bytes: Vec::new(),
             child_started: false,
             child_exited: false,
+            descendants_reaped: false,
             session: known.clone(),
             emitted: known.is_some(),
             thread_seen: false,
@@ -743,6 +799,13 @@ impl CliBackend {
                         {
                             state.child_exited = true;
                             Some("cli_child_exited")
+                        } else if line == b"\x1eagent-runner:descendants-reaped\n"
+                            && state.child_exited
+                            && !state.descendants_reaped
+                        {
+                            // Recorded without an event: it only becomes cleanup evidence once the helper exits by itself.
+                            state.descendants_reaped = true;
+                            None
                         } else {
                             None
                         };
@@ -839,7 +902,10 @@ impl CliBackend {
             Some(opened),
         )
         .await;
-        let mut session = stream.lock().ok().and_then(|state| state.session.clone());
+        let (mut session, reaped) = stream
+            .lock()
+            .map(|state| (state.session.clone(), state.descendants_reaped))
+            .unwrap_or((None, false));
         let report = match report {
             Ok(report) => report,
             Err(_) => {
@@ -861,6 +927,19 @@ impl CliBackend {
             warnings
         };
         let observed_warnings = with_version(observed_warnings(self.kind, &report.stdout.bytes));
+        // The helper exits by itself only after waitpid reports no remaining child, so its own exit after the
+        // reaped marker proves that no process from this run's tree is left. Forced or cancelled stops prove nothing.
+        let process_cleanup = if reaped
+            && report.reason == StopReason::Exited
+            && report.direct_io_settled()
+            && report.exit.is_some_and(|exit| exit.signal.is_none())
+            && !report.signals.graceful_attempted
+            && !report.signals.force_attempted
+        {
+            CleanupState::Settled
+        } else {
+            CleanupState::Uncertain
+        };
         let fail_observed = |code: &str, session| {
             self.result(
                 &request,
@@ -870,7 +949,7 @@ impl CliBackend {
                 }),
                 session,
                 observed_warnings.clone(),
-                CleanupState::Uncertain,
+                process_cleanup,
                 SessionDisposition::Uncertain,
             )
         };
@@ -1020,6 +1099,8 @@ struct StreamSession {
     stderr_bytes: Vec<u8>,
     child_started: bool,
     child_exited: bool,
+    /// The helper reported that no descendant remained in its subreaper tree.
+    descendants_reaped: bool,
     session: Option<SessionRef>,
     emitted: bool,
     thread_seen: bool,
@@ -1124,7 +1205,8 @@ fn validate_invocation(settings: &CliSettings) -> Result<(), &'static str> {
         || !settings.version.args.iter().all(valid_arg)
         || !settings.new_args.iter().all(valid_arg)
         || !settings.resume_args.iter().all(valid_arg)
-        || token_count(&settings.new_args) != 0
+        || token_count(&settings.new_args) > 1
+        || (token_count(&settings.new_args) == 1 && settings.session_store.is_none())
         || token_count(&settings.version.args) != 0
         || token_count(&settings.resume_args) != 1
     {
@@ -1275,6 +1357,37 @@ fn open_pinned_directory(directory: &crate::core::WorkingDirectory) -> Result<st
             Ok(file)
         }
     }
+}
+
+/// Generates a random version 4 UUID that names no existing transcript in the state directory.
+fn fresh_native_id(
+    store: Option<&CliSessionStore>,
+    state: Option<&std::path::Path>,
+) -> Result<String, ()> {
+    use std::io::Read;
+    for _ in 0..3 {
+        let mut bytes = [0_u8; 16];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut file| file.read_exact(&mut bytes))
+            .map_err(|_| ())?;
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let id = format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        );
+        // An existing transcript with this ID would make the new run continue someone else's conversation.
+        match (store, state) {
+            (Some(store), Some(state)) if native_session_present(store, state, &id)? => continue,
+            _ => return Ok(id),
+        }
+    }
+    Err(())
 }
 
 fn valid_uuid(id: &str) -> bool {
@@ -1463,12 +1576,11 @@ mod tests {
             CliKind::Codex => format!(
                 "{{\"type\":\"thread.started\",\"thread_id\":\"{ID}\"}}\n{{\"type\":\"turn.started\"}}\n{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"done\"}}}}\n{{\"type\":\"turn.completed\"}}"
             ),
-            CliKind::Claude => format!(
-                "{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"{ID}\",\"result\":\"done\",\"permission_denials\":[]}}"
-            ),
+            // The Claude fixture reports the session ID it was given, like the real CLI does for --session-id and --resume.
+            CliKind::Claude => "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"${sid}\",\"result\":\"done\",\"permission_denials\":[]}".to_owned(),
         };
         let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' '{version}'; exit 0; fi\nif [ -f '{0}/missing_session' ]; then printf x >> '{0}/missing_invocations'; cat > '{0}/missing_input'; printf '%s\\n' 'session not found' >&2; exit 1; fi\ncat > '{0}/input'\npwd > '{0}/cwd'\nprintf '%s\\n' \"$@\" > '{0}/args'\ncat <<'RESULT'\n{output}\nRESULT\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' '{version}'; exit 0; fi\nif [ -f '{0}/missing_session' ]; then printf x >> '{0}/missing_invocations'; cat > '{0}/missing_input'; printf '%s\\n' 'session not found' >&2; exit 1; fi\nsid={ID}; prev=; for arg in \"$@\"; do if [ \"$prev\" = --session-id ] || [ \"$prev\" = --resume ]; then sid=\"$arg\"; fi; prev=\"$arg\"; done\nif [ -f '{0}/report_session' ]; then sid=$(cat '{0}/report_session'); fi\ncat > '{0}/input'\npwd > '{0}/cwd'\nprintf '%s\\n' \"$@\" > '{0}/args'\nif [ -f '{0}/exit_code' ]; then code=$(cat '{0}/exit_code'); else code=0; fi\ncat <<RESULT\n{output}\nRESULT\nexit $code\n",
             temp.path().display()
         );
         std::fs::write(&program, script).unwrap();
@@ -1546,7 +1658,16 @@ mod tests {
             assert!(
                 matches!(&first.outcome, ExecutionOutcome::Succeeded { output } if output == "done")
             );
-            assert_eq!(first.session.as_ref().unwrap().native_id, ID);
+            let native = first.session.as_ref().unwrap().native_id.clone();
+            match kind {
+                CliKind::Codex => assert_eq!(native, ID),
+                // Claude's profile pre-assigns a fresh UUID for every new session.
+                CliKind::Claude => {
+                    assert!(valid_uuid(&native) && native != ID);
+                    let args = std::fs::read_to_string(temp.path().join("args")).unwrap();
+                    assert!(args.contains(&format!("--session-id\n{native}\n")));
+                }
+            }
             assert_eq!(
                 std::fs::read_to_string(temp.path().join("input")).unwrap(),
                 "literal prompt\n"
@@ -1576,7 +1697,7 @@ mod tests {
             assert!(matches!(second.outcome, ExecutionOutcome::Succeeded { .. }));
             let args = std::fs::read_to_string(temp.path().join("args")).unwrap();
             assert!(args.contains("resume\n") || args.contains("--resume\n"));
-            assert!(observed.lock().unwrap().iter().any(|kind| matches!(kind, ExecutionEventKind::SessionObserved(session) if session.native_id == ID)));
+            assert!(observed.lock().unwrap().iter().any(|kind| matches!(kind, ExecutionEventKind::SessionObserved(session) if session.native_id == native)));
         }
     }
 
@@ -1622,6 +1743,8 @@ mod tests {
                 state_realm: backend.state_realm().to_owned(),
                 native_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
             });
+            // The Claude fixture echoes the requested ID unless told to report another one.
+            std::fs::write(temp.path().join("report_session"), ID).unwrap();
             let sink: EventSink = Arc::new(|_| Ok(()));
             let result = backend.execute(input, sink, CancellationToken::new()).await;
             assert!(matches!(result.outcome, ExecutionOutcome::Failed(_)));
@@ -1714,6 +1837,95 @@ mod tests {
         assert!(validate_invocation(&settings).is_err());
         settings.version.expected_stdout = Some(" ".into());
         assert!(validate_invocation(&settings).is_err());
+    }
+
+    /// Wraps the fixture in a script that speaks the helper's marker protocol, optionally without the reaped marker.
+    fn with_fake_helper(temp: &TempDir, backend: &mut CliBackend, reaped: bool) {
+        let helper = temp.path().join("fake-helper");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' '{HELPER_VERSION}'; exit 0; fi\nshift\nprintf '\\036agent-runner:child-started\\n' >&2\n\"$@\"\ncode=$?\nprintf '\\036agent-runner:child-exited\\n' >&2\n{}exit $code\n",
+            if reaped {
+                "printf '\\036agent-runner:descendants-reaped\\n' >&2\n"
+            } else {
+                ""
+            }
+        );
+        std::fs::write(&helper, script).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        backend.helper_program = Some(helper);
+    }
+
+    #[tokio::test]
+    async fn a_failed_cli_settles_cleanup_only_after_the_helper_reports_reaped_descendants() {
+        for (reaped, expected) in [
+            (true, CleanupState::Settled),
+            (false, CleanupState::Uncertain),
+        ] {
+            let (temp, mut backend) = fixture(CliKind::Codex, true);
+            with_fake_helper(&temp, &mut backend, reaped);
+            std::fs::write(temp.path().join("exit_code"), "3").unwrap();
+            let sink: EventSink = Arc::new(|_| Ok(()));
+            let result = backend
+                .execute(
+                    request(temp.path().to_path_buf()),
+                    sink,
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(
+                matches!(result.outcome, ExecutionOutcome::Failed(_)),
+                "{:?}",
+                result.outcome
+            );
+            assert_eq!(result.cleanup, expected, "reaped marker {reaped}");
+            // Reuse of the native session is still unproven after a failed turn.
+            assert_eq!(result.session_disposition, SessionDisposition::Uncertain);
+            assert_eq!(result.session.unwrap().native_id, ID);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_new_claude_session_keeps_its_pre_assigned_identity() {
+        let (temp, mut backend) = fixture(CliKind::Claude, true);
+        with_fake_helper(&temp, &mut backend, true);
+        std::fs::write(temp.path().join("exit_code"), "1").unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&observed);
+        let sink: EventSink = Arc::new(move |event| {
+            recorded.lock().unwrap().push(event.kind);
+            Ok(())
+        });
+        let result = backend
+            .execute(
+                request(temp.path().to_path_buf()),
+                sink,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result.outcome, ExecutionOutcome::Failed(_)));
+        let native = result.session.expect("pre-assigned session").native_id;
+        assert!(valid_uuid(&native));
+        // The identity is reported when the process starts, before the CLI could print anything.
+        let kinds = observed.lock().unwrap();
+        let started = kinds
+            .iter()
+            .position(|kind| matches!(kind, ExecutionEventKind::Started))
+            .unwrap();
+        let bound = kinds
+            .iter()
+            .position(|kind| matches!(kind, ExecutionEventKind::SessionObserved(session) if session.native_id == native))
+            .unwrap();
+        assert_eq!(bound, started + 1);
+        assert_eq!(result.cleanup, CleanupState::Settled);
+    }
+
+    #[test]
+    fn fresh_native_ids_are_version_four_uuids() {
+        let id = fresh_native_id(None, None).unwrap();
+        assert!(valid_uuid(&id));
+        assert_eq!(&id[14..15], "4");
+        assert!(matches!(&id[19..20], "8" | "9" | "a" | "b"));
+        assert_ne!(id, fresh_native_id(None, None).unwrap());
     }
 
     #[tokio::test]
@@ -2206,8 +2418,17 @@ mod tests {
             let mut settings = example(kind);
             settings.resume_args.push(NATIVE_SESSION_TOKEN.into());
             assert!(validate_invocation(&settings).is_err());
+            // One token in the new arguments pre-assigns the session ID; it needs a session store to avoid collisions.
             let mut settings = example(kind);
+            settings.new_args.retain(|arg| arg != NATIVE_SESSION_TOKEN);
             settings.new_args.push(NATIVE_SESSION_TOKEN.into());
+            assert!(validate_invocation(&settings).is_ok());
+            settings.new_args.push(NATIVE_SESSION_TOKEN.into());
+            assert!(validate_invocation(&settings).is_err());
+            let mut settings = example(kind);
+            settings.new_args.retain(|arg| arg != NATIVE_SESSION_TOKEN);
+            settings.new_args.push(NATIVE_SESSION_TOKEN.into());
+            settings.session_store = None;
             assert!(validate_invocation(&settings).is_err());
             let mut settings = example(kind);
             settings.environment.inherit.retain(|name| name != "HOME");

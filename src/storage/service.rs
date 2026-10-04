@@ -233,7 +233,7 @@ impl SqliteStore {
             (None, None) => None,
         };
         let quarantined: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions s LEFT JOIN service_jobs j ON j.owner_id = s.owner_id AND j.client_id = s.client_id AND j.run_id = s.reserved_run_id LEFT JOIN attempts a ON a.owner_id = j.owner_id AND a.client_id = j.client_id AND a.run_id = j.run_id AND a.attempt_id = j.attempt_id LEFT JOIN runs r ON r.owner_id = s.owner_id AND r.client_id = s.client_id AND r.run_id = s.reserved_run_id WHERE s.runtime = ?1 AND s.state_realm = ?2 AND s.reserved_run_id IS NOT NULL AND ((s.native_id IS NULL AND (j.queue_id IS NULL OR a.spawn_intent = 1 OR (s.cleanup='uncertain' AND r.state IN ('succeeded','failed','cancelled','timed_out','interrupted'))) AND NOT (?4 AND COALESCE(j.independent_new_sessions,0)=1 AND r.state IN ('queued','preparing','running','validating') AND j.stop_cause IS NULL)) OR (?3 AND s.native_id IS NOT NULL AND r.state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted'))))",
+            "SELECT EXISTS(SELECT 1 FROM sessions s LEFT JOIN service_jobs j ON j.owner_id = s.owner_id AND j.client_id = s.client_id AND j.run_id = s.reserved_run_id LEFT JOIN attempts a ON a.owner_id = j.owner_id AND a.client_id = j.client_id AND a.run_id = j.run_id AND a.attempt_id = j.attempt_id LEFT JOIN runs r ON r.owner_id = s.owner_id AND r.client_id = s.client_id AND r.run_id = s.reserved_run_id WHERE s.runtime = ?1 AND s.state_realm = ?2 AND s.reserved_run_id IS NOT NULL AND ((s.native_id IS NULL AND (j.queue_id IS NULL OR a.spawn_intent = 1 OR (s.cleanup='uncertain' AND r.state IN ('succeeded','failed','cancelled','timed_out','interrupted'))) AND NOT (?4 AND COALESCE(j.independent_new_sessions,0)=1 AND r.state IN ('queued','preparing','running','validating') AND j.stop_cause IS NULL)) OR (?3 AND s.native_id IS NOT NULL AND COALESCE(s.cleanup,'uncertain')<>'settled' AND r.state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted'))))",
             params![admission.metadata.runtime, admission.state_realm, resume_session_id.is_none(), admission.independent_new_sessions],
             |row| row.get(0),
         )?;
@@ -393,7 +393,7 @@ impl SqliteStore {
                  LEFT JOIN runs other_run ON other_run.owner_id=oj.owner_id AND other_run.client_id=oj.client_id AND other_run.run_id=oj.run_id
                  WHERE other.runtime=r.runtime AND other.state_realm=j.state_realm AND other.reserved_run_id IS NOT NULL
                  AND NOT (other.owner_id=j.owner_id AND other.client_id=j.client_id AND other.reserved_run_id=j.run_id)
-                 AND ((other.native_id IS NULL AND (oj.queue_id IS NULL OR oj.claim_token IS NOT NULL OR oa.spawn_intent=1 OR (other.cleanup='uncertain' AND other_run.state IN ('succeeded','failed','cancelled','timed_out','interrupted')))) OR (s.native_id IS NULL AND other.native_id IS NOT NULL))
+                 AND ((other.native_id IS NULL AND (oj.queue_id IS NULL OR oj.claim_token IS NOT NULL OR oa.spawn_intent=1 OR (other.cleanup='uncertain' AND other_run.state IN ('succeeded','failed','cancelled','timed_out','interrupted')))) OR (s.native_id IS NULL AND other.native_id IS NOT NULL AND NOT (COALESCE(other.cleanup,'uncertain')='settled' AND other_run.state IN ('succeeded','failed','cancelled','timed_out','interrupted'))))
                  AND NOT (j.independent_new_sessions=1 AND COALESCE(oj.independent_new_sessions,0)=1 AND other_run.state IN ('queued','preparing','running','validating') AND oj.stop_cause IS NULL)
              )
              AND NOT EXISTS (
@@ -1318,8 +1318,9 @@ fn finish_tx(
             params![namespace.owner_id, namespace.client_id, session_id],
         )?;
     }
-    let workspace_uncertain = candidate.cleanup == CleanupState::Uncertain
-        || (spawn && candidate.disposition != SessionDisposition::Reusable);
+    // A workspace stays held only while a process from the run may still write to it. An unproven session
+    // disposition keeps the session reserved but does not hold the workspace once cleanup is settled.
+    let workspace_uncertain = candidate.cleanup == CleanupState::Uncertain;
     tx.execute(
         "UPDATE run_workspaces SET held=?1, uncertain=?1 WHERE owner_id=?2 AND client_id=?3 AND run_id=?4",
         params![workspace_uncertain, namespace.owner_id, namespace.client_id, run_id],

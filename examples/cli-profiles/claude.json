@@ -2,7 +2,7 @@
   "kind": "claude",
   "program": "/usr/local/bin/claude",
   "helper_program": "/usr/local/bin/agent-runner-cli-helper",
-  "compatibility": "claude-2.1.286-wsl2-x86_64-subreaper-v1",
+  "compatibility": "claude-2.1.286-wsl2-x86_64-subreaper-v2",
   "version": {
     "args": [
       "--version"
@@ -21,7 +21,9 @@
     "--permission-mode",
     "dontAsk",
     "--permission-prompts",
-    "none"
+    "none",
+    "--session-id",
+    "{native_session_id}"
   ],
   "resume_args": [
     "-p",

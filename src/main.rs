@@ -171,6 +171,10 @@ fn print_entry(entry: &QuarantinedRun, directory: Option<std::path::PathBuf>) {
             "every new run and resume in this state realm",
             "abandons the session; it can never be resumed",
         ),
+        QuarantineKind::BoundSession if entry.cleanup.as_deref() == Some("settled") => (
+            "only this session; no process from the run remains",
+            "makes the session resumable again",
+        ),
         QuarantineKind::BoundSession => (
             "new sessions in this state realm and this session",
             "makes the session resumable again",

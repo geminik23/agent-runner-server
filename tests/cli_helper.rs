@@ -579,3 +579,35 @@ async fn a_detached_descendant_outliving_deadline_never_reports_normal_completio
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn helper_reports_reaped_descendants_only_after_a_detached_descendant_exits() {
+    let _gate = SPAWN_GATE.read().await;
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("cli-fixture");
+    let marker = temp.path().join("descendant-finished");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n/usr/bin/setsid /bin/sh -c 'sleep 0.3; printf finished > \"{}\"' </dev/null >/dev/null 2>&1 &\nexit 4\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-runner-cli-helper"))
+        .arg("--")
+        .arg(&script)
+        .arg("fixture")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    // The CLI's own failure code is preserved, and the reaped marker follows the exit marker only after the descendant finished.
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(
+        output.stderr,
+        b"\x1eagent-runner:child-started\n\x1eagent-runner:child-exited\n\x1eagent-runner:descendants-reaped\n"
+    );
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "finished");
+}

@@ -176,9 +176,10 @@ fn private_dir(path: &Path) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 /// Writes a fake CLI that records its native transcript at `transcript`, a shell path expression.
-fn cli_fixture(path: &Path, version: &str, transcript: &str, output: &str) {
+/// `${sid}` in `transcript` and `output` is the ID passed with `--session-id` or `--resume`, otherwise `default_id`.
+fn cli_fixture(path: &Path, version: &str, default_id: &str, transcript: &str, output: &str) {
     let script = format!(
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' '{version}'; exit 0; fi\nprintf x >> \"$0.calls\"\ncat >/dev/null\nmkdir -p \"$(dirname \"{transcript}\")\" && : >> \"{transcript}\"\ncat <<'RESULT'\n{output}\nRESULT\n"
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' '{version}'; exit 0; fi\nprintf x >> \"$0.calls\"\nsid={default_id}; prev=; for arg in \"$@\"; do if [ \"$prev\" = --session-id ] || [ \"$prev\" = --resume ]; then sid=\"$arg\"; fi; prev=\"$arg\"; done\ncat >/dev/null\nmkdir -p \"$(dirname \"{transcript}\")\" && : >> \"{transcript}\"\ncat <<RESULT\n{output}\nRESULT\n"
     );
     std::fs::write(path, script).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -205,6 +206,7 @@ async fn configured_cli_profiles_use_real_server_and_owned_state_without_live_pr
         example_profile("codex")["version"]["expected_stdout"]
             .as_str()
             .unwrap(),
+        ID,
         &format!("$CODEX_HOME/sessions/2026/11/07/rollout-fixture-{ID}.jsonl"),
         &format!(
             "{{\"type\":\"thread.started\",\"thread_id\":\"{ID}\"}}\n{{\"type\":\"turn.started\"}}\n{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"codex fixture\"}}}}\n{{\"type\":\"turn.completed\"}}"
@@ -215,10 +217,9 @@ async fn configured_cli_profiles_use_real_server_and_owned_state_without_live_pr
         example_profile("claude")["version"]["expected_stdout"]
             .as_str()
             .unwrap(),
-        &format!("$CLAUDE_CONFIG_DIR/projects/fixture/{ID}.jsonl"),
-        &format!(
-            "{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"{ID}\",\"result\":\"claude fixture\",\"permission_denials\":[]}}"
-        ),
+        ID,
+        "$CLAUDE_CONFIG_DIR/projects/fixture/${sid}.jsonl",
+        "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"${sid}\",\"result\":\"claude fixture\",\"permission_denials\":[]}",
     );
     let secret = temp.path().join("secret");
     std::fs::write(&secret, "07".repeat(32)).unwrap();
