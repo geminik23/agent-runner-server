@@ -7,7 +7,8 @@ use agent_runner_server::{
     core::{CleanupState, ExecutionMetadata, SessionDisposition, SessionRef},
     storage::{
         Admission, AdmissionOutcome, Completion, DeliveryIntent, HookBinding, Namespace,
-        NewInboxItem, NewSession, SkillRef, SkillWrite, SqliteStore, StorageError, TerminalState,
+        NewInboxItem, NewSession, QuarantineKind, SkillRef, SkillWrite, SqliteStore, StorageError,
+        TerminalState,
     },
 };
 use rusqlite::Connection;
@@ -1316,5 +1317,92 @@ fn direct_sql_cannot_replace_a_referenced_skill_with_deferred_foreign_keys() {
             .unwrap()
             .markdown,
         "original"
+    );
+}
+
+#[test]
+fn abandoning_requires_a_terminal_launched_and_unbound_reservation() {
+    let ns = namespace("client-a");
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    store.create_namespace(&ns).unwrap();
+    store.create_session(&ns, &session(None)).unwrap();
+    store
+        .admit_run(&ns, &admission("run-1", "key-1", Some("session-1")))
+        .unwrap();
+    store
+        .record_spawn_intent(&ns, "run-1", "attempt-run-1")
+        .unwrap();
+    assert!(matches!(
+        store.abandon_unbound_session(&ns, "run-1"),
+        Err(StorageError::InvalidState)
+    ));
+    let mut finish = completion("run-1", true);
+    finish.state = TerminalState::Cancelled;
+    finish.cleanup = CleanupState::Uncertain;
+    finish.disposition = SessionDisposition::Uncertain;
+    store.finish_run(&ns, &finish).unwrap();
+    let listed = store.quarantined_runs().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].kind, QuarantineKind::UnboundSession);
+    assert!(store.abandon_unbound_session(&ns, "run-1").unwrap());
+    let saved = store.get_session(&ns, "session-1").unwrap().unwrap();
+    assert_eq!(saved.reserved_run_id, None);
+    assert_eq!(saved.session.native_id, None);
+    assert!(store.quarantined_runs().unwrap().is_empty());
+    assert!(!store.abandon_unbound_session(&ns, "run-1").unwrap());
+}
+
+#[test]
+fn abandoning_refuses_unlaunched_or_bound_sessions() {
+    let ns = namespace("client-a");
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    store.create_namespace(&ns).unwrap();
+    store.create_session(&ns, &session(None)).unwrap();
+    store
+        .admit_run(&ns, &admission("run-1", "key-1", Some("session-1")))
+        .unwrap();
+    let mut finish = completion("run-1", true);
+    finish.state = TerminalState::Cancelled;
+    finish.disposition = SessionDisposition::NotApplicable;
+    store.finish_run(&ns, &finish).unwrap();
+    assert!(!store.abandon_unbound_session(&ns, "run-1").unwrap());
+
+    // A separate database, because the unbound reservation above quarantines the whole realm.
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let other = namespace("client-b");
+    store.create_namespace(&other).unwrap();
+    store
+        .create_session(&other, &session(Some("native-1")))
+        .unwrap();
+    store
+        .admit_run(&other, &admission("run-2", "key-2", Some("session-1")))
+        .unwrap();
+    store
+        .record_spawn_intent(&other, "run-2", "attempt-run-2")
+        .unwrap();
+    let mut finish = completion("run-2", true);
+    finish.state = TerminalState::Cancelled;
+    finish.cleanup = CleanupState::Uncertain;
+    finish.disposition = SessionDisposition::Uncertain;
+    store.finish_run(&other, &finish).unwrap();
+    assert_eq!(
+        store
+            .quarantined_runs()
+            .unwrap()
+            .iter()
+            .find(|entry| entry.run_id == "run-2")
+            .unwrap()
+            .kind,
+        QuarantineKind::BoundSession
+    );
+    assert!(!store.abandon_unbound_session(&other, "run-2").unwrap());
+    assert_eq!(
+        store
+            .get_session(&other, "session-1")
+            .unwrap()
+            .unwrap()
+            .reserved_run_id
+            .as_deref(),
+        Some("run-2")
     );
 }

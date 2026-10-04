@@ -13,13 +13,14 @@ use agent_runner_server::{
         AccessLimits, ClientAccessControl, ClientRegistration, CredentialSecret, ExecutionProfile,
         Scope,
     },
-    application::{BackendProfile, RunLimits, RunService},
+    application::{BackendProfile, RunLimits, RunService, ServiceError},
     core::{
         BackendError, CancellationToken, CleanupState, EventSink, ExecutionBackend,
         ExecutionMetadata, ExecutionRequest, ExecutionResult, SessionDisposition, SessionRef,
     },
+    maintenance::{Maintenance, Release},
     runtimes::dummy::{DummyBackend, DummyScenario},
-    storage::{Namespace, SqliteStore},
+    storage::{Namespace, QuarantineKind, SqliteStore},
     workspace::{WorkspaceAccess, WorkspaceConfig, WorkspaceEntry, WorkspaceLocation},
 };
 use serde_json::json;
@@ -1029,4 +1030,195 @@ async fn restoring_a_database_before_a_completed_run_is_rejected() {
     )
     .await;
     assert!(reopened.is_err());
+}
+
+fn profiles(backend: Arc<WorkspaceBackend>) -> Vec<BackendProfile> {
+    vec![BackendProfile {
+        profile_id: "profile".into(),
+        revision: "v1".into(),
+        state_realm: "dummy".into(),
+        backend,
+    }]
+}
+
+fn maintenance(root: &Path, backend: Arc<WorkspaceBackend>) -> Result<Maintenance, ServiceError> {
+    Maintenance::open(
+        &root.join("runs.sqlite"),
+        &profiles(backend),
+        Some(config(root)),
+    )
+}
+
+fn native_state_backend(root: &Path, wait: bool) -> Arc<WorkspaceBackend> {
+    use std::os::unix::fs::PermissionsExt;
+    let state = root.join("native_state");
+    if !state.exists() {
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    Arc::new(WorkspaceBackend {
+        inner: DummyBackend::new(DummyScenario::Success, 0),
+        captured: Mutex::new(Vec::new()),
+        changed: Notify::new(),
+        release: Notify::new(),
+        wait,
+        state_directory: Some(state),
+        state_owner_root: Some(root.to_path_buf()),
+    })
+}
+
+#[tokio::test]
+async fn maintenance_abandons_an_unbound_session_and_unblocks_the_realm() {
+    let temp = tempdir().unwrap();
+    prepare_directories(temp.path());
+    let access = access();
+    let client = access.authenticate("client", &[7; 32]).unwrap();
+    let waiting = native_state_backend(temp.path(), true);
+    let running = service(temp.path(), waiting.clone(), Arc::clone(&access)).await;
+    let first = running
+        .start(&client, &body("a", "unbound", json!({"mode":"new"})))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let notified = waiting.changed.notified();
+            if !waiting.captured.lock().unwrap().is_empty() {
+                break;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .unwrap();
+    running.cancel(&client, &first.run_id).await.unwrap();
+    assert_eq!(
+        terminal(&running, &client, &first.run_id).await,
+        "cancelled"
+    );
+    assert!(
+        running
+            .start(&client, &body("b", "blocked", json!({"mode":"new"})))
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        maintenance(temp.path(), native_state_backend(temp.path(), false)),
+        Err(ServiceError::AlreadyRunning)
+    ));
+    running.shutdown().await.unwrap();
+
+    let mut tool = maintenance(temp.path(), native_state_backend(temp.path(), false)).unwrap();
+    let entries = tool.quarantined().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].run_id, first.run_id);
+    assert_eq!(entries[0].kind, QuarantineKind::UnboundSession);
+    assert!(entries[0].native_id.is_none());
+    let namespace = entries[0].namespace.clone();
+    assert_eq!(
+        tool.release(&namespace, &first.run_id).unwrap(),
+        Release::Abandoned
+    );
+    assert!(tool.quarantined().unwrap().is_empty());
+    assert!(tool.release(&namespace, &first.run_id).is_err());
+    drop(tool);
+
+    let resumed = service(
+        temp.path(),
+        native_state_backend(temp.path(), false),
+        access,
+    )
+    .await;
+    let next = resumed
+        .start(&client, &body("b", "after-abandon", json!({"mode":"new"})))
+        .await
+        .unwrap();
+    assert_eq!(terminal(&resumed, &client, &next.run_id).await, "succeeded");
+    let session = first.session_id.unwrap();
+    assert!(
+        resumed
+            .start(
+                &client,
+                &body(
+                    "a",
+                    "resume-abandoned",
+                    json!({"mode":"resume","session_id":session})
+                )
+            )
+            .await
+            .is_err()
+    );
+    resumed.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn maintenance_makes_a_bound_session_resumable_again() {
+    let temp = tempdir().unwrap();
+    prepare_directories(temp.path());
+    let access = access();
+    let client = access.authenticate("client", &[7; 32]).unwrap();
+    let delayed = Arc::new(WorkspaceBackend {
+        inner: DummyBackend::new(DummyScenario::DelayedSuccess, 0),
+        captured: Mutex::new(Vec::new()),
+        changed: Notify::new(),
+        release: Notify::new(),
+        wait: false,
+        state_directory: None,
+        state_owner_root: None,
+    });
+    let running = service(temp.path(), delayed, Arc::clone(&access)).await;
+    let first = running
+        .start(&client, &body("a", "bound", json!({"mode":"new"})))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while running
+            .get_run(&client, &first.run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state
+            != "running"
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // The dummy reports its native session right after it starts and then sleeps.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    running.cancel(&client, &first.run_id).await.unwrap();
+    assert_eq!(
+        terminal(&running, &client, &first.run_id).await,
+        "cancelled"
+    );
+    let session = first.session_id.clone().unwrap();
+    let resume = |key: &str| body("a", key, json!({"mode":"resume","session_id":session}));
+    assert!(
+        running
+            .start(&client, &resume("resume-blocked"))
+            .await
+            .is_err()
+    );
+    running.shutdown().await.unwrap();
+
+    let mut tool = maintenance(temp.path(), backend(false)).unwrap();
+    let entries = tool.quarantined().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].kind, QuarantineKind::BoundSession);
+    assert!(entries[0].native_id.is_some());
+    let namespace = entries[0].namespace.clone();
+    assert_eq!(
+        tool.release(&namespace, &first.run_id).unwrap(),
+        Release::Resumable
+    );
+    drop(tool);
+
+    let resumed = service(temp.path(), backend(false), access).await;
+    let next = resumed
+        .start(&client, &resume("resume-after-release"))
+        .await
+        .unwrap();
+    assert_eq!(next.session_id.as_deref(), Some(session.as_str()));
+    assert_eq!(terminal(&resumed, &client, &next.run_id).await, "succeeded");
+    resumed.shutdown().await.unwrap();
 }

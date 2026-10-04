@@ -4,6 +4,7 @@ mod completion;
 pub(crate) mod dispatch;
 pub(crate) mod hooks;
 pub(crate) mod inbox;
+mod quarantine;
 mod queries;
 mod retention;
 mod runs;
@@ -18,5 +19,6 @@ mod delivery_tests;
 #[cfg(test)]
 mod service_tests;
 
+pub use quarantine::{QuarantineKind, QuarantinedRun};
 pub use sqlite::SqliteStore;
 pub use types::*;

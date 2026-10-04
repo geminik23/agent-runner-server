@@ -348,6 +348,11 @@ impl PreparedServer {
             workspaces,
         })
     }
+    /// Opens offline maintenance over the configured database with the daemon's exclusive locks.
+    pub fn maintenance(self) -> Result<crate::maintenance::Maintenance, ServerError> {
+        crate::maintenance::Maintenance::open(&self.database, &self.profiles, self.workspaces)
+            .map_err(ServerError::Service)
+    }
     pub async fn start(self) -> Result<Server, ServerError> {
         let service = RunService::open_with_workspaces(
             self.database,

@@ -40,7 +40,8 @@ use crate::{
         service::{Candidate, ClaimedJob, ServiceAdmission, ServiceClock, StopCause},
     },
     workspace::{
-        WorkspaceAccess, WorkspaceConfig, WorkspacePlan, WorkspaceRegistry, journal::JournalKey,
+        WorkspaceAccess, WorkspaceConfig, WorkspaceOwnership, WorkspacePlan, WorkspaceRegistry,
+        journal::JournalKey,
     },
 };
 
@@ -381,41 +382,11 @@ impl RunService {
         {
             return Err(ServiceError::InvalidConfiguration);
         }
-        let mut states = Vec::new();
-        for profile in profile_map.values() {
-            if let Some(path) = profile.backend.state_directory() {
-                let root = profile
-                    .backend
-                    .state_owner_root()
-                    .ok_or(ServiceError::InvalidConfiguration)?;
-                states.push((
-                    profile.state_realm.clone(),
-                    path.to_path_buf(),
-                    root.to_path_buf(),
-                ));
-            }
-        }
+        let states = owned_states(&profile_map.values().cloned().collect::<Vec<_>>())?;
         let path = path.as_ref().to_path_buf();
         let registry = workspaces.clone();
         let (store, guard, workspace_guard) = tokio::task::spawn_blocking(move || {
-            let (guard, canonical) = lock_database(&path)?;
-            let readonly = SqliteStore::open_read_only(&canonical)?;
-            let mut owner = if let Some(registry) = &registry {
-                let owner = registry.acquire_owner(&canonical, &states, &readonly)?;
-                owner.verify(&readonly)?;
-                Some(owner)
-            } else {
-                if readonly.has_unsettled_workspace_jobs()? {
-                    return Err(ServiceError::InvalidConfiguration);
-                }
-                None
-            };
-            drop(readonly);
-            let mut store = open_locked_store(&canonical, &guard)?;
-            if let Some(owner) = &mut owner {
-                owner.reconcile(&mut store)?;
-            }
-            Ok::<_, ServiceError>((store, guard, owner))
+            open_owned_store(&path, registry.as_deref(), &states)
         })
         .await
         .map_err(|_| ServiceError::Unavailable)??;
@@ -1397,6 +1368,54 @@ impl Drop for RunService {
             });
         }
     }
+}
+
+/// Takes the database lock and every workspace and native state owner, then reconciles their journals.
+/// The daemon and offline maintenance share this path so neither can run while the other holds the state.
+pub(crate) fn open_owned_store(
+    path: &Path,
+    registry: Option<&WorkspaceRegistry>,
+    states: &[(String, PathBuf, PathBuf)],
+) -> Result<(SqliteStore, File, Option<WorkspaceOwnership>), ServiceError> {
+    let (guard, canonical) = lock_database(path)?;
+    let readonly = SqliteStore::open_read_only(&canonical)?;
+    let mut owner = if let Some(registry) = registry {
+        let owner = registry.acquire_owner(&canonical, states, &readonly)?;
+        owner.verify(&readonly)?;
+        Some(owner)
+    } else {
+        if readonly.has_unsettled_workspace_jobs()? {
+            return Err(ServiceError::InvalidConfiguration);
+        }
+        None
+    };
+    drop(readonly);
+    let mut store = open_locked_store(&canonical, &guard)?;
+    if let Some(owner) = &mut owner {
+        owner.reconcile(&mut store)?;
+    }
+    Ok((store, guard, owner))
+}
+
+/// Collects the native state directories whose owners must be held with the database.
+pub(crate) fn owned_states(
+    profiles: &[BackendProfile],
+) -> Result<Vec<(String, PathBuf, PathBuf)>, ServiceError> {
+    let mut states = Vec::new();
+    for profile in profiles {
+        if let Some(path) = profile.backend.state_directory() {
+            let root = profile
+                .backend
+                .state_owner_root()
+                .ok_or(ServiceError::InvalidConfiguration)?;
+            states.push((
+                profile.state_realm.clone(),
+                path.to_path_buf(),
+                root.to_path_buf(),
+            ));
+        }
+    }
+    Ok(states)
 }
 
 fn lock_database(path: &Path) -> Result<(File, PathBuf), ServiceError> {

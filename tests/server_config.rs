@@ -445,3 +445,146 @@ async fn forced_daemon_crash_does_not_repeat_a_started_dummy_run() {
     restarted.0.kill().unwrap();
     restarted.0.wait().unwrap();
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn quarantine_commands_release_a_session_left_by_a_crashed_daemon() {
+    use std::process::{Child, Command, Output, Stdio};
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+    let binary = env!("CARGO_BIN_EXE_agent-runner-server");
+    let spawn = |config: &Path| {
+        ChildGuard(
+            Command::new(binary)
+                .arg("--config")
+                .arg(config)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let quarantine = |config: &Path, args: &[&str]| -> Output {
+        Command::new(binary)
+            .arg("--config")
+            .arg(config)
+            .arg("quarantine")
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let temp = tempdir().unwrap();
+    let config = temp.path().join("config.json");
+    secret(&temp.path().join("secret"));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut value = settings(port);
+    value["profiles"][0]["scenario"] = json!("delayed-success");
+    write_config(&config, &value);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_millis(500))
+        .build()
+        .unwrap();
+    let url = format!("http://127.0.0.1:{port}");
+    let bearer = format!("full.{}", "07".repeat(32));
+    let ready = || async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !client
+                .get(format!("{url}/v1/agents"))
+                .bearer_auth(&bearer)
+                .send()
+                .await
+                .is_ok_and(|r| r.status() == 200)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("daemon did not start");
+    };
+    let mut child = spawn(&config);
+    ready().await;
+    let request = json!({"profile_id":"profile","workspace_id":"workspace","input":{"request":"quarantine fixture"},"idempotency_key":"quarantine-test"});
+    let receipt: Value = client
+        .post(format!("{url}/v1/runs"))
+        .bearer_auth(&bearer)
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let run = receipt["run_id"].as_str().unwrap().to_owned();
+    let session = receipt["session_id"].as_str().unwrap().to_owned();
+    let path = temp.path().join("runs.sqlite");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            let observed: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND kind='run.session')",
+                    [&run],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if observed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("dummy session was not recorded");
+    let busy = quarantine(&config, &["list"]);
+    assert!(!busy.status.success());
+    assert!(String::from_utf8_lossy(&busy.stderr).contains("stop the daemon first"));
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+
+    let listed = quarantine(&config, &["list"]);
+    assert!(listed.status.success());
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(text.contains(&run) && text.contains("interrupted") && text.contains("bound_session"));
+    let unconfirmed = quarantine(&config, &["release", &run]);
+    assert!(!unconfirmed.status.success());
+    let unknown = quarantine(
+        &config,
+        &["release", "run_missing", "--confirm-no-cli-process"],
+    );
+    assert!(!unknown.status.success());
+    let released = quarantine(&config, &["release", &run, "--confirm-no-cli-process"]);
+    assert!(
+        released.status.success(),
+        "{}",
+        String::from_utf8_lossy(&released.stderr)
+    );
+    assert!(String::from_utf8_lossy(&released.stdout).contains("can be resumed"));
+    let empty = quarantine(&config, &["list"]);
+    assert!(String::from_utf8_lossy(&empty.stdout).contains("no quarantined runs"));
+
+    let _restarted = spawn(&config);
+    ready().await;
+    let mut resume = request;
+    resume["idempotency_key"] = json!("resume-after-release");
+    resume["session"] = json!({"mode":"resume","session_id":session});
+    let response = client
+        .post(format!("{url}/v1/runs"))
+        .bearer_auth(&bearer)
+        .json(&resume)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+}
