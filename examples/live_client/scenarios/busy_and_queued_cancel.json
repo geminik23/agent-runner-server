@@ -1,0 +1,18 @@
+{
+  "name": "busy_and_queued_cancel",
+  "description": "a second request on a busy session is refused, and a run queued behind it is cancelled before any CLI starts",
+  "steps": [
+    {"op": "start", "id": "long", "via": "rest", "request": {
+      "profile_id": "${profile}", "workspace_id": "${workspace}", "session": {"mode": "new"},
+      "input": {"request": "Write about 120 words explaining how ocean tides work. Do not use tools."}}},
+    {"op": "start", "id": "busy", "via": "mcp", "request": {
+      "profile_id": "${profile}", "workspace_id": "${workspace}", "session": {"mode": "resume", "session_id": "${long.session_id}"},
+      "input": {"request": "Reply with OK only. Do not use tools."}},
+      "expect": {"error": "session_busy"}},
+    {"op": "start", "id": "queued", "via": "rest", "request": {
+      "profile_id": "${profile}", "workspace_id": "${workspace}", "session": {"mode": "new"},
+      "input": {"request": "Reply with OK only. Do not use tools."}}},
+    {"op": "cancel_queued", "run": "queued", "blocker": "long"},
+    {"op": "wait", "run": "long", "expect": {"output_contains": "tide"}}
+  ]
+}

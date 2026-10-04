@@ -1,0 +1,18 @@
+{
+  "name": "replay",
+  "description": "the same request replays across REST and MCP, and a different request with the same key is refused",
+  "steps": [
+    {"op": "start", "id": "first", "via": "rest", "request": {
+      "profile_id": "${profile}", "workspace_id": "${workspace}", "session": {"mode": "new"},
+      "input": {"request": "Reply with the word READY only. Do not use tools."}}},
+    {"op": "start", "id": "again", "via": "mcp", "request": {
+      "profile_id": "${profile}", "workspace_id": "${workspace}", "session": {"mode": "new"}, "idempotency_key": "${first.idempotency_key}",
+      "input": {"request": "Reply with the word READY only. Do not use tools."}},
+      "expect": {"replay": true, "same_run_as": "first"}},
+    {"op": "start", "id": "conflict", "via": "rest", "request": {
+      "profile_id": "${profile}", "workspace_id": "${workspace}", "session": {"mode": "new"}, "idempotency_key": "${first.idempotency_key}",
+      "input": {"request": "Reply with the word DIFFERENT only. Do not use tools."}},
+      "expect": {"error": "idempotency_conflict"}},
+    {"op": "wait", "run": "first", "expect": {"output_contains": "READY"}}
+  ]
+}

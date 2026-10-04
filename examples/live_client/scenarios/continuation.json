@@ -1,0 +1,19 @@
+{
+  "name": "continuation",
+  "description": "new, resume by server ID over MCP, then resume by native ID; each continuation recalls the token",
+  "steps": [
+    {"op": "start", "id": "first", "via": "rest", "request": {
+      "profile_id": "${profile}", "workspace_id": "${workspace}", "session": {"mode": "new"},
+      "input": {"request": "Remember the token ${token}. Reply with OK only. Do not use tools."}}},
+    {"op": "wait", "run": "first"},
+    {"op": "start", "id": "second", "via": "mcp", "request": {
+      "profile_id": "${profile}", "workspace_id": "${workspace}", "session": {"mode": "resume", "session_id": "${first.session_id}"},
+      "input": {"request": "Reply with only the token I asked you to remember. Do not use tools."}}},
+    {"op": "wait", "run": "second", "expect": {"output_contains": "${token}"}},
+    {"op": "native_id", "session": "${first.session_id}", "save": "native"},
+    {"op": "start", "id": "third", "via": "rest", "request": {
+      "profile_id": "${profile}", "workspace_id": "${workspace}", "session": {"mode": "resume_native", "native_id": "${native}"},
+      "input": {"request": "Reply with only the token I asked you to remember. Do not use tools."}}},
+    {"op": "wait", "run": "third", "expect": {"output_contains": "${token}"}}
+  ]
+}

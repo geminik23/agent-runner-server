@@ -1,0 +1,16 @@
+{
+  "name": "result_schema",
+  "description": "a JSON reply that matches the result schema succeeds, and one that does not match fails validation",
+  "steps": [
+    {"op": "start", "id": "matching", "via": "rest", "request": {
+      "profile_id": "${profile}", "workspace_id": "${workspace}", "session": {"mode": "new"},
+      "input": {"request": "Reply with exactly this JSON object and nothing else, without code fences: {\"answer\": \"blue\"}. Do not use tools."},
+      "result_schema": {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"], "additionalProperties": false}}},
+    {"op": "wait", "run": "matching", "expect": {"validation": "passed"}},
+    {"op": "start", "id": "mismatch", "via": "mcp", "request": {
+      "profile_id": "${profile}", "workspace_id": "${workspace}", "session": {"mode": "new"},
+      "input": {"request": "Reply with exactly this JSON object and nothing else, without code fences: {\"answer\": \"blue\"}. Do not use tools."},
+      "result_schema": {"type": "object", "properties": {"count": {"type": "number"}}, "required": ["count"], "additionalProperties": false}}},
+    {"op": "wait", "run": "mismatch", "expect": {"state": "failed", "validation": "failed"}}
+  ]
+}

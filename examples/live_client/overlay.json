@@ -1,0 +1,16 @@
+{
+  "config": {
+    "delivery": {
+      "max_pending": 8, "max_payload_bytes": 65536, "max_workers": 1, "max_attempts": 2,
+      "delivery_ttl_ms": 600000, "retention_ms": 600000, "lease_ms": 2000, "timeout_ms": 1000, "retry_ms": 50, "poll_ms": 10,
+      "destinations": [
+        {"id": "inbox", "revision": "v1", "kind": "inbox"},
+        {"id": "test-webhook", "revision": "v1", "kind": "webhook_test", "endpoint": "http://127.0.0.1:9/hook"}
+      ]
+    }
+  },
+  "client": {
+    "scopes": ["run_start", "run_read", "run_cancel", "session_read", "skill_read", "skill_write", "hook_read", "hook_write", "inbox_read", "inbox_ack"],
+    "destinations": ["inbox", "test-webhook"]
+  }
+}

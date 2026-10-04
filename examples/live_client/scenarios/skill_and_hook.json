@@ -1,0 +1,25 @@
+{
+  "name": "skill_and_hook",
+  "description": "a selected skill reaches the CLI prompt, an inbox hook notifies, and a test connector is refused for a real run",
+  "steps": [
+    {"op": "call", "tool": "skills_register", "args": {
+      "skill_id": "live-client-marker", "version": "${suffix}",
+      "markdown": "End every reply with the exact word KESTREL on its own line.", "required_capabilities": []}},
+    {"op": "call", "tool": "hooks_register", "args": {
+      "hook_id": "live-client-inbox-${suffix}", "version": "1", "destination_id": "inbox", "events": ["succeeded", "failed"]}},
+    {"op": "call", "tool": "hooks_register", "args": {
+      "hook_id": "live-client-webhook-${suffix}", "version": "1", "destination_id": "test-webhook", "events": ["succeeded", "failed"]}},
+    {"op": "start", "id": "refused", "via": "rest", "request": {
+      "profile_id": "${profile}", "workspace_id": "${workspace}", "session": {"mode": "new"},
+      "hooks": [{"hook_id": "live-client-webhook-${suffix}", "version": "1"}],
+      "input": {"request": "Reply with OK only. Do not use tools."}},
+      "expect": {"error": "hook_unavailable"}},
+    {"op": "start", "id": "marked", "via": "mcp", "request": {
+      "profile_id": "${profile}", "workspace_id": "${workspace}", "session": {"mode": "new"},
+      "skills": [{"skill_id": "live-client-marker", "version": "${suffix}"}],
+      "hooks": [{"hook_id": "live-client-inbox-${suffix}", "version": "1"}],
+      "input": {"request": "Reply with one short sentence about the sky. Do not use tools."}}},
+    {"op": "wait", "run": "marked", "expect": {"output_contains": "KESTREL"}},
+    {"op": "inbox", "runs": ["marked"], "expect": {"synthetic": false, "state": "succeeded"}}
+  ]
+}
