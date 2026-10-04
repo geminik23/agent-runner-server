@@ -95,7 +95,30 @@ fn example_settings(kind: CliKind, executable: PathBuf, timeout_ms: u64) -> CliS
     settings.program = executable;
     settings.helper_program = PathBuf::from(env!("CARGO_BIN_EXE_agent-runner-cli-helper"));
     settings.timeout_ms = timeout_ms;
+    accept_installed_version(&mut settings.version, &settings.program);
     settings
+}
+/// Lets an operator explicitly run the live tests against the installed CLI without editing the shipped profile.
+const ACCEPT_INSTALLED_VERSION: &str = "AGENT_RUNNER_LIVE_ACCEPT_INSTALLED_VERSION";
+fn accept_installed_version(
+    version: &mut agent_runner_server::runtimes::cli::CliVersionProbe,
+    program: &Path,
+) {
+    if std::env::var_os(ACCEPT_INSTALLED_VERSION).is_none() {
+        return;
+    }
+    let output = std::process::Command::new(program)
+        .args(&version.args)
+        .output()
+        .expect("CLI version");
+    assert!(
+        output.status.success(),
+        "installed CLI version probe failed"
+    );
+    version.expected_stdout = String::from_utf8(output.stdout)
+        .expect("UTF-8 CLI version")
+        .trim()
+        .to_owned();
 }
 fn make_dir(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -105,19 +128,41 @@ fn make_dir(path: &Path) {
 fn body(workspace: &str, key: &str, session: Value, prompt: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({"profile_id":"profile","workspace_id":workspace,"idempotency_key":key,"session":session,"input":{"request":prompt}})).unwrap()
 }
-async fn run_live(kind: CliKind) {
-    let (name, token) = match kind {
-        CliKind::Codex => ("codex", "ORBIT642"),
-        CliKind::Claude => ("claude", "MEADOW317"),
-    };
-    let temp = tempfile::tempdir().unwrap();
-    for dir in ["owner", "a", "b"] {
-        make_dir(&temp.path().join(dir));
+fn kind_name(kind: CliKind) -> &'static str {
+    match kind {
+        CliKind::Codex => "codex",
+        CliKind::Claude => "claude",
     }
-    let timings: Timings = Arc::new(Mutex::new(HashMap::new()));
+}
+fn live_limits() -> RunLimits {
+    RunLimits {
+        max_outstanding: 4,
+        max_workers: 2,
+        database_queue: 32,
+        event_buffer: 32,
+        max_events_per_run: 32,
+        max_event_bytes: 4096,
+        max_result_bytes: 16384,
+        max_page_size: 16,
+        run_timeout: Duration::from_secs(75),
+        cleanup_grace: Duration::from_secs(8),
+        poll_interval: Duration::from_millis(10),
+    }
+}
+/// Opens a RunService over the shipped profile with two exclusive workspaces under `root`.
+async fn live_service(
+    kind: CliKind,
+    root: &Path,
+    limits: RunLimits,
+    timings: Timings,
+) -> (RunService, agent_runner_server::access::AuthenticatedClient) {
+    for dir in ["owner", "a", "b"] {
+        make_dir(&root.join(dir));
+    }
     let backend = Arc::new(LiveBackend(
-        CliBackend::new(example_settings(kind, program(name), 60000)).expect("trusted CLI profile"),
-        Arc::clone(&timings),
+        CliBackend::new(example_settings(kind, program(kind_name(kind)), 60000))
+            .expect("trusted CLI profile"),
+        timings,
     ));
     let runtime = backend.metadata().runtime;
     let realm = backend.state_realm().to_owned();
@@ -154,21 +199,8 @@ async fn run_live(kind: CliKind) {
         .unwrap(),
     );
     let client = access.authenticate("client", &[7; 32]).unwrap();
-    let limits = RunLimits {
-        max_outstanding: 4,
-        max_workers: 2,
-        database_queue: 32,
-        event_buffer: 32,
-        max_events_per_run: 32,
-        max_event_bytes: 4096,
-        max_result_bytes: 16384,
-        max_page_size: 16,
-        run_timeout: Duration::from_secs(75),
-        cleanup_grace: Duration::from_secs(8),
-        poll_interval: Duration::from_millis(10),
-    };
     let workspaces = WorkspaceConfig {
-        ownership_directory: temp.path().join("owner"),
+        ownership_directory: root.join("owner"),
         entries: ["a", "b"]
             .into_iter()
             .map(|id| WorkspaceEntry {
@@ -176,13 +208,13 @@ async fn run_live(kind: CliKind) {
                 revision: "v1".into(),
                 access: WorkspaceAccess::Exclusive,
                 location: WorkspaceLocation::Existing {
-                    path: temp.path().join(id),
+                    path: root.join(id),
                 },
             })
             .collect(),
     };
     let service = RunService::open_with_workspaces(
-        temp.path().join("runs.sqlite"),
+        root.join("runs.sqlite"),
         access,
         vec![BackendProfile {
             profile_id: "profile".into(),
@@ -197,6 +229,43 @@ async fn run_live(kind: CliKind) {
     )
     .await
     .unwrap();
+    (service, client)
+}
+/// Waits for a terminal Run state and returns it.
+async fn wait(
+    service: &RunService,
+    client: &agent_runner_server::access::AuthenticatedClient,
+    id: &str,
+) -> String {
+    tokio::time::timeout(Duration::from_secs(80), async {
+        loop {
+            let state = service.get_run(client, id).await.unwrap().unwrap().state;
+            if [
+                "succeeded",
+                "failed",
+                "cancelled",
+                "timed_out",
+                "interrupted",
+            ]
+            .contains(&state.as_str())
+            {
+                break state;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("live run terminal")
+}
+async fn run_live(kind: CliKind) {
+    let (name, token) = match kind {
+        CliKind::Codex => ("codex", "ORBIT642"),
+        CliKind::Claude => ("claude", "MEADOW317"),
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let timings: Timings = Arc::new(Mutex::new(HashMap::new()));
+    let (service, client) =
+        live_service(kind, temp.path(), live_limits(), Arc::clone(&timings)).await;
     let first = service.start(&client, &body("a", "new-a", json!({"mode":"new"}), &format!("Remember token {token}. In about 80 words explain why rain falls. Do not use any tools."))).await.unwrap();
     let second = service
         .start(
@@ -291,31 +360,6 @@ async fn run_live(kind: CliKind) {
     })
     .await
     .expect("two live started runs");
-    async fn wait(
-        service: &RunService,
-        client: &agent_runner_server::access::AuthenticatedClient,
-        id: &str,
-    ) -> String {
-        tokio::time::timeout(Duration::from_secs(80), async {
-            loop {
-                let state = service.get_run(client, id).await.unwrap().unwrap().state;
-                if [
-                    "succeeded",
-                    "failed",
-                    "cancelled",
-                    "timed_out",
-                    "interrupted",
-                ]
-                .contains(&state.as_str())
-                {
-                    break state;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("live run terminal")
-    }
     assert_eq!(
         wait(&service, &client, &first.run_id).await,
         "succeeded",
@@ -640,4 +684,148 @@ async fn live_codex_workspace_parallel_and_resume() {
 #[ignore = "performs approved real provider requests and creates native CLI sessions"]
 async fn live_claude_workspace_parallel_and_resume() {
     run_live(CliKind::Claude).await;
+}
+
+/// Reads the error code recorded in a terminal Run result, if any.
+async fn result_error(
+    service: &RunService,
+    client: &agent_runner_server::access::AuthenticatedClient,
+    id: &str,
+) -> Option<String> {
+    service
+        .get_result(client, id)
+        .await
+        .unwrap()
+        .and_then(|result| serde_json::from_slice::<Value>(&result.payload).ok())
+        .and_then(|value| {
+            ["/details/error", "/details/outcome/error"]
+                .iter()
+                .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+                .map(str::to_owned)
+        })
+}
+
+/// Covers approval-required writes, result limits and run timeouts against a real CLI.
+async fn run_live_boundaries(kind: CliKind) {
+    let name = kind_name(kind);
+    let temp = tempfile::tempdir().unwrap();
+    let timings: Timings = Arc::new(Mutex::new(HashMap::new()));
+    let limits = RunLimits {
+        max_result_bytes: 2048,
+        ..live_limits()
+    };
+    let (service, client) = live_service(kind, temp.path(), limits, Arc::clone(&timings)).await;
+
+    // The read-only profile must not wait for a human or write into the workspace.
+    let probe = temp.path().join("a").join("approval-probe.txt");
+    let started = Instant::now();
+    let approval = service
+        .start(
+            &client,
+            &body(
+                "a",
+                "approval",
+                json!({"mode":"new"}),
+                "Create a file named approval-probe.txt in the current directory containing the word OK. If you cannot create it, reply with one short sentence explaining why.",
+            ),
+        )
+        .await
+        .unwrap();
+    let approval_state = wait(&service, &client, &approval.run_id).await;
+    assert!(
+        !probe.exists(),
+        "{name}: read-only profile created a workspace file"
+    );
+    println!(
+        "{name}: approval-required write ended as {approval_state} in {:?} without creating the file (error: {:?})",
+        started.elapsed(),
+        result_error(&service, &client, &approval.run_id).await
+    );
+
+    // Output above the configured result limit must fail instead of being stored or truncated.
+    let large = service
+        .start(
+            &client,
+            &body(
+                "b",
+                "large-output",
+                json!({"mode":"new"}),
+                "Print the integers from 1 to 600, one per line, with no other text. Do not use any tools.",
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        wait(&service, &client, &large.run_id).await,
+        "failed",
+        "{name}: oversized output"
+    );
+    assert_eq!(
+        result_error(&service, &client, &large.run_id)
+            .await
+            .as_deref(),
+        Some("result_limit_exceeded"),
+        "{name}: oversized output error"
+    );
+    println!("{name}: output above the result limit failed with result_limit_exceeded");
+    service.shutdown().await.unwrap();
+
+    // A run deadline that expires after launch must stop the CLI and keep the workspace isolated.
+    let temp = tempfile::tempdir().unwrap();
+    let limits = RunLimits {
+        run_timeout: Duration::from_secs(6),
+        ..live_limits()
+    };
+    let (service, client) = live_service(kind, temp.path(), limits, Arc::clone(&timings)).await;
+    let slow = service
+        .start(
+            &client,
+            &body(
+                "a",
+                "timeout",
+                json!({"mode":"new"}),
+                "Write a detailed essay of about 1500 words on the history of weather forecasting. Do not use any tools.",
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        wait(&service, &client, &slow.run_id).await,
+        "timed_out",
+        "{name}: run deadline"
+    );
+    let interval = timings.lock().unwrap().get(&slow.run_id).copied();
+    assert!(
+        interval.is_some_and(|(start, _)| start.is_some()),
+        "{name}: the deadline expired before the CLI started"
+    );
+    let connection = rusqlite::Connection::open(temp.path().join("runs.sqlite")).unwrap();
+    let (held, uncertain): (bool, bool) = connection
+        .query_row(
+            "SELECT held,uncertain FROM run_workspaces WHERE run_id=?1",
+            [&slow.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        held && uncertain,
+        "{name}: timed out workspace must remain quarantined"
+    );
+    drop(connection);
+    println!(
+        "{name}: run deadline after launch ended as timed_out and kept the workspace quarantined"
+    );
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "performs approved real provider requests and creates native CLI sessions"]
+async fn live_codex_approval_result_limit_and_timeout() {
+    run_live_boundaries(CliKind::Codex).await;
+}
+
+#[tokio::test]
+#[ignore = "performs approved real provider requests and creates native CLI sessions"]
+async fn live_claude_approval_result_limit_and_timeout() {
+    run_live_boundaries(CliKind::Claude).await;
 }

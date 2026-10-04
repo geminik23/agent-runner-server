@@ -565,14 +565,22 @@ fn live_cli_profile(kind: &str) -> Value {
         .find(|path| path.is_file())
         .expect("CLI executable in PATH");
     let mut value = example_profile(kind);
-    let expected = value["version"]["expected_stdout"]
-        .as_str()
-        .unwrap()
-        .to_owned();
     let version = Command::new(&executable)
         .arg("--version")
         .output()
         .expect("CLI version");
+    // An operator may explicitly accept the installed CLI version for a candidate run; the shipped profile is unchanged.
+    if std::env::var_os("AGENT_RUNNER_LIVE_ACCEPT_INSTALLED_VERSION").is_some() {
+        value["version"]["expected_stdout"] = json!(
+            std::str::from_utf8(&version.stdout)
+                .expect("UTF-8 CLI version")
+                .trim()
+        );
+    }
+    let expected = value["version"]["expected_stdout"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     assert!(
         version.status.success()
             && std::str::from_utf8(&version.stdout).ok().map(str::trim) == Some(expected.as_str()),
@@ -583,15 +591,13 @@ fn live_cli_profile(kind: &str) -> Value {
     value
 }
 
-/// Starts the daemon from `config`, runs the approved REST and MCP new, replay and resume flow, and stops it cleanly.
-/// `suffix` keeps idempotency keys unique when the database already holds earlier live runs.
-async fn live_rest_mcp_flow(
+/// Starts the daemon from `config` and waits until the authenticated agent list responds.
+async fn start_live_daemon(
     config: &Path,
     log: std::fs::File,
     port: u16,
     secret: &str,
-    suffix: &str,
-) {
+) -> (ChildGuard, reqwest::Client, String, String) {
     let child = Command::new(env!("CARGO_BIN_EXE_agent-runner-server"))
         .arg("--config")
         .arg(config)
@@ -627,6 +633,37 @@ async fn live_rest_mcp_flow(
     })
     .await
     .expect("daemon readiness");
+    (child, client, url, bearer)
+}
+
+/// Stops the daemon with SIGTERM and requires a clean exit.
+async fn stop_live_daemon(mut child: ChildGuard) {
+    // SAFETY: The PID identifies the daemon spawned by this test.
+    assert_eq!(unsafe { libc::kill(child.0.id() as i32, libc::SIGTERM) }, 0);
+    let status = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("daemon shutdown");
+    assert!(status.success());
+    drop(child);
+}
+
+/// Starts the daemon from `config`, runs the approved REST and MCP new, replay and resume flow, and stops it cleanly.
+/// `suffix` keeps idempotency keys unique when the database already holds earlier live runs.
+async fn live_rest_mcp_flow(
+    config: &Path,
+    log: std::fs::File,
+    port: u16,
+    secret: &str,
+    suffix: &str,
+) {
+    let (child, client, url, bearer) = start_live_daemon(config, log, port, secret).await;
 
     let new = |profile: &str, workspace: &str, key: &str, token: &str| {
         json!({
@@ -687,20 +724,88 @@ async fn live_rest_mcp_flow(
         );
     }
     println!("both explicit continuations recalled their tokens");
-    // SAFETY: The PID identifies the daemon spawned by this test.
-    assert_eq!(unsafe { libc::kill(child.0.id() as i32, libc::SIGTERM) }, 0);
-    let status = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            if let Some(status) = child.0.try_wait().unwrap() {
-                break status;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("daemon shutdown");
-    assert!(status.success());
-    drop(child);
+    stop_live_daemon(child).await;
+}
+
+/// Holds a temporary configuration copy and log for one daemon run over a retained database.
+struct ExistingDaemon {
+    config: tempfile::NamedTempFile,
+    log: std::fs::File,
+    port: u16,
+    secret: String,
+    suffix: String,
+}
+
+/// Copies the retained configuration with a fresh port and live CLI profiles, then applies `adjust`.
+/// The original configuration and secret stay unchanged, and `suffix` keeps new identifiers unique.
+fn prepare_existing_daemon(root: &Path, adjust: impl FnOnce(&mut Value)) -> ExistingDaemon {
+    use std::{
+        io::{Read, Write},
+        os::unix::fs::OpenOptionsExt,
+    };
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(root.join("config.json")).unwrap()).unwrap();
+    let secret = std::fs::read_to_string(root.join("secret")).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    config["listen"] = json!(format!("127.0.0.1:{port}"));
+    for profile in config["profiles"].as_array_mut().unwrap() {
+        let Some(kind) = profile
+            .get("cli")
+            .and_then(|cli| cli["kind"].as_str())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        profile["cli"] = live_cli_profile(&kind);
+    }
+    adjust(&mut config);
+    let mut bytes = [0_u8; 8];
+    std::fs::File::open("/dev/urandom")
+        .unwrap()
+        .read_exact(&mut bytes)
+        .unwrap();
+    let suffix: String = std::iter::once("-".to_owned())
+        .chain(bytes.iter().map(|byte| format!("{byte:02x}")))
+        .collect();
+    let mut copy = tempfile::NamedTempFile::new_in(root).unwrap();
+    copy.write_all(&serde_json::to_vec(&config).unwrap())
+        .unwrap();
+    copy.flush().unwrap();
+    let log = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(root.join(format!("server{suffix}.log")))
+        .unwrap();
+    ExistingDaemon {
+        config: copy,
+        log,
+        port,
+        secret,
+        suffix,
+    }
+}
+
+/// Counts runs and sessions with a recorded native ID in a retained database.
+fn owned_counts(root: &Path) -> (i64, i64) {
+    let db = rusqlite::Connection::open_with_flags(
+        root.join("runs.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let runs: i64 = db
+        .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+        .unwrap();
+    let sessions: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE native_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    (runs, sessions)
 }
 
 /// Returns the explicitly selected retained live directory after checking its location and private permissions.
@@ -934,68 +1039,19 @@ async fn real_owned_state_reopens_without_provider_requests() {
 #[tokio::test]
 #[ignore = "reopens an explicitly selected live test database, sends provider requests, and adds runs to its retained records"]
 async fn approved_real_cli_daemon_rest_mcp_on_existing_owned_state() {
-    use std::{
-        io::{Read, Write},
-        os::unix::fs::OpenOptionsExt,
-    };
     // The native state already belongs to this database, so the live flow reuses it instead of creating a new owner.
     let root = existing_live_root();
-    let mut config: Value =
-        serde_json::from_slice(&std::fs::read(root.join("config.json")).unwrap()).unwrap();
-    let secret = std::fs::read_to_string(root.join("secret")).unwrap();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    config["listen"] = json!(format!("127.0.0.1:{port}"));
-    for profile in config["profiles"].as_array_mut().unwrap() {
-        let Some(kind) = profile
-            .get("cli")
-            .and_then(|cli| cli["kind"].as_str())
-            .map(str::to_owned)
-        else {
-            continue;
-        };
-        profile["cli"] = live_cli_profile(&kind);
-    }
-    let mut bytes = [0_u8; 8];
-    std::fs::File::open("/dev/urandom")
-        .unwrap()
-        .read_exact(&mut bytes)
-        .unwrap();
-    let suffix: String = std::iter::once("-".to_owned())
-        .chain(bytes.iter().map(|byte| format!("{byte:02x}")))
-        .collect();
-    let mut config_copy = tempfile::NamedTempFile::new_in(&root).unwrap();
-    config_copy
-        .write_all(&serde_json::to_vec(&config).unwrap())
-        .unwrap();
-    config_copy.flush().unwrap();
-    let log = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(root.join(format!("server{suffix}.log")))
-        .unwrap();
-    let counts = || {
-        let db = rusqlite::Connection::open_with_flags(
-            root.join("runs.sqlite"),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        let runs: i64 = db
-            .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
-            .unwrap();
-        let sessions: i64 = db
-            .query_row(
-                "SELECT COUNT(*) FROM sessions WHERE native_id IS NOT NULL",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        (runs, sessions)
-    };
+    let daemon = prepare_existing_daemon(&root, |_| {});
+    let counts = || owned_counts(&root);
     let before = counts();
-    live_rest_mcp_flow(config_copy.path(), log, port, &secret, &suffix).await;
+    live_rest_mcp_flow(
+        daemon.config.path(),
+        daemon.log,
+        daemon.port,
+        &daemon.secret,
+        &daemon.suffix,
+    )
+    .await;
     let after = counts();
     assert_eq!(
         after.0 - before.0,
@@ -1005,5 +1061,166 @@ async fn approved_real_cli_daemon_rest_mcp_on_existing_owned_state() {
     assert_eq!(after.1 - before.1, 2);
     println!(
         "live daemon on existing owned state, cross-transport replay and durable sessions passed"
+    );
+}
+
+#[tokio::test]
+#[ignore = "reopens an explicitly selected live test database, sends provider requests, and adds runs, skills and hooks to its retained records"]
+async fn approved_real_cli_daemon_skill_and_completion_hooks_on_existing_owned_state() {
+    // Inbox delivery is the only destination allowed for real runs; the test connector stays closed to them.
+    let root = existing_live_root();
+    let daemon = prepare_existing_daemon(&root, |config| {
+        config["delivery"] = json!({
+            "max_pending":8,"max_payload_bytes":65536,"max_workers":1,"max_attempts":2,
+            "delivery_ttl_ms":600000,"retention_ms":600000,"lease_ms":2000,"timeout_ms":1000,"retry_ms":50,"poll_ms":10,
+            "destinations":[
+                {"id":"inbox","revision":"v1","kind":"inbox"},
+                {"id":"test-webhook","revision":"v1","kind":"webhook_test","endpoint":"http://127.0.0.1:9/hook"}
+            ]
+        });
+        let client = &mut config["clients"][0];
+        client["scopes"] = json!([
+            "run_start",
+            "run_read",
+            "run_cancel",
+            "session_read",
+            "skill_read",
+            "skill_write",
+            "hook_read",
+            "hook_write",
+            "inbox_read",
+            "inbox_ack"
+        ]);
+        client["destinations"] = json!(["inbox", "test-webhook"]);
+    });
+    let suffix = daemon.suffix.clone();
+    let before = owned_counts(&root);
+    let (child, client, url, bearer) = start_live_daemon(
+        daemon.config.path(),
+        daemon.log,
+        daemon.port,
+        &daemon.secret,
+    )
+    .await;
+    let post = |path: &str, body: Value| {
+        client
+            .post(format!("{url}{path}"))
+            .bearer_auth(&bearer)
+            .json(&body)
+            .send()
+    };
+    let skill = json!({"skill_id":"live-marker","version":format!("1{suffix}")});
+    let response = post(
+        "/v1/skills",
+        json!({"skill_id":"live-marker","version":format!("1{suffix}"),"markdown":"End every reply with the exact word KESTREL on its own line.","required_capabilities":[]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 200, "skill registration");
+    for (hook, destination) in [("live-inbox", "inbox"), ("live-webhook", "test-webhook")] {
+        let response = post(
+            "/v1/hooks",
+            json!({"hook_id":format!("{hook}{suffix}"),"version":"1","destination_id":destination,"events":["succeeded","failed"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200, "{hook} registration");
+    }
+    let request = |profile: &str, workspace: &str, key: &str, hook: &str| {
+        json!({
+            "profile_id":profile,"workspace_id":workspace,"session":{"mode":"new"},
+            "idempotency_key":format!("{key}{suffix}"),
+            "skills":[skill.clone()],
+            "hooks":[{"hook_id":format!("{hook}{suffix}"),"version":"1"}],
+            "input":{"request":"Reply with one short sentence about the sky. Do not use tools."}
+        })
+    };
+    // A real run must not bind a test connector, and the rejected admission must not create a run.
+    let rejected = post(
+        "/v1/runs",
+        request("codex", "a", "codex-webhook", "live-webhook"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rejected.status(), 409, "test connector for a real run");
+    let rejected: Value = rejected.json().await.unwrap();
+    assert_eq!(rejected["error"]["code"], "hook_unavailable", "{rejected}");
+    let codex = rest_start(
+        &client,
+        &url,
+        &bearer,
+        &request("codex", "a", "codex-skill", "live-inbox"),
+        202,
+    )
+    .await;
+    let claude = mcp(
+        &client,
+        &url,
+        &bearer,
+        "agents_start",
+        request("claude", "b", "claude-skill", "live-inbox"),
+    )
+    .await;
+    let mut runs = Vec::new();
+    for (receipt, label) in [(&codex, "codex"), (&claude, "claude")] {
+        let run = receipt["run_id"].as_str().unwrap().to_owned();
+        wait_success(&client, &url, &bearer, &run, label).await;
+        let view = mcp(&client, &url, &bearer, "runs_result", json!({"run_id":run})).await;
+        let data: Value =
+            serde_json::from_str(view["data"].as_str().expect("UTF-8 result")).unwrap();
+        assert!(
+            data["details"]["outcome"]["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("KESTREL")),
+            "{label}: the selected skill did not reach the CLI prompt"
+        );
+        runs.push(run);
+    }
+    println!("both real CLIs followed the selected skill");
+    let items = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let page: Value = post("/v1/inbox/list", json!({"limit":16}))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let items: Vec<Value> = page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| {
+                    runs.iter()
+                        .any(|run| item["notification"]["run_id"] == run.as_str())
+                })
+                .cloned()
+                .collect();
+            if items.len() == runs.len() {
+                break items;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("inbox notifications for both real runs");
+    for item in &items {
+        assert_eq!(item["notification"]["synthetic"], false, "{item}");
+        assert_eq!(item["notification"]["state"], "succeeded", "{item}");
+        let response = post("/v1/inbox/ack", json!({"inbox_id":item["inbox_id"]}))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "inbox ack");
+    }
+    println!("both real runs delivered a non-synthetic inbox notification");
+    stop_live_daemon(child).await;
+    let after = owned_counts(&root);
+    assert_eq!(
+        after.0 - before.0,
+        2,
+        "the rejected admission created a run"
+    );
+    assert_eq!(after.1 - before.1, 2);
+    println!(
+        "live daemon skill, inbox hook and test connector boundary passed on existing owned state"
     );
 }
