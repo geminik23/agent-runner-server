@@ -141,6 +141,10 @@ pub struct CliEnvironment {
     /// They cannot name `HOME`, `PATH`, the state variable or an inherited variable.
     #[serde(default)]
     pub set: BTreeMap<String, String>,
+    /// Variables passed as an absolute path below the native state directory, such as a dedicated empty
+    /// configuration directory that keeps the account's own CLI configuration out of runs.
+    #[serde(default)]
+    pub state_paths: BTreeMap<String, PathBuf>,
 }
 
 /// Optional host requirements for the reviewed compatibility record.
@@ -310,10 +314,16 @@ impl CliBackend {
                 .iter()
                 .map(|(key, value)| (OsString::from(key), OsString::from(value))),
         );
+        environment.extend(
+            env_settings
+                .state_paths
+                .iter()
+                .map(|(key, path)| (OsString::from(key), state.join(path).into_os_string())),
+        );
         let state_realm = native_realm(settings.kind, &state_directory);
         let os_args = |args: &[String]| args.iter().map(OsString::from).collect::<Vec<_>>();
-        // The helper wrapper adds a separator and the CLI program before the configured arguments.
-        let max_args = 2 + settings
+        // The helper wrapper adds its parent watch, a separator and the CLI program before the configured arguments.
+        let max_args = 6 + settings
             .new_args
             .len()
             .max(settings.resume_args.len())
@@ -397,7 +407,16 @@ impl CliBackend {
             limits.timeout = limits.timeout.min(self.preflight_timeout);
         }
         let (program, args) = if let Some(helper) = &self.helper_program {
-            let mut wrapped = vec![OsString::from("--"), self.program.as_os_str().to_owned()];
+            // The helper stops the CLI when this daemon exits and escalates after the profile's signal grace,
+            // because no supervisor is left to do it.
+            let mut wrapped = vec![
+                OsString::from("--parent"),
+                OsString::from(std::process::id().to_string()),
+                OsString::from("--stop-grace-ms"),
+                OsString::from(self.limits.signal_grace.as_millis().max(1).to_string()),
+                OsString::from("--"),
+                self.program.as_os_str().to_owned(),
+            ];
             wrapped.extend(args);
             (helper.clone(), wrapped)
         } else {
@@ -879,7 +898,7 @@ impl CliBackend {
             let attempt_id = request.attempt_id.clone();
             let known = known.clone();
             let cancellation = cancellation.clone();
-            Arc::new(move |_| {
+            Arc::new(move |identity: crate::process::ProcessIdentity| {
                 let send = |kind| {
                     events(ExecutionEvent {
                         run_id: run_id.clone(),
@@ -888,9 +907,19 @@ impl CliBackend {
                         kind,
                     })
                 };
+                // The start token is read while the process is known to run; without it the release relies on the workspace check.
+                let process = crate::process::process_start_token(identity.pid).map(|start| {
+                    crate::core::ProcessRecord {
+                        pid: identity.pid,
+                        start,
+                    }
+                });
                 if send(ExecutionEventKind::Started).is_err()
                     || known.as_ref().is_some_and(|session| {
                         send(ExecutionEventKind::SessionObserved(session.clone())).is_err()
+                    })
+                    || process.is_some_and(|record| {
+                        send(ExecutionEventKind::ProcessStarted(record)).is_err()
                     })
                 {
                     cancellation.cancel();
@@ -1069,13 +1098,11 @@ impl CliBackend {
         };
         let observed_warnings = with_version(observed_warnings(self.kind, &report.stdout.bytes));
         // The helper exits by itself only after waitpid reports no remaining child, so its own exit after the
-        // reaped marker proves that no process from this run's tree is left. Forced or cancelled stops prove nothing.
+        // reaped marker proves that no process from this run's tree is left. This holds after a cancellation too:
+        // the helper outlives interrupt and terminate signals, and a forced kill would show as its exit signal.
         let process_cleanup = if reaped
-            && report.reason == StopReason::Exited
             && report.direct_io_settled()
             && report.exit.is_some_and(|exit| exit.signal.is_none())
-            && !report.signals.graceful_attempted
-            && !report.signals.force_attempted
         {
             CleanupState::Settled
         } else {
@@ -1100,7 +1127,7 @@ impl CliBackend {
                 ExecutionOutcome::Cancelled,
                 session,
                 observed_warnings,
-                CleanupState::Uncertain,
+                process_cleanup,
                 SessionDisposition::Uncertain,
             );
         }
@@ -1371,6 +1398,17 @@ fn validate_invocation(settings: &CliSettings) -> Result<(), &'static str> {
                 && name != "PATH"
                 && *name != env.state_directory_variable
                 && !env.inherit.contains(name)
+        })
+        || !env.state_paths.iter().all(|(name, path)| {
+            valid_name(name)
+                && name != "HOME"
+                && name != "PATH"
+                && *name != env.state_directory_variable
+                && !env.inherit.contains(name)
+                && !env.set.contains_key(name)
+                && !path.as_os_str().is_empty()
+                && !path.as_os_str().as_encoded_bytes().contains(&0)
+                && relative_without_parent(path)
         })
     {
         return Err("invalid CLI environment");
@@ -1853,7 +1891,7 @@ mod tests {
             CliKind::OpenCode => "{\"type\":\"step_start\",\"sessionID\":\"${sid}\",\"part\":{\"sessionID\":\"${sid}\",\"messageID\":\"msg_1\",\"type\":\"step-start\"}}\n{\"type\":\"text\",\"sessionID\":\"${sid}\",\"part\":{\"sessionID\":\"${sid}\",\"messageID\":\"msg_1\",\"type\":\"text\",\"text\":\"done\"}}".to_owned(),
         };
         let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' '{version}'; exit 0; fi\nif [ \"$1\" = api ]; then printf x >> '{0}/probes'; id=${{4#sessionID=}}; if [ -f '{0}/probe_broken' ]; then printf '%s\\n' 'HTTP 500 Internal Server Error' >&2; exit 1; fi; if [ -f '{0}/sessions/'\"$id\" ]; then printf '{{\"data\":{{\"id\":\"%s\"}}}}\\n' \"$id\"; exit 0; fi; printf '%s\\n' 'HTTP 404 Not Found' >&2; exit 1; fi\nif [ -f '{0}/missing_session' ]; then printf x >> '{0}/missing_invocations'; cat > '{0}/missing_input'; printf '%s\\n' 'session not found' >&2; exit 1; fi\nsid={ID}; prev=; for arg in \"$@\"; do if [ \"$prev\" = --session-id ] || [ \"$prev\" = --resume ] || [ \"$prev\" = --session ]; then sid=\"$arg\"; fi; prev=\"$arg\"; done\nif [ -f '{0}/report_session' ]; then sid=$(cat '{0}/report_session'); fi\ncat > '{0}/input'\npwd > '{0}/cwd'\nmkdir -p '{0}/sessions'; : > '{0}/sessions/'\"$sid\"\nprintf '%s\\n' \"$@\" > '{0}/args'\nif [ -f '{0}/exit_code' ]; then code=$(cat '{0}/exit_code'); else code=0; fi\ncat <<RESULT\n{output}\nRESULT\nexit $code\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' '{version}'; exit 0; fi\nif [ \"$1\" = api ]; then printf x >> '{0}/probes'; id=${{4#sessionID=}}; if [ -f '{0}/probe_broken' ]; then printf '%s\\n' 'HTTP 500 Internal Server Error' >&2; exit 1; fi; if [ -f '{0}/sessions/'\"$id\" ]; then printf '{{\"data\":{{\"id\":\"%s\"}}}}\\n' \"$id\"; exit 0; fi; printf '%s\\n' 'HTTP 404 Not Found' >&2; exit 1; fi\nif [ -f '{0}/missing_session' ]; then printf x >> '{0}/missing_invocations'; cat > '{0}/missing_input'; printf '%s\\n' 'session not found' >&2; exit 1; fi\nsid={ID}; prev=; for arg in \"$@\"; do if [ \"$prev\" = --session-id ] || [ \"$prev\" = --resume ] || [ \"$prev\" = --session ]; then sid=\"$arg\"; fi; prev=\"$arg\"; done\nif [ -f '{0}/report_session' ]; then sid=$(cat '{0}/report_session'); fi\ncat > '{0}/input'\npwd > '{0}/cwd'\nif [ -f '{0}/sleep' ]; then /bin/sleep $(cat '{0}/sleep'); fi\nmkdir -p '{0}/sessions'; : > '{0}/sessions/'\"$sid\"\nprintf '%s\\n' \"$@\" > '{0}/args'\nif [ -f '{0}/exit_code' ]; then code=$(cat '{0}/exit_code'); else code=0; fi\ncat <<RESULT\n{output}\nRESULT\nexit $code\n",
             temp.path().display()
         );
         std::fs::write(&program, script).unwrap();
@@ -2133,7 +2171,9 @@ mod tests {
     fn with_fake_helper(temp: &TempDir, backend: &mut CliBackend, reaped: bool) {
         let helper = temp.path().join("fake-helper");
         let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' '{HELPER_VERSION}'; exit 0; fi\nshift\nprintf '\\036agent-runner:child-started\\n' >&2\n\"$@\"\ncode=$?\nprintf '\\036agent-runner:child-exited\\n' >&2\n{}exit $code\n",
+            // Like the real helper, it skips its own options, survives the group's interrupt while the CLI runs and
+            // reports the CLI's code; it reports reaped descendants only when asked to.
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' '{HELPER_VERSION}'; exit 0; fi\nwhile [ \"$1\" != -- ]; do shift; done\nshift\ntrap : INT TERM\nprintf '\\036agent-runner:child-started\\n' >&2\n\"$@\"\ncode=$?\nprintf '\\036agent-runner:child-exited\\n' >&2\n{}exit $code\n",
             if reaped {
                 "printf '\\036agent-runner:descendants-reaped\\n' >&2\n"
             } else {
@@ -2171,6 +2211,36 @@ mod tests {
             // Reuse of the native session is still unproven after a failed turn.
             assert_eq!(result.session_disposition, SessionDisposition::Uncertain);
             assert_eq!(result.session.unwrap().native_id, ID);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_cli_settles_cleanup_when_the_helper_reaps_every_descendant() {
+        for (reaped, expected) in [
+            (true, CleanupState::Settled),
+            (false, CleanupState::Uncertain),
+        ] {
+            let (temp, mut backend) = fixture(CliKind::Codex, true);
+            with_fake_helper(&temp, &mut backend, reaped);
+            std::fs::write(temp.path().join("sleep"), "5").unwrap();
+            let sink: EventSink = Arc::new(|_| Ok(()));
+            let cancellation = CancellationToken::new();
+            let cancel = cancellation.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                cancel.cancel();
+            });
+            let result = backend
+                .execute(request(temp.path().to_path_buf()), sink, cancellation)
+                .await;
+            assert!(
+                matches!(result.outcome, ExecutionOutcome::Cancelled),
+                "{:?}",
+                result.outcome
+            );
+            assert_eq!(result.cleanup, expected, "reaped marker {reaped}");
+            assert_eq!(result.session_disposition, SessionDisposition::Uncertain);
+            assert_eq!(result.dispatch, DispatchStatus::StartedOrUnknown);
         }
     }
 
@@ -2880,6 +2950,24 @@ mod tests {
             .set
             .insert("OPENCODE_EXTRA".into(), "a\0b".into());
         assert!(validate_invocation(&settings).is_err());
+        // State paths stay below the state directory and never shadow another variable.
+        assert!(!base.environment.state_paths.is_empty());
+        for (name, path) in [
+            ("OPENCODE_CONFIG_DIR", "../escape"),
+            ("OPENCODE_CONFIG_DIR", "/absolute"),
+            ("OPENCODE_CONFIG_DIR", ""),
+            ("OPENCODE_DISABLE_PROJECT_CONFIG", "config"),
+            ("XDG_DATA_HOME", "config"),
+            ("HOME", "config"),
+        ] {
+            let mut settings = base.clone();
+            settings.environment.state_paths.clear();
+            settings
+                .environment
+                .state_paths
+                .insert(name.into(), path.into());
+            assert!(validate_invocation(&settings).is_err(), "{name}={path}");
+        }
     }
 
     #[tokio::test]

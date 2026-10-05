@@ -1114,12 +1114,41 @@ async fn maintenance_abandons_an_unbound_session_and_unblocks_the_realm() {
         Err(ServiceError::AlreadyRunning)
     ));
     running.shutdown().await.unwrap();
+    // A recorded helper that still runs keeps the run quarantined even when it works outside the workspace,
+    // because its descendants may still run under it.
+    let mut helper = std::process::Command::new("sleep")
+        .arg("30")
+        .current_dir(temp.path())
+        .spawn()
+        .unwrap();
+    let start = agent_runner_server::process::process_start_token(helper.id()).unwrap();
+    let connection = rusqlite::Connection::open(temp.path().join("runs.sqlite")).unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE attempts SET process_pid = ?1, process_start = ?2 WHERE run_id = ?3 AND spawn_intent = 1",
+                rusqlite::params![helper.id(), start, first.run_id],
+            )
+            .unwrap(),
+        1
+    );
+    drop(connection);
 
     let mut tool = maintenance(temp.path(), native_state_backend(temp.path(), false)).unwrap();
     let entries = tool.quarantined().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].run_id, first.run_id);
     assert_eq!(entries[0].kind, QuarantineKind::UnboundSession);
+    assert_eq!(
+        entries[0].process.as_ref().map(|process| process.pid),
+        Some(helper.id())
+    );
+    assert!(matches!(
+        tool.release(&entries[0].namespace, &first.run_id),
+        Err(ReleaseError::ProcessRunning(pid)) if pid == helper.id()
+    ));
+    helper.kill().unwrap();
+    helper.wait().unwrap();
     assert!(entries[0].native_id.is_none());
     let namespace = entries[0].namespace.clone();
     assert_eq!(

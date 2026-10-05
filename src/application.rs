@@ -2736,6 +2736,7 @@ fn event_within_limit(event: &ExecutionEvent, limit: usize) -> bool {
             add(&warning.code);
             add(&warning.message);
         }
+        ExecutionEventKind::ProcessStarted(record) => add(&record.start),
         _ => {}
     }
     size <= limit
@@ -2842,7 +2843,27 @@ async fn collect_events(
             cancellation.cancel();
             return false;
         }
+        // The started process is attempt state for a later operator release, not a client-visible event.
+        if let ExecutionEventKind::ProcessStarted(record) = event.kind {
+            let event_job = job.clone();
+            if shared
+                .database
+                .call(move |store| {
+                    store
+                        .service_record_process(&event_job, &record)
+                        .map_err(Into::into)
+                })
+                .await
+                .is_err()
+            {
+                failed.store(true, Ordering::Release);
+                cancellation.cancel();
+                return false;
+            }
+            continue;
+        }
         let (kind, payload, session) = match event.kind {
+            ExecutionEventKind::ProcessStarted(_) => continue,
             ExecutionEventKind::Started => ("run.started", json!({}), None),
             ExecutionEventKind::SessionObserved(session) => {
                 ("run.session", json!({}), Some(session))

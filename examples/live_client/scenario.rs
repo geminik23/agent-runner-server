@@ -762,7 +762,8 @@ impl Runner<'_> {
                     let result = loop {
                         match self.quarantine(&["release", &run_id, "--confirm-no-cli-process"]) {
                             Err(error)
-                                if error.contains("processes still work")
+                                if (error.contains("processes still work")
+                                    || error.contains("started for this run still runs"))
                                     && Instant::now() < deadline =>
                             {
                                 // A CLI that outlived a crashed daemon still works in the workspace; wait for it to exit.

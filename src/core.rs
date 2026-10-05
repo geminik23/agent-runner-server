@@ -83,6 +83,16 @@ pub enum ExecutionEventKind {
         cleanup: CleanupState,
         session: SessionDisposition,
     },
+    /// The directly started process, recorded so that an operator release can tell whether it still runs.
+    ProcessStarted(ProcessRecord),
+}
+
+/// Identifies a started process across PID reuse: the PID together with an opaque start token
+/// built from the boot ID and the kernel start time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessRecord {
+    pub pid: u32,
+    pub start: String,
 }
 
 /// Associates an observation with its run, attempt, and provenance.

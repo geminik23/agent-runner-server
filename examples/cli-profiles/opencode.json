@@ -2,7 +2,7 @@
   "kind": "opencode",
   "program": "/usr/local/bin/opencode",
   "helper_program": "/usr/local/bin/agent-runner-cli-helper",
-  "compatibility": "opencode-2.2.0-wsl2-x86_64-subreaper-v1",
+  "compatibility": "opencode-2.2.0-wsl2-x86_64-subreaper-v2",
   "version": {
     "args": [
       "--version"
@@ -53,7 +53,11 @@
     "forbidden_names": [],
     "set": {
       "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+      "OPENCODE_DISABLE_CLAUDE_CODE": "1",
       "OPENCODE_CONFIG_CONTENT": "{\"permissions\":[{\"action\":\"*\",\"resource\":\"*\",\"effect\":\"deny\"},{\"action\":\"read\",\"resource\":\"*\",\"effect\":\"allow\"},{\"action\":\"glob\",\"resource\":\"*\",\"effect\":\"allow\"},{\"action\":\"grep\",\"resource\":\"*\",\"effect\":\"allow\"},{\"action\":\"read\",\"resource\":\"*.env\",\"effect\":\"deny\"},{\"action\":\"read\",\"resource\":\"*.env.*\",\"effect\":\"deny\"},{\"action\":\"external_directory\",\"resource\":\"*\",\"effect\":\"deny\"}]}"
+    },
+    "state_paths": {
+      "OPENCODE_CONFIG_DIR": "agent-runner/opencode-config"
     }
   },
   "platform": {

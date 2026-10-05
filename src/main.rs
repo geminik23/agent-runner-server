@@ -213,6 +213,18 @@ fn print_entry(entry: &QuarantinedRun, directory: Option<std::path::PathBuf>) {
             (Some(key), None) => format!("{key} (not in the current configuration)"),
         }
     );
+    if let Some(process) = &entry.process {
+        #[cfg(target_os = "linux")]
+        let running =
+            agent_runner_server::process::process_still_running(process.pid, &process.start);
+        #[cfg(not(target_os = "linux"))]
+        let running = false;
+        println!(
+            "  helper process {} ({})",
+            process.pid,
+            if running { "still running" } else { "exited" }
+        );
+    }
     println!("  blocks: {blocks}");
     println!("  release: {release}");
 }

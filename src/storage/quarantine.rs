@@ -50,6 +50,8 @@ pub struct QuarantinedRun {
     pub workspace_id: Option<String>,
     /// Stored workspace resource key (`<device>:<path below the mount root>`), not a path to open.
     pub workspace_key: Option<String>,
+    /// Process started for the run (the CLI helper), when it was recorded; maintenance checks that it no longer runs.
+    pub process: Option<crate::core::ProcessRecord>,
     pub kind: QuarantineKind,
 }
 
@@ -62,7 +64,9 @@ impl SqliteStore {
         let sql = format!(
             "SELECT r.owner_id, r.client_id, r.run_id, r.session_id, r.runtime, r.state, j.stop_cause, \
              EXISTS(SELECT 1 FROM attempts a WHERE a.owner_id=r.owner_id AND a.client_id=r.client_id AND a.run_id=r.run_id AND a.spawn_intent=1), \
-             s.state_realm, s.native_id, s.reserved_run_id=r.run_id, w.resource_path, COALESCE(w.held,0), COALESCE(w.uncertain,0), j.workspace_id, s.cleanup \
+             s.state_realm, s.native_id, s.reserved_run_id=r.run_id, w.resource_path, COALESCE(w.held,0), COALESCE(w.uncertain,0), j.workspace_id, s.cleanup, \
+             (SELECT a.process_pid FROM attempts a WHERE a.owner_id=r.owner_id AND a.client_id=r.client_id AND a.run_id=r.run_id AND a.process_pid IS NOT NULL ORDER BY a.attempt_id DESC LIMIT 1), \
+             (SELECT a.process_start FROM attempts a WHERE a.owner_id=r.owner_id AND a.client_id=r.client_id AND a.run_id=r.run_id AND a.process_pid IS NOT NULL ORDER BY a.attempt_id DESC LIMIT 1) \
              FROM runs r \
              LEFT JOIN service_jobs j USING (owner_id, client_id, run_id) \
              LEFT JOIN sessions s ON s.owner_id=r.owner_id AND s.client_id=r.client_id AND s.session_id=r.session_id \
@@ -77,6 +81,8 @@ impl SqliteStore {
             let reserved: Option<bool> = row.get(10)?;
             let held: bool = row.get(12)?;
             let uncertain: bool = row.get(13)?;
+            let process_pid: Option<u32> = row.get(16)?;
+            let process_start: Option<String> = row.get(17)?;
             let reserved = reserved.unwrap_or(false);
             let kind = match (reserved, launched, &native_id) {
                 (true, true, None) => QuarantineKind::UnboundSession,
@@ -100,6 +106,9 @@ impl SqliteStore {
                 workspace_id: row.get(14)?,
                 cleanup: row.get(15)?,
                 workspace_key: row.get(11)?,
+                process: process_pid
+                    .zip(process_start)
+                    .map(|(pid, start)| crate::core::ProcessRecord { pid, start }),
                 kind,
             })
         })?;

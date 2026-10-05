@@ -764,6 +764,34 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Records the started process on the launched attempt so that an operator release can check it still runs.
+    /// The first record wins; a later different record for the same attempt is refused.
+    pub(crate) fn service_record_process(
+        &mut self,
+        job: &ClaimedJob,
+        record: &crate::core::ProcessRecord,
+    ) -> Result<(), StorageError> {
+        if record.pid <= 1 || record.start.is_empty() || record.start.len() > 128 {
+            return Err(StorageError::InvalidInput("process identity"));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (_, _, spawn) = job_status(&tx, job)?;
+        if !spawn {
+            return Err(StorageError::InvalidState);
+        }
+        let updated = tx.execute(
+            "UPDATE attempts SET process_pid = ?5, process_start = ?6 WHERE owner_id = ?1 AND client_id = ?2 AND run_id = ?3 AND attempt_id = ?4 AND spawn_intent = 1 AND process_pid IS NULL",
+            params![job.namespace.owner_id, job.namespace.client_id, job.run_id, job.attempt_id, record.pid, record.start],
+        )?;
+        if updated != 1 {
+            return Err(StorageError::InvalidState);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn service_finish(
         &mut self,
         job: &ClaimedJob,

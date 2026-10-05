@@ -91,7 +91,7 @@
   "max_line_bytes": 262144,
   "timeout_ms": 90000,
   "preflight_timeout_ms": 10000,
-  "signal_grace_ms": 1000,
+  "signal_grace_ms": 3000,
   "kill_grace_ms": 1000,
   "pipe_grace_ms": 1000
 }

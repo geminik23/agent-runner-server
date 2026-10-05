@@ -47,6 +47,8 @@ pub enum ReleaseError {
     WorkspaceUnknown,
     /// Processes still work inside the run's workspace, as `(pid, command name)`.
     ProcessesRemain(PathBuf, Vec<(u32, String)>),
+    /// The process recorded when the run started (the CLI helper) still runs, so its descendants may too.
+    ProcessRunning(u32),
     Service(ServiceError),
 }
 
@@ -72,6 +74,10 @@ impl fmt::Display for ReleaseError {
                     list.join(", ")
                 )
             }
+            Self::ProcessRunning(pid) => write!(
+                formatter,
+                "process {pid} started for this run still runs; stop it or wait until it exits"
+            ),
             Self::Service(error) => write!(formatter, "{error}"),
         }
     }
@@ -129,7 +135,9 @@ impl Maintenance {
     }
 
     /// Releases one quarantined run after the operator confirmed that no process from it remains.
-    /// It refuses while any process works inside the run's workspace; a process that moved elsewhere is not found.
+    /// It refuses while the recorded helper process of the run still runs, because the helper exits only after every
+    /// descendant in its tree; and while any process works inside the run's workspace, which also covers runs started
+    /// before the helper was recorded. A process that left both is not found.
     /// The release matches the recorded shape; unrecognized shapes stay quarantined.
     pub fn release(
         &mut self,
@@ -141,6 +149,12 @@ impl Maintenance {
             .into_iter()
             .find(|entry| &entry.namespace == namespace && entry.run_id == run_id)
             .ok_or(ReleaseError::NotQuarantined)?;
+        #[cfg(target_os = "linux")]
+        if let Some(process) = &entry.process
+            && crate::process::process_still_running(process.pid, &process.start)
+        {
+            return Err(ReleaseError::ProcessRunning(process.pid));
+        }
         if entry.workspace_key.is_some() {
             let directory = self
                 .workspace_directory(&entry)

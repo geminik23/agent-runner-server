@@ -300,6 +300,28 @@ impl ProcessSpec {
     }
 }
 
+/// Returns the start token of a running process: the boot ID and the kernel start time of `pid`.
+/// Together with the PID it names one process instance even after the PID is reused or the host reboots.
+pub fn process_start_token(pid: u32) -> Option<String> {
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name may contain spaces and parentheses, so fields are counted after its last `)`.
+    // The start time is field 22 of the whole line, which is the 20th field after the state.
+    let (_, fields) = stat.rsplit_once(')')?;
+    let mut fields = fields.split_whitespace();
+    let state = fields.next()?;
+    if state == "Z" || state == "X" {
+        return None;
+    }
+    let start = fields.nth(18)?.parse::<u64>().ok()?;
+    Some(format!("{}:{start}", boot.trim()))
+}
+
+/// Reports whether the process recorded as `(pid, start)` still runs; a different start token means the PID was reused.
+pub fn process_still_running(pid: u32, start: &str) -> bool {
+    process_start_token(pid).is_some_and(|current| current == start)
+}
+
 /// Runs a trusted command without a shell and with bounded pipe collection.
 pub struct ProcessSupervisor;
 
@@ -839,6 +861,24 @@ async fn supervise(
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::{InputCancellation, InputCompletion, write_input};
+
+    #[test]
+    fn start_tokens_name_one_running_process_instance() {
+        let own = std::process::id();
+        let token = super::process_start_token(own).unwrap();
+        assert!(super::process_still_running(own, &token));
+        let (boot, ticks) = token.rsplit_once(':').unwrap();
+        assert!(!boot.is_empty() && ticks.parse::<u64>().is_ok());
+        // Another start time for the same PID is a different, reused process.
+        assert!(!super::process_still_running(
+            own,
+            &format!("{boot}:{}", ticks.parse::<u64>().unwrap() + 1)
+        ));
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(super::process_start_token(pid).is_none_or(|current| current != token));
+    }
     use tokio::io::AsyncReadExt;
     use tokio_util::sync::CancellationToken;
 

@@ -11,7 +11,7 @@ use super::{
     },
 };
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const APPLICATION_ID: i64 = 0x41525353;
 const INITIAL_MIGRATION: &str = include_str!("../../migrations/0001_initial.sql");
 const RUN_SERVICE_MIGRATION: &str = include_str!("../../migrations/0002_run_service.sql");
@@ -20,6 +20,7 @@ const COMPLETION_DELIVERY_MIGRATION: &str =
     include_str!("../../migrations/0004_completion_delivery.sql");
 const RUN_RETENTION_MIGRATION: &str = include_str!("../../migrations/0005_run_retention.sql");
 const WORKSPACE_MIGRATION: &str = include_str!("../../migrations/0006_workspace_coordination.sql");
+const PROCESS_IDENTITY_MIGRATION: &str = include_str!("../../migrations/0007_process_identity.sql");
 
 /// Owns a synchronous SQLite connection; async callers must avoid blocking their runtime.
 pub struct SqliteStore {
@@ -67,6 +68,7 @@ impl SqliteStore {
                 transaction.execute_batch(COMPLETION_DELIVERY_MIGRATION)?;
                 transaction.execute_batch(RUN_RETENTION_MIGRATION)?;
                 transaction.execute_batch(WORKSPACE_MIGRATION)?;
+                transaction.execute_batch(PROCESS_IDENTITY_MIGRATION)?;
                 transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
@@ -76,6 +78,7 @@ impl SqliteStore {
                 transaction.execute_batch(COMPLETION_DELIVERY_MIGRATION)?;
                 transaction.execute_batch(RUN_RETENTION_MIGRATION)?;
                 transaction.execute_batch(WORKSPACE_MIGRATION)?;
+                transaction.execute_batch(PROCESS_IDENTITY_MIGRATION)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             (APPLICATION_ID, 2) => {
@@ -83,21 +86,29 @@ impl SqliteStore {
                 transaction.execute_batch(COMPLETION_DELIVERY_MIGRATION)?;
                 transaction.execute_batch(RUN_RETENTION_MIGRATION)?;
                 transaction.execute_batch(WORKSPACE_MIGRATION)?;
+                transaction.execute_batch(PROCESS_IDENTITY_MIGRATION)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             (APPLICATION_ID, 3) => {
                 transaction.execute_batch(COMPLETION_DELIVERY_MIGRATION)?;
                 transaction.execute_batch(RUN_RETENTION_MIGRATION)?;
                 transaction.execute_batch(WORKSPACE_MIGRATION)?;
+                transaction.execute_batch(PROCESS_IDENTITY_MIGRATION)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             (APPLICATION_ID, 4) => {
                 transaction.execute_batch(RUN_RETENTION_MIGRATION)?;
                 transaction.execute_batch(WORKSPACE_MIGRATION)?;
+                transaction.execute_batch(PROCESS_IDENTITY_MIGRATION)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             (APPLICATION_ID, 5) => {
                 transaction.execute_batch(WORKSPACE_MIGRATION)?;
+                transaction.execute_batch(PROCESS_IDENTITY_MIGRATION)?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            }
+            (APPLICATION_ID, 6) => {
+                transaction.execute_batch(PROCESS_IDENTITY_MIGRATION)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             (APPLICATION_ID, SCHEMA_VERSION) => {}

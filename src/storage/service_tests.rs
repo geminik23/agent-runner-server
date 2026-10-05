@@ -2313,3 +2313,54 @@ fn uncertain_cleanup_still_blocks_new_sessions_in_the_realm() {
         Err(StorageError::SessionBusy)
     ));
 }
+
+#[test]
+fn the_started_process_is_recorded_once_and_listed_with_the_quarantine() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    store.service_admit(&admission("process")).unwrap();
+    let job = store.service_claim(1_000).unwrap().unwrap();
+    let record = crate::core::ProcessRecord {
+        pid: 4242,
+        start: "boot:123".into(),
+    };
+    // Nothing may be recorded before the launch intent.
+    assert!(matches!(
+        store.service_record_process(&job, &record),
+        Err(StorageError::InvalidState)
+    ));
+    store.service_launch(&job, 1_001).unwrap();
+    store.service_record_process(&job, &record).unwrap();
+    let other = crate::core::ProcessRecord {
+        pid: 4343,
+        start: "boot:456".into(),
+    };
+    assert!(matches!(
+        store.service_record_process(&job, &other),
+        Err(StorageError::InvalidState)
+    ));
+    for invalid in [
+        crate::core::ProcessRecord {
+            pid: 1,
+            start: "boot:1".into(),
+        },
+        crate::core::ProcessRecord {
+            pid: 7,
+            start: String::new(),
+        },
+    ] {
+        assert!(matches!(
+            store.service_record_process(&job, &invalid),
+            Err(StorageError::InvalidInput(_))
+        ));
+    }
+    let candidate = Candidate {
+        state: TerminalState::Cancelled,
+        details: json!({}),
+        cleanup: CleanupState::Uncertain,
+        disposition: SessionDisposition::Uncertain,
+    };
+    store.service_finish(&job, &candidate, 1_002, 1024).unwrap();
+    let listed = store.quarantined_runs().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].process.as_ref(), Some(&record));
+}

@@ -362,7 +362,7 @@ fn existing_version_two_database_preserves_skill_versions_and_adds_registry() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     let policy: (String, bool) = connection.query_row("SELECT required_capabilities, enabled FROM skill_policies WHERE skill_id = 'report' AND version = '1'", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
     assert_eq!(policy, ("[]".into(), true));
 }
@@ -407,7 +407,7 @@ fn version_three_preserves_legacy_intents_without_enrolling_them_for_dispatch() 
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     assert_eq!(enrolled, 0);
 }
 
@@ -451,7 +451,7 @@ fn version_four_results_are_preserved_without_retroactive_retention() {
     let policies: i64 = connection
         .query_row("SELECT COUNT(*) FROM run_retention", [], |row| row.get(0))
         .unwrap();
-    assert_eq!((version, policies), (6, 0));
+    assert_eq!((version, policies), (7, 0));
 }
 
 #[test]
@@ -495,7 +495,7 @@ fn version_five_sessions_are_preserved_without_inventing_workspace_bindings() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!((version, bindings), (6, 0));
+    assert_eq!((version, bindings), (7, 0));
 }
 
 #[test]
@@ -533,7 +533,7 @@ fn existing_version_one_database_is_upgraded_without_losing_records() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     let created: bool = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'service_jobs')",
@@ -993,17 +993,17 @@ fn newer_schema_is_rejected_without_changing_it() {
     let path = temp.path().join("storage.sqlite");
     drop(SqliteStore::open(&path).unwrap());
     let connection = Connection::open(&path).unwrap();
-    connection.pragma_update(None, "user_version", 7).unwrap();
+    connection.pragma_update(None, "user_version", 8).unwrap();
     drop(connection);
     assert!(matches!(
         SqliteStore::open(&path),
-        Err(StorageError::UnsupportedSchema(7))
+        Err(StorageError::UnsupportedSchema(8))
     ));
     let connection = Connection::open(&path).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
 }
 
 #[test]
@@ -1405,4 +1405,34 @@ fn abandoning_refuses_unlaunched_or_bound_sessions() {
             .as_deref(),
         Some("run-2")
     );
+}
+
+#[test]
+fn version_six_database_gains_empty_process_identity_columns() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("storage.sqlite");
+    drop(SqliteStore::open(&path).unwrap());
+    // Recreate the version six shape: the attempts table without the process identity columns.
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE attempts DROP COLUMN process_start; ALTER TABLE attempts DROP COLUMN process_pid;",
+        )
+        .unwrap();
+    connection.pragma_update(None, "user_version", 6).unwrap();
+    drop(connection);
+    drop(SqliteStore::open(&path).unwrap());
+    let connection = Connection::open(&path).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 7);
+    let columns: Vec<String> = connection
+        .prepare("SELECT name FROM pragma_table_info('attempts') WHERE name LIKE 'process_%' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(columns, ["process_pid", "process_start"]);
 }
